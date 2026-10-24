@@ -1,0 +1,59 @@
+{
+  "devices": {
+    "video": "default",
+    "audio": "default"
+  },
+  "output": {
+    "url": "rtmp://127.0.0.1/live/livestream",
+    "video_file": "output/video.mp4",
+    "audio_file": "output/audio.m4a"
+  },
+  "video": {
+    "width": 1280,
+    "height": 720,
+    "fps": 25,
+    "bitrate": 2000000
+  },
+  "video_encoder": {
+    "gop_size": 50,
+    "preset": "veryfast",
+    "low_latency": true
+  },
+  "audio": {
+    "sample_rate": 48000,
+    "channels": 2,
+    "bitrate": 128000
+  },
+  "capture": {
+    "source": "devices",
+    "audio_source": "microphone",
+    "file": "",
+    "loop": false,
+    "realtime": true,
+    "video": true,
+    "audio": true,
+    "timeout_ms": 5000,
+    "video_format": ""
+  },
+  "preprocess": {
+    "video": {
+      "scale_algorithm": "bilinear",
+      "resize_mode": "fit",
+      "rotation": 0,
+      "mirror": false,
+      "watermark": "",
+      "timestamp_overlay": false
+    },
+    "audio": {
+      "sample_format": "fltp",
+      "frame_size": 1024,
+      "gain_db": 0,
+      "discontinuity_threshold_ms": 100
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": ""
+  }
+}

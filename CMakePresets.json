@@ -1,0 +1,136 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows / MSVC + Ninja",
+      "description": "在 x64 Developer PowerShell 中直接使用 cmake --preset windows-release",
+      "hidden": true,
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "environment": {
+        "VSLANG": "1033"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LSL_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "windows-debug",
+      "inherits": "windows",
+      "displayName": "Windows Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-release",
+      "inherits": "windows",
+      "displayName": "Windows Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "unix",
+      "displayName": "Linux / macOS + Ninja",
+      "hidden": true,
+      "condition": {
+        "type": "anyOf",
+        "conditions": [
+          {
+            "type": "equals",
+            "lhs": "${hostSystemName}",
+            "rhs": "Linux"
+          },
+          {
+            "type": "equals",
+            "lhs": "${hostSystemName}",
+            "rhs": "Darwin"
+          }
+        ]
+      },
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LSL_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "unix-debug",
+      "inherits": "unix",
+      "displayName": "Linux / macOS Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "unix-release",
+      "inherits": "unix",
+      "displayName": "Linux / macOS Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
+    },
+    {
+      "name": "unix-debug",
+      "configurePreset": "unix-debug"
+    },
+    {
+      "name": "unix-release",
+      "configurePreset": "unix-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "unix-debug",
+      "configurePreset": "unix-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "unix-release",
+      "configurePreset": "unix-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

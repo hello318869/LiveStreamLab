@@ -1,0 +1,15 @@
+{
+  "input": {
+    "url": "http://127.0.0.1:8080/live/livestream.flv"
+  },
+  "audio": {
+    "device": "default",
+    "sample_rate": 48000,
+    "channels": 2
+  },
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": ""
+  }
+}

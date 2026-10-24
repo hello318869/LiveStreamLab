@@ -1,0 +1,10 @@
+{
+  "capture": {
+    "source": "file",
+    "file": "sample.mp4",
+    "loop": true,
+    "realtime": true,
+    "video": true,
+    "audio": true
+  }
+}
