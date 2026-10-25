@@ -63,6 +63,11 @@ struct AudioPlayback::Impl {
                     if (event.serial != input.stats().buffer.serial) continue;
                     serial = event.serial;
                     initialized = sink && event.streams && event.streams->audio.index >= 0;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        counters.serial = serial;
+                        counters.activeTrack = initialized;
+                    }
                     if (initialized) {
                         decoder.reset(event.streams->audio, serial);
                         sink->reset(serial);

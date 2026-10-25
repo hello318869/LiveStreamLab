@@ -39,6 +39,12 @@ struct AudioClock {
     bool valid = false;
     std::int64_t timestampUs = 0;
     std::uint64_t serial = 0;
+    std::uint64_t revision = 0; // 同 serial 内的 PCM 时间戳跳变；变化后须重建同步基准。
+    std::int64_t bufferedUs = 0; // 已提交媒体中估计尚未播放的时长，不包含应用 PCM 环。
+    std::int64_t deviceLatencyUs = 0; // 根据设备处理周期估计，并非物理播放位置测量。
+    bool paused = false;
+    bool starved = false; // 应用环空、SDL 无可输出样本，且消费停滞超过设备尾部保护期。
+    bool finished = false;
 };
 
 class IAudioSink {
@@ -55,7 +61,8 @@ public:
     virtual void setMuted(bool muted) = 0;
     virtual void setVolume(int volume) = 0;
     virtual AudioSinkStats stats() const = 0;
-    // 回调提交媒体的时间位置。欠载不推进；不代表声卡/扬声器的精确播放位置。
+    // 基于媒体 PTS、SDL 缓存和设备处理周期估计的播放位置；回调间按单调时钟推进。
+    // 欠载到达已提交媒体终点后冻结，暂停期间冻结；不是声卡/扬声器的精确播放位置。
     virtual AudioClock clock() const = 0;
     virtual void checkError() const = 0;
     // 停止生产线程并 join 后调用；可重复调用，析构也会停止输出。

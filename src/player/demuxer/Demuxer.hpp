@@ -27,6 +27,8 @@ public:
 
     void start();
     PacketEvent pop(TrackKind track, int timeoutMs = 20);
+    // 主线程同步恢复：只清理预期代次的双轨缓冲，不操作网络上下文或重新连接。
+    bool resynchronize(std::uint64_t expectedSerial);
     void requestStop() noexcept;
     void join();
     void checkError() const;

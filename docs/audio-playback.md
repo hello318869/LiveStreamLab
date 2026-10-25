@@ -5,10 +5,10 @@
 float32 PCM，再由 SDL3 音频流回调播放。默认播放音频，输出采样率 48000 Hz、立体声，
 PCM 环形缓冲容量时长默认 500 ms。
 
-视频仍按自己的 PTS 时钟显示；本次没有实现 M13 音画同步，声音与画面可能存在偏差。
-音频暂停只影响声音，视频继续显示。
+M13 已接入音频主时钟与视频调度，见 [音画同步](av-sync.md)。Space 与初始 `audio.paused`
+现在同时暂停声音和视频；静音继续消费媒体并推进时钟。
 
-2026-10-25 已通过 CMake 配置与 Windows Release 的 `player` 编译、链接。未启动程序、未运行测试、未连接 SRS；
+2026-10-25 M11 阶段已通过 CMake 配置与 Windows Release 的 `player` 编译、链接。当时未启动程序、未运行测试、未连接 SRS；
 实际声音、设备兼容性、连续播放和断线恢复尚未运行验收。
 
 ## 构建和使用
@@ -36,7 +36,7 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 # 调整声音：50% 音量，输出 48 kHz 立体声
 .\build\cmake\bin\Release\player.exe --volume 50 --sample-rate 48000 --channels 2
 
-# 静音启动，或仅暂停音频启动
+# 静音启动，或以音画暂停状态启动
 .\build\cmake\bin\Release\player.exe --mute true
 .\build\cmake\bin\Release\player.exe --audio-paused true
 
@@ -52,7 +52,7 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 
 | 操作 | 行为 |
 |---|---|
-| Space | 只暂停或恢复音频，视频继续 |
+| Space | 同时暂停或恢复声音与视频 |
 | M | 切换静音 |
 | 上/下方向键 | 每次增加或减少 10% 音量，限制在 0% 至 100% |
 | F、Alt+Enter、双击 | 沿用 M12 的全屏切换 |
@@ -67,7 +67,7 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 | `--audio-buffer-ms N` | PCM 环形缓冲目标时长，100 至 2000 ms；实际容量至少 4096 帧 |
 | `--volume N` | 音量，0 至 100 |
 | `--mute true\|false` | 静音状态 |
-| `--audio-paused true\|false` | 音频暂停状态 |
+| `--audio-paused true\|false` | 初始音画暂停状态，沿用旧参数名 |
 
 这些开关分别对应 JSON 的 `audio.enabled`、`audio.device`、`audio.sample_rate`、
 `audio.channels`、`audio.buffer_ms`、`audio.volume`、`audio.muted` 和 `audio.paused`。
@@ -112,7 +112,7 @@ send 返回 EAGAIN 时先 receive，再重试同一个尚未接受的包；持�
 网络包队列仍使用 [M09 的限制和换代规则](network-demuxing.md)。PCM 交接缓冲按
 `--audio-buffer-ms` 限制容量，音频工作线程与视频工作线程独立，音频输出背压不占用视频解码线程。
 暂停、停止和换代需要及时解除生产者等待；不能让主线程等待一个永远无法继续写入的音频线程。
-音频暂停时间过长仍可能触发直播输入的缓存清理，恢复后的声音可能跳到较新的内容。
+音画暂停时间过长仍可能触发直播输入的缓存清理，恢复后可能跳到较新的直播内容。
 
 ## 重连、EOF 与退出
 
@@ -131,9 +131,10 @@ send 返回 EAGAIN 时先 receive，再重试同一个尚未接受的包；持�
 随后销毁 SDL 音频流和设备，最后释放 SDL 视频资源。音频流销毁前，回调 userdata 及其缓冲必须保持存活。
 音频工作线程和回调中的失败通过受保护状态传回主线程，不能让异常穿过 SDL 的 C 回调边界。
 
-## 音频媒体位置的口径
+## 音频媒体位置与 M13 时钟的口径
 
-M11 可以记录媒体起始时间与回调实际提交的媒体样本帧数，提供提交侧的媒体位置估计。
+M11 记录媒体起始时间与回调实际提交的媒体样本帧数；M13 在此基础上扣除 SDL 未消费数据与
+设备周期延迟，提供 `IAudioSink::clock()` 估计播放位置供视频同步调度。
 欠载由静音补足的部分不累计为媒体样本，静音开关本身仍消费正常媒体样本；
 暂停、清缓存和代次变化按各自生命周期维护或重置该基准。
 
@@ -145,4 +146,6 @@ M11 可以记录媒体起始时间与回调实际提交的媒体样本帧数，�
 
 `SDL_GetAudioStreamQueued` 返回未消费的输入字节，`SDL_GetAudioStreamAvailable` 返回可读的
 转换后输出字节；二者都不直接报告扬声器当前播放位置。
-本次只保留音频媒体位置和计数接口，视频显示不读取该值，不宣称完成 M13 或真实音画同步。
+M13 使用估计位置驱动视频，欠载时停止媒体时钟推进，并有限等待后降级到外部时钟。
+`Queued` 与 `Available` 表示同一流的输入/输出视角，不能重复相加扣减；设备周期仍只是估计，
+不宣称取得扬声器精确播放位置或已经验证真实音画同步。细节见 [M13](av-sync.md)。

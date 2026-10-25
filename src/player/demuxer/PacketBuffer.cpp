@@ -153,6 +153,18 @@ void PacketBuffer::invalidate() {
     impl_->changed.notify_all();
 }
 
+bool PacketBuffer::resynchronize(std::uint64_t expectedSerial) {
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->stopped || impl_->finished || !impl_->streams ||
+            impl_->counters.serial != expectedSerial) return false;
+        // 仅重置有界缓冲及消费者代次；沿用快照和等待关键帧/音频截止规则。
+        impl_->resetLocked();
+    }
+    impl_->changed.notify_all();
+    return true;
+}
+
 bool PacketBuffer::push(TrackKind kind, media::PacketPtr packet, std::int64_t timestampUs) {
     if (!packet) throw error::AppError("demuxer", error::InvalidConfig, "cannot queue a null packet");
     std::lock_guard<std::mutex> lock(impl_->mutex);

@@ -4,6 +4,7 @@
 #include "player/decoder/VideoDecoder.hpp"
 #include "player/demuxer/Demuxer.hpp"
 #include "player/renderer/SDLVideoRenderer.hpp"
+#include "player/sync/AVSynchronizer.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -19,7 +20,6 @@
 namespace lsl::player {
 namespace {
 using Clock = std::chrono::steady_clock;
-using Microseconds = std::chrono::microseconds;
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires a lock-free stop flag");
 std::atomic<bool> stopRequested{false};
 void signalStop(int) { stopRequested.store(true, std::memory_order_relaxed); }
@@ -225,42 +225,11 @@ private:
     std::thread thread_;
 };
 
-// M10/M12 使用独立的视频 PTS 时钟；M13 接入后再替换为音频主时钟。
-class VideoSchedule {
-public:
-    Clock::time_point due(const decoder::DecodedVideoFrame& frame, Clock::time_point now) {
-        const auto duration = std::clamp<std::int64_t>(frame.durationUs, 1000, 1000000);
-        auto result = now;
-        if (initialized_) {
-            result = next_;
-            if (frame.timestampUs != AV_NOPTS_VALUE && lastPts_ != AV_NOPTS_VALUE) {
-                const auto delta = static_cast<long double>(frame.timestampUs) - lastPts_;
-                if (delta >= 0 && delta <= 500000) {
-                    result = previous_ + Microseconds(static_cast<std::int64_t>(delta));
-                } else {
-                    result = now; // 时间轴异常时重建锚点，避免等待极端 PTS。
-                }
-            }
-        }
-        previous_ = result;
-        next_ = result + Microseconds(duration);
-        lastPts_ = frame.timestampUs;
-        initialized_ = true;
-        return result;
-    }
-    void reset() { initialized_ = false; lastPts_ = AV_NOPTS_VALUE; }
-private:
-    Clock::time_point previous_{};
-    Clock::time_point next_{};
-    std::int64_t lastPts_ = AV_NOPTS_VALUE;
-    bool initialized_ = false;
-};
-
 void report(logging::Logger& logger, const demuxer::DemuxStats& network,
             const VideoFrameQueue::Snapshot& frames, const renderer::VideoRenderStats& display,
             const AudioPlaybackStats& audioDecode, const audio::AudioSinkStats& audioOutput,
             const VideoFrameQueue::Snapshot& previousFrames, const renderer::VideoRenderStats& previousDisplay,
-            double seconds) {
+            const sync::SyncStats& timing, const audio::AudioClock& audioClock, double seconds) {
     const auto decoded = frames.decode.decodedFrames - previousFrames.decode.decodedFrames;
     const auto rendered = display.renderedFrames - previousDisplay.renderedFrames;
     logger.log(logging::Level::Info, "player", "received=" + std::to_string(network.videoPackets) +
@@ -289,6 +258,18 @@ void report(logging::Logger& logger, const demuxer::DemuxStats& network,
         " audio_paused=" + std::to_string(audioOutput.paused) +
         " audio_muted=" + std::to_string(audioOutput.muted) +
         " volume=" + std::to_string(audioOutput.volume) +
+        " master=" + sync::clockName(timing.master) +
+        " av_error_ms=" + (timing.errorValid ? std::to_string(timing.errorUs / 1000.0) : "n/a") +
+        " av_mean_abs_ms=" + std::to_string(timing.meanAbsoluteErrorUs / 1000.0) +
+        " av_max_abs_ms=" + std::to_string(timing.maxAbsoluteErrorUs / 1000.0) +
+        " av_samples=" + std::to_string(timing.samples) +
+        " sync_waits=" + std::to_string(timing.waits) +
+        " sync_drops=" + std::to_string(timing.droppedFrames) +
+        " sync_fallbacks=" + std::to_string(timing.fallbacks) +
+        " sync_resets=" + std::to_string(timing.resets) +
+        " sync_recoveries=" + std::to_string(timing.recoveries) +
+        " audio_buffered_ms=" + std::to_string(audioClock.bufferedUs / 1000.0) +
+        " audio_device_latency_ms=" + std::to_string(audioClock.deviceLatencyUs / 1000.0) +
         " buffer_ms=" + std::to_string(network.buffer.bufferedMs) +
         " retries=" + std::to_string(network.reconnects));
 }
@@ -319,14 +300,14 @@ int runPlayer(const config::PlayerConfig& config, const config::CommandLineOptio
     VideoWorker worker(input, frames, logger);
     AudioPlayback audioWorker(config, input, audioOutput, logger);
     logger.log(logging::Level::Info, "player",
-        "M09-M12 playback; F/Alt+Enter/double click fullscreen, Space audio pause, M mute, Up/Down volume, Escape/close/Ctrl+C stop. A/V sync (M13) is not implemented.");
+        "M09-M13 playback; audio master with estimated device latency; F/Alt+Enter/double click fullscreen, Space A/V pause, M mute, Up/Down volume, Escape/close/Ctrl+C stop.");
     std::optional<decoder::DecodedVideoFrame> pending;
-    VideoSchedule schedule;
-    Clock::time_point due{};
+    sync::AVSynchronizer schedule(config.sync);
     auto lastReport = Clock::now();
     auto previousFrames = frames.snapshot();
     auto previousDisplay = display.stats();
     std::uint64_t visibleSerial = 0;
+    bool paused = config.audioPlayback.paused;
     bool stoppedByUser = false;
     for (;;) {
         if (stopRequested.load(std::memory_order_relaxed) || !display.pollEvents()) {
@@ -334,52 +315,77 @@ int runPlayer(const config::PlayerConfig& config, const config::CommandLineOptio
             break;
         }
         input.checkError();
+        const auto controls = display.takeAudioControls();
+        if (controls.togglePaused) {
+            paused = !paused;
+            if (audioOutput) audioOutput->setPaused(paused);
+        }
         if (audioOutput) {
             audioOutput->checkError();
-            const auto controls = display.takeAudioControls();
             const auto settings = audioOutput->stats();
-            if (controls.togglePaused) audioOutput->setPaused(!settings.paused);
             if (controls.toggleMuted) audioOutput->setMuted(!settings.muted);
             if (controls.volumeDelta) audioOutput->setVolume(std::clamp(settings.volume + controls.volumeDelta, 0, 100));
-        } else {
-            static_cast<void>(display.takeAudioControls());
         }
         const auto serial = input.stats().buffer.serial;
         if (serial != visibleSerial) {
             if (pending) display.noteDroppedFrames(1);
             pending.reset();
-            schedule.reset();
+            schedule.reset(serial, Clock::now());
             display.clear();
             if (audioOutput && audioOutput->stats().serial != serial) audioOutput->clear(serial);
             visibleSerial = serial;
         }
+        schedule.setPaused(paused, Clock::now());
         if (!pending) {
             pending = frames.pop();
-            if (pending) due = schedule.due(*pending, Clock::now());
+            if (pending) schedule.beginFrame(pending->timestampUs, pending->durationUs, Clock::now());
         }
         auto state = frames.snapshot();
         const auto audioState = audioWorker.stats();
+        const auto audioClock = audioOutput ? audioOutput->clock() : audio::AudioClock{};
         const auto now = Clock::now();
         if (pending) {
             if (pending->serial != input.stats().buffer.serial) {
                 display.noteDroppedFrames(1);
                 pending.reset();
-                schedule.reset();
-            } else if (now >= due) {
-                // 超过100ms的帧让位给后续画面；无后续帧时仍显示，避免长时间黑屏。
-                if (now - due > std::chrono::milliseconds(100) && state.queued > 0) {
+            } else {
+                sync::SyncInput timing;
+                timing.audio = audioClock;
+                // 音频工作线程尚未收到 Reset 时给它启动宽限；确认本代无音轨后立即降级。
+                timing.audioExpected = audioOutput && (audioState.serial != serial || audioState.activeTrack);
+                timing.audioFinished = audioState.finished && (!audioOutput || audioOutput->drained());
+                timing.paused = paused;
+                timing.hasNextFrame = state.queued > 0;
+                timing.canResynchronize = !state.finished && !audioState.finished;
+                const auto action = schedule.evaluate(timing, now);
+                if (action == sync::SyncAction::Resynchronize) {
+                    const bool reset = input.resynchronize(serial);
+                    logger.log(logging::Level::Warn, "sync", reset ?
+                        "persistent A/V drift or timestamp discontinuity; reset both tracks and wait for a keyframe" :
+                        "synchronization recovery superseded by a newer generation or EOF");
                     display.noteDroppedFrames(1);
-                } else {
-                    display.render(*pending->frame);
+                    pending.reset();
+                    // 成功换代由下一轮公共分支统一重置；EOF 竞争失败只撤销本地基准。
+                    if (!reset && input.stats().buffer.serial == visibleSerial) schedule.reset(visibleSerial, now);
+                } else if (action == sync::SyncAction::Drop) {
+                    display.noteDroppedFrames(1);
+                    pending.reset();
+                } else if (action == sync::SyncAction::Render) {
+                    // 再核对一次，减少网络换代发生在时钟查询与上传之间时的旧帧窗口。
+                    if (pending->serial == input.stats().buffer.serial) {
+                        display.render(*pending->frame);
+                    } else {
+                        display.noteDroppedFrames(1);
+                    }
+                    pending.reset();
                 }
-                pending.reset();
             }
         }
         if (now - lastReport >= std::chrono::seconds(1)) {
             const auto currentDisplay = display.stats();
             report(logger, input.stats(), state, currentDisplay, audioState,
                    audioOutput ? audioOutput->stats() : audio::AudioSinkStats{}, previousFrames, previousDisplay,
-                   std::chrono::duration<double>(now - lastReport).count());
+                   schedule.stats(), audioClock, std::chrono::duration<double>(now - lastReport).count());
             lastReport = now;
             previousFrames = state;
             previousDisplay = currentDisplay;

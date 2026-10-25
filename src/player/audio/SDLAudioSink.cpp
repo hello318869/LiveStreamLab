@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -91,6 +92,16 @@ std::int64_t frameEndTimestamp(std::int64_t start, std::size_t frames, int sampl
     if (start > std::numeric_limits<std::int64_t>::max() - offset) return std::numeric_limits<std::int64_t>::max();
     return start + offset;
 }
+
+std::int64_t boundedTimestamp(long double timestamp) {
+    // INT64_MIN 保留给 AV_NOPTS_VALUE。
+    // MSVC 的 long double 与 double 同精度，边界判断要在整数转换前进行。
+    if (timestamp <= static_cast<long double>(std::numeric_limits<std::int64_t>::min() + 1))
+        return std::numeric_limits<std::int64_t>::min() + 1;
+    if (timestamp >= static_cast<long double>(std::numeric_limits<std::int64_t>::max()))
+        return std::numeric_limits<std::int64_t>::max();
+    return static_cast<std::int64_t>(timestamp);
+}
 } // namespace
 
 struct SDLAudioSink::Impl {
@@ -115,6 +126,19 @@ struct SDLAudioSink::Impl {
     std::atomic<bool> flushed{false};
     std::atomic<bool> clockValid{false};
     std::atomic<std::int64_t> clockTimestamp{AV_NOPTS_VALUE};
+    // callbackAt/clockSubmittedFrames 与 SDL 输入队列一起受 stream 锁保护。
+    // 其他时钟估计状态只由持有 control 的线程修改，回调从不取 control。
+    std::optional<Clock::time_point> callbackAt;
+    std::uint64_t clockSubmittedFrames = 0;
+    std::uint64_t clockRevision = 0;
+    bool haveAccepted = false;
+    std::int64_t nextTimestampUs = AV_NOPTS_VALUE;
+    mutable std::optional<Clock::time_point> clockAnchorAt;
+    mutable std::uint64_t observedConsumedFrames = 0;
+    mutable std::int64_t clockAnchorTimestamp = 0;
+    mutable std::int64_t lastClockTimestamp = 0;
+    mutable std::optional<Clock::time_point> starvationSince;
+    mutable std::uint64_t starvationConsumedFrames = 0;
     std::atomic<std::uint64_t> submittedFrames{0};
     std::atomic<std::uint64_t> underruns{0};
     std::atomic<std::uint64_t> droppedFrames{0};
@@ -149,11 +173,88 @@ struct SDLAudioSink::Impl {
         else flushed.store(true, std::memory_order_release);
     }
 
+    void clearClock() noexcept {
+        // 调用者持 control；设备已暂停，且存在 stream 时还持有 stream 锁。
+        clockValid.store(false, std::memory_order_release);
+        clockTimestamp.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+        clockSubmittedFrames = 0;
+        callbackAt.reset();
+        clockAnchorAt.reset();
+        observedConsumedFrames = 0;
+        starvationSince.reset();
+        starvationConsumedFrames = 0;
+        haveAccepted = false;
+        nextTimestampUs = AV_NOPTS_VALUE;
+    }
+
+    AudioClock estimateClock() const {
+        // 调用者持 control。此处只取 stream 锁，绝不在 stream 锁内调用设备 API。
+        AudioClock result;
+        result.serial = serial.load(std::memory_order_relaxed);
+        result.revision = clockRevision;
+        result.paused = options.paused;
+        result.finished = finished.load(std::memory_order_acquire);
+        result.deviceLatencyUs = tailProtection.count();
+        if (!stream || !ready.load(std::memory_order_acquire) || stopped.load(std::memory_order_acquire)) return result;
+        StreamLock freeze(stream.get());
+        if (!clockValid.load(std::memory_order_acquire)) return result;
+        const auto endpoint = clockTimestamp.load(std::memory_order_relaxed);
+        if (endpoint == AV_NOPTS_VALUE || !callbackAt) return result;
+        const int queuedBytes = SDL_GetAudioStreamQueued(stream.get());
+        const int availableBytes = SDL_GetAudioStreamAvailable(stream.get());
+        if (queuedBytes < 0 || availableBytes < 0) failSDL("query audio playback clock");
+        // GetAudioStreamAvailable 只是同一队列的可输出字节视图，不能与 queued 再次相加。
+        // 本流输入格式固定，用 queued 即可保留尚未完成转换/重采样的输入时长。
+        const auto queuedFrames = std::min(clockSubmittedFrames, static_cast<std::uint64_t>(queuedBytes) / frameBytes);
+        const auto consumedFrames = clockSubmittedFrames - queuedFrames;
+        const auto queuedUs = static_cast<std::int64_t>(queuedFrames * 1000000ULL / options.sampleRate);
+        const auto consumedEnd = boundedTimestamp(static_cast<long double>(endpoint) - queuedUs);
+        const auto now = Clock::now();
+        if (!clockAnchorAt || consumedFrames != observedConsumedFrames) {
+            const auto candidate = boundedTimestamp(static_cast<long double>(consumedEnd) - result.deviceLatencyUs);
+            // 主线程查询时 SDL 通常已经消费本次回调提交的数据，锚点仍对应回调时刻。
+            // 返回值只允许前进，但必须保留实际候选锚点：欠载恢复后若估计位置落后，
+            // 先冻结到新候选追上，不能把锚点抬高后插值而永久吃掉设备延迟补偿。
+            if (!clockAnchorAt) lastClockTimestamp = candidate;
+            clockAnchorTimestamp = candidate;
+            clockAnchorAt = *callbackAt;
+            observedConsumedFrames = consumedFrames;
+        }
+        auto position = lastClockTimestamp;
+        if (!options.paused) {
+            const auto elapsed = std::max<std::int64_t>(0,
+                std::chrono::duration_cast<std::chrono::microseconds>(now - *clockAnchorAt).count());
+            position = std::max(lastClockTimestamp, std::min(consumedEnd,
+                boundedTimestamp(static_cast<long double>(clockAnchorTimestamp) + elapsed)));
+            lastClockTimestamp = position;
+        }
+        result.valid = true;
+        result.timestampUs = position;
+        result.bufferedUs = boundedTimestamp(std::max(0.0L, static_cast<long double>(endpoint) - position));
+        // 未 flush 的 SDL 重采样器会保留 future padding：可能 Queued>0、Available==0。
+        // Available 只用于耗尽检测，不计入上面的时长扣减。确认无可输出 PCM、应用环空，
+        // 且输入消费位置经过设备尾部保护期仍未变化后，才允许视频降级到外部时钟。
+        const bool noPlayableData = availableBytes == 0 &&
+            readPosition.load(std::memory_order_relaxed) == writePosition.load(std::memory_order_acquire);
+        if (!options.paused && noPlayableData) {
+            if (!starvationSince || starvationConsumedFrames != consumedFrames) {
+                starvationSince = now;
+                starvationConsumedFrames = consumedFrames;
+            }
+            result.starved = now - *starvationSince >= tailProtection;
+        } else {
+            starvationSince.reset();
+        }
+        return result;
+    }
+
     static void SDLCALL fill(void* userdata, SDL_AudioStream* target, int additionalAmount, int) noexcept {
         auto& self = *static_cast<Impl*>(userdata);
         self.callbacks.fetch_add(1, std::memory_order_relaxed);
         if (self.stopped.load(std::memory_order_acquire) || !self.ready.load(std::memory_order_acquire) ||
             self.callbackFailure.load(std::memory_order_relaxed) != CallbackFailure::None) return;
+
+        self.callbackAt = Clock::now();
 
         // SDL 在调用回调前已持有 stream 锁。这里从不取 control、不分配应用内存、不写日志。
         // additionalAmount 是输入格式的约略字节数，可能高估；只交付实际媒体，欠载由设备补静音。
@@ -181,6 +282,7 @@ struct SDLAudioSink::Impl {
             self.clockTimestamp.store(timestamp, std::memory_order_relaxed);
             self.clockValid.store(timestamp != AV_NOPTS_VALUE, std::memory_order_release);
             self.submittedFrames.fetch_add(count, std::memory_order_relaxed);
+            self.clockSubmittedFrames += count;
             read += count;
             // Put 已复制数据，才允许生产者重新使用这些环形槽位。
             self.readPosition.store(read, std::memory_order_release);
@@ -207,7 +309,8 @@ struct SDLAudioSink::Impl {
         }
         logger.log(logging::Level::Info, module, "SDL float32 playback device=" + options.device +
             " rate=" + std::to_string(options.sampleRate) + " channels=" + std::to_string(options.channels) +
-            " ring_frames=" + std::to_string(capacityFrames) + "; clock tracks callback submissions, not hardware playback");
+            " ring_frames=" + std::to_string(capacityFrames) + " estimated_device_latency_us=" +
+            std::to_string(tailProtection.count()) + "; playback clock is estimated, not a hardware position measurement");
     }
 
     void clearRing() noexcept {
@@ -232,19 +335,35 @@ struct SDLAudioSink::Impl {
             serial.store(generation, std::memory_order_release);
             finished.store(false, std::memory_order_release);
             flushed.store(false, std::memory_order_release);
-            clockValid.store(false, std::memory_order_release);
-            clockTimestamp.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+            clearClock();
         } else {
             clearRing();
             ready.store(false, std::memory_order_release);
             serial.store(generation, std::memory_order_release);
             finished.store(false, std::memory_order_release);
             flushed.store(false, std::memory_order_release);
-            clockValid.store(false, std::memory_order_release);
-            clockTimestamp.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+            clearClock();
         }
+        clockRevision = 0;
         emptySince.reset();
         // 无音轨的新会话保持设备暂停；下一次有效 reset 才按用户的暂停状态恢复。
+    }
+
+    void restartTimeline() {
+        // 同一网络代次内出现明显 PTS 跳变时一起丢弃旧 PCM/SDL 缓存，禁止跨跳变插值。
+        requireSDL(SDL_PauseAudioStreamDevice(stream.get()), "pause audio for timestamp discontinuity");
+        {
+            StreamLock freeze(stream.get());
+            const auto queued = SDL_GetAudioStreamQueued(stream.get());
+            if (queued < 0) failSDL("query audio before timestamp discontinuity");
+            droppedFrames.fetch_add(static_cast<std::uint64_t>(queued) / frameBytes, std::memory_order_relaxed);
+            requireSDL(SDL_ClearAudioStream(stream.get()), "clear discontinuous SDL audio");
+            clearRing();
+            clearClock();
+        }
+        ++clockRevision;
+        emptySince.reset();
+        if (!options.paused) requireSDL(SDL_ResumeAudioStreamDevice(stream.get()), "resume audio after timestamp discontinuity");
     }
 };
 
@@ -286,6 +405,13 @@ bool SDLAudioSink::enqueue(const decoder::DecodedAudioBlock& block) {
     if (count > impl_->capacityFrames) {
         throw error::AppError(module, error::InvalidConfig, "PCM block exceeds ring capacity; decoder must split large blocks");
     }
+    if (count == 0) return true;
+    if (impl_->haveAccepted &&
+        ((impl_->nextTimestampUs == AV_NOPTS_VALUE) != (block.timestampUs == AV_NOPTS_VALUE) ||
+         (block.timestampUs != AV_NOPTS_VALUE && std::abs(static_cast<long double>(block.timestampUs) -
+             impl_->nextTimestampUs) > 100000.0L))) {
+        impl_->restartTimeline();
+    }
     const auto write = impl_->writePosition.load(std::memory_order_relaxed);
     const auto read = impl_->readPosition.load(std::memory_order_acquire);
     if (count > impl_->capacityFrames - static_cast<std::size_t>(write - read)) return false;
@@ -297,6 +423,8 @@ bool SDLAudioSink::enqueue(const decoder::DecodedAudioBlock& block) {
         impl_->endTimestamps[offset] = frameEndTimestamp(block.timestampUs, frame + 1, impl_->options.sampleRate);
     }
     impl_->writePosition.store(write + count, std::memory_order_release);
+    impl_->nextTimestampUs = frameEndTimestamp(block.timestampUs, count, impl_->options.sampleRate);
+    impl_->haveAccepted = true;
     impl_->emptySince.reset();
     return true;
 }
@@ -346,11 +474,26 @@ void SDLAudioSink::setPaused(bool paused) {
     std::lock_guard<std::mutex> lock(impl_->control);
     impl_->checkFailure();
     if (impl_->stopped.load(std::memory_order_acquire)) return;
+    if (paused == impl_->options.paused) return;
     if (impl_->stream && impl_->ready.load(std::memory_order_acquire)) {
-        requireSDL(paused ? SDL_PauseAudioStreamDevice(impl_->stream.get()) : SDL_ResumeAudioStreamDevice(impl_->stream.get()),
-                   paused ? "pause audio playback" : "resume audio playback");
+        if (paused) {
+            requireSDL(SDL_PauseAudioStreamDevice(impl_->stream.get()), "pause audio playback");
+            (void)impl_->estimateClock(); // 先保存暂停瞬间的位置，后续查询不再按墙钟推进。
+        } else {
+            {
+                StreamLock freeze(impl_->stream.get());
+                const auto now = Clock::now();
+                if (impl_->clockAnchorAt) {
+                    impl_->clockAnchorTimestamp = impl_->lastClockTimestamp;
+                    impl_->clockAnchorAt = now;
+                }
+                impl_->callbackAt = now;
+            }
+            requireSDL(SDL_ResumeAudioStreamDevice(impl_->stream.get()), "resume audio playback");
+        }
     }
     impl_->options.paused = paused;
+    impl_->starvationSince.reset();
     impl_->emptySince.reset();
 }
 
@@ -399,12 +542,8 @@ AudioSinkStats SDLAudioSink::stats() const {
 
 AudioClock SDLAudioSink::clock() const {
     std::lock_guard<std::mutex> lock(impl_->control);
-    AudioClock result;
-    result.serial = impl_->serial.load(std::memory_order_relaxed);
-    result.valid = impl_->clockValid.load(std::memory_order_acquire);
-    result.timestampUs = impl_->clockTimestamp.load(std::memory_order_relaxed);
-    result.valid = result.valid && result.timestampUs != AV_NOPTS_VALUE;
-    return result;
+    impl_->checkFailure();
+    return impl_->estimateClock();
 }
 
 void SDLAudioSink::checkError() const {

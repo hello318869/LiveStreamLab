@@ -26,6 +26,12 @@
     "muted": false,
     "paused": false
   },
+  "sync": {
+    "tolerance_ms": 40,
+    "drop_threshold_ms": 100,
+    "audio_wait_ms": 500,
+    "discontinuity_threshold_ms": 1000
+  },
   "logging": {
     "level": "INFO",
     "console": true,

@@ -121,7 +121,14 @@ struct PlayerAudioConfig {
     int bufferMs = 500; // 应用 PCM 环形缓冲目标深度，至少容纳一个解码块。
     int volume = 100;   // 0..100；只影响此播放器，不改变系统音量。
     bool muted = false;
-    bool paused = false; // 仅暂停音频；M13 音画同步尚未实现。
+    bool paused = false; // M13 同时暂停音频与视频；保留 audio.paused 配置名。
+};
+
+struct PlayerSyncConfig {
+    int toleranceMs = 40;                // 视频提前量在此范围内可显示，避免小抖动反复等待。
+    int dropThresholdMs = 100;           // 超过此迟到量且有后续帧时丢弃旧帧。
+    int audioWaitMs = 500;               // 初始音频或欠载恢复等待上限，之后降级到外部时钟。
+    int discontinuityThresholdMs = 1000; // 同一代次内的异常时间戳跳变阈值。
 };
 
 struct PlayerConfig {
@@ -132,6 +139,7 @@ struct PlayerConfig {
     DemuxConfig demux;
     PlayerVideoConfig video;
     PlayerAudioConfig audioPlayback;
+    PlayerSyncConfig sync;
     LoggingConfig logging;
 };
 

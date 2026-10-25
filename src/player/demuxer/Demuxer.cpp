@@ -314,6 +314,9 @@ void Demuxer::start() {
     impl_->started = true;
 }
 PacketEvent Demuxer::pop(TrackKind track, int timeoutMs) { return impl_->buffer.pop(track, timeoutMs); }
+bool Demuxer::resynchronize(std::uint64_t expectedSerial) {
+    return impl_->buffer.resynchronize(expectedSerial);
+}
 void Demuxer::requestStop() noexcept { impl_->requestStop(); }
 void Demuxer::join() { if (impl_->worker.joinable()) impl_->worker.join(); }
 void Demuxer::checkError() const {

@@ -3,9 +3,10 @@
 观众端现已接通 M09 拉流 → M10 视频解码 → M12 SDL3 窗口显示。
 输入使用 RTMP/RTMPS 或 HTTP/HTTPS-FLV，视频按输入流的实际编码参数解码，按视频 PTS 控制显示节奏。
 M11 音频解码与声音输出已接入独立线程及 SDL3 音频流回调，见 [音频播放](audio-playback.md)。
-M13 音画同步仍未实现，视频沿用独立 PTS 节奏；只有音频的输入保留黑色窗口并输出声音。
+M13 已用音频主时钟替代原独立视频时钟，见 [音画同步](av-sync.md)；
+没有可用音频时降级到外部时钟，只有音频的输入保留黑色窗口并输出声音。
 
-2026-10-25 已通过 CMake 配置与 Windows Release 的 `player` 编译、链接，
+2026-10-25 M10/M12 阶段已通过 CMake 配置与 Windows Release 的 `player` 编译、链接，
 生成 `build/cmake/bin/Release/player.exe`。本次未启动程序、未运行测试、未连接 SRS；
 真实解码、显示效果、窗口操作和断线恢复仍需实际运行验收。
 
@@ -54,13 +55,14 @@ F、Alt+Enter 或鼠标左键双击切换全屏；Esc、关闭窗口或 Ctrl+C �
 | `src/player/decoder/VideoDecoder.*` | 解码器初始化、视频包解码、显示格式适配、解码统计 |
 | `src/player/renderer/IVideoRenderer.hpp` | 事件、显示、清屏和渲染统计接口 |
 | `src/player/renderer/SDLVideoRenderer.*` | SDL3 视频子系统、窗口、纹理和渲染后端 |
-| `src/player/pipeline/PlayerPipeline.*` | 网络/解码生命周期、原始帧队列、视频显示时序和日志 |
+| `src/player/sync/AVSynchronizer.*` | 音频主时钟、视频等待/丢帧、外部时钟降级与同步统计 |
+| `src/player/pipeline/PlayerPipeline.*` | 网络/解码生命周期、原始帧队列、同步调用和日志 |
 
 ```text
 网络线程：AVFormatContext → av_read_frame → 视频/音频 PacketBuffer
 解码线程：视频包 → VideoDecoder → DecodedVideoFrame → VideoFrameQueue
 音频线程：音频包 → AudioDecoder → swresample / F32 → SPSC 环 → SDL3 音频回调
-主线程：  SDL 窗口事件 → 取待显示帧 → 视频 PTS 调度 → IVideoRenderer → SDL3
+主线程：  SDL 窗口事件 → 取待显示帧 → AVSynchronizer/音频时钟 → IVideoRenderer → SDL3
 ```
 
 网络线程独占输入上下文，解码线程独占视频解码上下文。所有 SDL 视频操作和资源释放都在主线程执行。
@@ -103,10 +105,11 @@ BT2020 CL 与 SDL 无法表示的色度位置会明确报告不支持。
 这些是各层交接限额，不是整个播放器的内存或端到端延迟保证；解码参考帧、转换临时帧与 SDL 纹理另占资源。
 丢弃已解码帧不会破坏解码器的参考帧链。
 
-`VideoSchedule` 将视频 PTS 增量映射到单调墙钟；缺失 PTS 时用帧时长补时。
-PTS 回退或向前跳变超过 500 ms 时重新锚定，避免等待异常的远期时间戳。
-到期后若迟到超过 100 ms 且队列仍有后续帧，丢弃当前帧追赶；没有后续帧时仍显示该帧。
-这是独立视频时钟，尚未使用音频主时钟，不构成 M13 音画同步。
+`AVSynchronizer` 将视频 PTS 与同代次音频估计播放位置比较，默认提前超过 40 ms 等待，
+迟到超过 100 ms 且仍有后续帧时丢弃当前帧。小幅抖动由容差吸收；缺失 PTS 用帧时长补时，
+但不把补时值记为真实音画误差。初始音频、欠载恢复或有效音频时钟停滞超过等待上限后，
+使用单调外部时钟降级，音频恢复时再跟随音频进度。提前候选帧等待过久且有后续帧时更新候选，
+无帧期间也观察同步暂停。时间戳异常与代次恢复的处理见 [M13](av-sync.md)。
 
 重连、包缓冲超限或网络时间戳跳变递增 `serial`；解码线程重开解码器并清空帧队列，
 主线程丢弃旧待显示帧、清屏并重置时钟。网络线程已换代而 Reset 尚未被解码线程取到时，

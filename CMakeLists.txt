@@ -128,11 +128,15 @@ add_library(lsl_video_renderer STATIC src/player/renderer/SDLVideoRenderer.cpp)
 target_link_libraries(lsl_video_renderer PUBLIC lsl_common SDL3::SDL3)
 lsl_set_warnings(lsl_video_renderer)
 
+add_library(lsl_sync STATIC src/player/sync/AVSynchronizer.cpp)
+target_link_libraries(lsl_sync PUBLIC lsl_common)
+lsl_set_warnings(lsl_sync)
+
 add_library(lsl_player_pipeline STATIC
     src/player/pipeline/PlayerPipeline.cpp
     src/player/pipeline/AudioPlayback.cpp)
 target_link_libraries(lsl_player_pipeline PUBLIC lsl_common
-    PRIVATE lsl_demuxer lsl_video_decoder lsl_video_renderer lsl_audio_decoder lsl_audio_sink)
+    PRIVATE lsl_demuxer lsl_video_decoder lsl_video_renderer lsl_audio_decoder lsl_audio_sink lsl_sync)
 lsl_set_warnings(lsl_player_pipeline)
 
 if(LSL_BUILD_APPS)

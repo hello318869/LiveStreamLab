@@ -16,6 +16,8 @@ public:
 
     void reset(std::shared_ptr<const StreamInfo> streams);
     void invalidate();
+    // 同步器按观察到的代次请求双轨换代；并发重连、停止或 EOF 后不再清理。
+    bool resynchronize(std::uint64_t expectedSerial);
     bool push(TrackKind kind, media::PacketPtr packet, std::int64_t timestampUs);
     PacketEvent pop(TrackKind kind, int timeoutMs);
     void finish();

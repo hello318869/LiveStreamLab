@@ -89,6 +89,10 @@ Json document(const PlayerConfig& c) {
                        {"muted", c.audioPlayback.muted}, {"paused", c.audioPlayback.paused}}},
             {"video", {{"width", c.video.width}, {"height", c.video.height},
                        {"vsync", c.video.vsync}, {"fullscreen", c.video.fullscreen}}},
+            {"sync", {{"tolerance_ms", c.sync.toleranceMs},
+                      {"drop_threshold_ms", c.sync.dropThresholdMs},
+                      {"audio_wait_ms", c.sync.audioWaitMs},
+                      {"discontinuity_threshold_ms", c.sync.discontinuityThresholdMs}}},
             {"logging", document(c.logging)}};
 }
 
@@ -335,6 +339,16 @@ void validate(const PlayerConfig& c) {
     audio(c.sampleRate, c.channels);
     range(c.audioPlayback.bufferMs, 100, 2000, "audio.buffer_ms");
     range(c.audioPlayback.volume, 0, 100, "audio.volume");
+    range(c.sync.toleranceMs, 1, 100, "sync.tolerance_ms");
+    range(c.sync.dropThresholdMs, 1, 1000, "sync.drop_threshold_ms");
+    range(c.sync.audioWaitMs, 100, 5000, "sync.audio_wait_ms");
+    range(c.sync.discontinuityThresholdMs, 500, 10000, "sync.discontinuity_threshold_ms");
+    if (c.sync.dropThresholdMs < c.sync.toleranceMs) {
+        fail("sync.drop_threshold_ms", "must be greater than or equal to sync.tolerance_ms");
+    }
+    if (c.sync.discontinuityThresholdMs <= c.sync.dropThresholdMs) {
+        fail("sync.discontinuity_threshold_ms", "must be greater than sync.drop_threshold_ms");
+    }
     range(c.video.width, 160, 7680, "video.width");
     range(c.video.height, 90, 4320, "video.height");
     range(c.demux.connectTimeoutMs, 100, 60000, "input.connect_timeout_ms");
@@ -431,6 +445,11 @@ PlayerConfig parsePlayerConfig(std::string_view text, const Overrides& overrides
     c.video.height = integer(data["video"]["height"], "video.height");
     c.video.vsync = data["video"]["vsync"].get<bool>();
     c.video.fullscreen = data["video"]["fullscreen"].get<bool>();
+    const auto& sync = data["sync"];
+    c.sync.toleranceMs = integer(sync["tolerance_ms"], "sync.tolerance_ms");
+    c.sync.dropThresholdMs = integer(sync["drop_threshold_ms"], "sync.drop_threshold_ms");
+    c.sync.audioWaitMs = integer(sync["audio_wait_ms"], "sync.audio_wait_ms");
+    c.sync.discontinuityThresholdMs = integer(sync["discontinuity_threshold_ms"], "sync.discontinuity_threshold_ms");
     c.logging = loggingConfig(data["logging"]);
     validate(c);
     return c;

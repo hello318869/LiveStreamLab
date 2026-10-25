@@ -11,6 +11,8 @@ namespace lsl::player {
 struct AudioPlaybackStats {
     decoder::AudioDecodeStats decode;
     std::uint64_t consumedPackets = 0;
+    std::uint64_t serial = 0;
+    bool activeTrack = false; // 当前代次已发现音轨且启用了声音输出。
     bool finished = false;
 };
 

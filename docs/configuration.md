@@ -47,7 +47,7 @@
 | `preprocess.audio.gain_db` | `0` | -60–30 dB，重采样后、编码前的软件 PCM 增益；0 保留原电平，不修改系统设备音量 |
 | `preprocess.audio.discontinuity_threshold_ms` | `100` | 1–1000 ms，区分时间抖动与不连续 |
 
-观众端 M09 输入、M11 音频与 M12 显示字段：
+观众端 M09 输入、M11 音频、M12 显示与 M13 同步字段：
 
 | 观众端字段 | 默认值 | 校验及含义 |
 |---|---|---|
@@ -68,12 +68,16 @@
 | `audio.enabled` | `true` | 启用音频解码与播放；禁用后仍消费并释放音频包 |
 | `audio.buffer_ms` | `500` | 100–2000 ms，PCM 环形缓冲目标深度，实际容量至少 4096 个每声道样本 |
 | `audio.volume` | `100` | 0–100，只改变播放器音量 |
-| `audio.muted` / `audio.paused` | `false` / `false` | 启动时静音 / 仅暂停音频 |
+| `audio.muted` / `audio.paused` | `false` / `false` | 启动时静音 / 同时暂停声音与视频，暂停沿用旧字段名 |
+| `sync.tolerance_ms` | `40` | 1–100 ms，视频允许提前显示的容差 |
+| `sync.drop_threshold_ms` | `100` | 1–1000 ms，迟到丢帧阈值，且不小于容差 |
+| `sync.audio_wait_ms` | `500` | 100–5000 ms，初始音频、欠载恢复或有效时钟停滞的等待上限 |
+| `sync.discontinuity_threshold_ms` | `1000` | 500–10000 ms，调度显著失步判定及提前帧候选等待阈值，且大于丢帧阈值 |
 
 观众端音频按流参数解码，再转换为配置的输出采样率与声道数；输出设置不覆盖输入编码参数。
-音画同步尚未实现；Space 仅暂停声音，M 静音，↑/↓ 每次调节 10% 音量。
+音频主时钟驱动视频，Space 同时暂停声音与视频，M 静音，↑/↓ 每次调节 10% 音量。
 网络缓冲见 [M09](network-demuxing.md)，视频节奏见 [M10/M12](video-playback.md)，
-音频接口、缓冲与提交侧时钟口径见 [M11](audio-playback.md)。
+音频接口与缓冲见 [M11](audio-playback.md)，估计播放时钟、降级及误差口径见 [M13](av-sync.md)。
 主播端与观众端都接受 `video.width` / `video.height`，前者控制编码尺寸，后者只设置初始窗口尺寸。
 
 AAC 采样率：7350、8000、11025、12000、16000、22050、24000、32000、44100、48000、
@@ -143,7 +147,9 @@ PCM 格式与帧长协商、尾帧和编码延迟见 [M06](audio-encoding.md)。
 Esc、关闭窗口或 Ctrl+C 停止。
 观众端音频支持 `--play-audio BOOL`、`--audio-buffer-ms MS`、`--volume N`、`--mute BOOL` 和
 `--audio-paused BOOL`，分别覆盖 `audio.enabled`、`audio.buffer_ms`、`audio.volume`、`audio.muted`、`audio.paused`；
-输出设备、采样率、声道沿用 `--audio-device`、`--sample-rate`、`--channels`。本次未实现音画同步。
+输出设备、采样率、声道沿用 `--audio-device`、`--sample-rate`、`--channels`。
+`--audio-paused` 现在同时暂停音画，保留原参数名；M13 参数通过通用 `--set` 覆盖，
+例如 `--set sync.tolerance_ms=30 --set sync.audio_wait_ms=500`。
 `--list-devices` 枚举摄像头、麦克风，`--list-options video|audio` 查询所选摄像头/麦克风能力，
 均不启动桌面采集；查询摄像头能力不要求先切换 `capture.video_source`。
 布尔值只接受 `true` / `false`，整数使用完整十进制文本。
