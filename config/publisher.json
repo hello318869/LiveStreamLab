@@ -6,7 +6,14 @@
   "output": {
     "url": "rtmp://127.0.0.1/live/livestream",
     "video_file": "output/video.mp4",
-    "audio_file": "output/audio.m4a"
+    "audio_file": "output/audio.m4a",
+    "streaming": false,
+    "connect_timeout_ms": 5000,
+    "write_timeout_ms": 5000,
+    "reconnect_attempts": 5,
+    "reconnect_delay_ms": 1000,
+    "queue_capacity": 256,
+    "max_interleave_delta_ms": 500
   },
   "video": {
     "width": 1280,
@@ -26,6 +33,7 @@
   },
   "capture": {
     "source": "devices",
+    "video_source": "desktop",
     "audio_source": "microphone",
     "file": "",
     "loop": false,

@@ -41,6 +41,7 @@ struct AudioConfig {
 
 struct CaptureConfig {
     std::string source = "devices"; // devices 或 file
+    std::string videoSource = "desktop"; // 设备模式：Windows desktop 或可选 camera
     std::string audioSource = "microphone"; // 设备模式：microphone 或 Windows system 回采
     std::string file;              // UTF-8 本地媒体路径
     bool loop = false;
@@ -48,7 +49,7 @@ struct CaptureConfig {
     bool video = true;
     bool audio = true;
     int timeoutMs = 5000;          // 单次设备读包/打开的超时
-    std::string videoFormat;       // 空值让驱动协商；如 yuyv422、mjpeg
+    std::string videoFormat;       // 仅摄像头：空值让驱动协商；如 yuyv422、mjpeg
 };
 
 struct VideoPreprocessConfig {
@@ -72,6 +73,16 @@ struct PreprocessConfig {
     AudioPreprocessConfig audio;
 };
 
+struct StreamingConfig {
+    bool enabled = false;              // 显式启用 M07；原有本地录制默认行为保留。
+    int connectTimeoutMs = 5000;
+    int writeTimeoutMs = 5000;
+    int reconnectAttempts = 5;          // 每次连接故障最多重试次数；0 禁用重连。
+    int reconnectDelayMs = 1000;
+    int queueCapacity = 256;            // 待复用编码包数量上限。
+    int maxInterleaveDeltaMs = 500;     // 音视频交织的最大等待跨度。
+};
+
 struct PublisherConfig {
     std::string videoDevice = "default";
     std::string audioDevice = "default";
@@ -83,6 +94,7 @@ struct PublisherConfig {
     AudioConfig audio;
     CaptureConfig capture;
     PreprocessConfig preprocess;
+    StreamingConfig streaming;
     LoggingConfig logging;
 };
 

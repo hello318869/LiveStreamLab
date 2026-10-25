@@ -1,9 +1,9 @@
-#include "publisher/encode/AudioFileWriter.hpp"
+#include "publisher/muxer/AudioFileWriter.hpp"
 
 #include <filesystem>
 #include <utility>
 
-namespace lsl::encode {
+namespace lsl::muxer {
 namespace {
 
 constexpr const char* module = "audio-file";
@@ -125,4 +125,4 @@ void AudioFileWriter::finish() {
     }
 }
 
-} // namespace lsl::encode
+} // namespace lsl::muxer

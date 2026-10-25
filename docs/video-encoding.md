@@ -6,8 +6,8 @@
 `D:\直播\LiveStreamLab\output\video.mp4`。
 
 输出是只有视频轨的 MP4。M06 已将音频编码为 AAC，独立保存为 `output/audio.m4a`；
-`output.url` / `--url` 留给 M07 的 RTMP 推流，目前不建立网络连接。
-本次只实现自动保存功能，没有运行采集程序或生成实际录像。
+`output.url` / `--url` 由 M07 使用；设置 `output.streaming=true` / `--stream true` 后进行 FLV/RTMP 推流，
+默认仍关闭推流。当前推流用法见 [M07](rtmp-streaming.md)。下文保留 M05 阶段的实现与验证记录。
 
 ## 参数
 
@@ -66,9 +66,10 @@ MediaInput → CapturedFrame → VideoPreprocessor → VideoEncoder
   → 独占 PacketPtr → VideoFileWriter → output/video.mp4
 ```
 
-`lsl_video_encode` 包含 `VideoEncoder` 与最小单路 MP4 写出器，链接 `lsl_common`。
+`lsl_video_encoder` 仅包含 `encoder/VideoEncoder`；`muxer/VideoFileWriter` 属于 `lsl_muxer`。
+两者均链接 `lsl_common`，由 `pipeline/PublisherPipeline` 组合调用。
 编码器、写出器和视频预处理器都在视频输入所属线程内调用。
-M14 的有界队列流水线尚未实现；当前直接交接独占包，不共享可变 AVPacket。
+M14 的完整处理队列流水线尚未实现；本地写出直接交接独占包，M07 使用独立的复用队列，均不共享可变 AVPacket。
 
 - `encode(const AVFrame&)` 返回零个、一个或多个编码包。send 返回 EAGAIN 时先 receive，
   然后重送尚未被接收的同一帧；不能把 EAGAIN 当作丢帧。
@@ -88,6 +89,6 @@ M14 的有界队列流水线尚未实现；当前直接交接独占包，不共�
 
 ## 本次完成边界（2026-10-24）
 
-M05 实现已接入 CMake、主播端、配置与命令行。Windows Release 完整构建通过，
-包括 `lsl_video_encode`、`publisher`、SDL3 与 `player` 的编译、链接。
+M05 实现已接入 CMake、主播端、配置与命令行。当时 Windows Release 完整构建通过，
+包括当时的 `lsl_video_encode`、`publisher`、SDL3 与 `player` 的编译、链接。
 按要求没有运行测试、采集或录像；视频可解码性、设备运行表现与其他平台兼容性尚未运行验收。

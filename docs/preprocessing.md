@@ -2,7 +2,7 @@
 
 `lsl_preprocess` 提供两个独立组件，输入为 M02 解码得到的 `AVFrame` 和
 `CapturedFrame::timestampUs`，输出为独占的 `media::FramePtr`。
-主播端已经在 `CaptureApp.cpp` 的读取循环调用预处理，视频输出继续交给 M05 编码并保存，
+主播端已经在 `pipeline/PublisherPipeline.cpp` 的读取循环调用预处理，视频输出继续交给 M05 编码并保存，
 音频输出继续交给 M06 编码为 AAC 并单独保存到 M4A，参见 [音频编码](audio-encoding.md)。
 
 ## 视频 M03

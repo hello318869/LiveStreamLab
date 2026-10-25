@@ -1,4 +1,4 @@
-#include "publisher/encode/AudioEncoder.hpp"
+#include "publisher/encoder/AudioEncoder.hpp"
 
 extern "C" {
 #include <libavcodec/version.h>
@@ -13,7 +13,7 @@ extern "C" {
 #include <string_view>
 #include <utility>
 
-namespace lsl::encode {
+namespace lsl::encoder {
 namespace {
 
 constexpr std::string_view module = "audio-encode";
@@ -274,4 +274,4 @@ bool AudioEncoder::supportsSmallLastFrame() const noexcept { return impl_->suppo
 std::string AudioEncoder::codecName() const { return impl_->context->codec->name; }
 AudioEncoderStats AudioEncoder::stats() const noexcept { return impl_->counters; }
 
-} // namespace lsl::encode
+} // namespace lsl::encoder

@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace lsl::encode {
+namespace lsl::muxer {
 
 // M05 的单路 H.264 本地输出；不承担 M07 的音视频交织或网络推流职责。
 // 单线程使用，接收独占 AVPacket；编码器必须启用 AV_CODEC_FLAG_GLOBAL_HEADER。
@@ -34,4 +34,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace lsl::encode
+} // namespace lsl::muxer

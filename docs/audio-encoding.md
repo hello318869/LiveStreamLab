@@ -6,7 +6,11 @@
 `D:\直播\LiveStreamLab\output\audio.m4a`。
 
 当前视频保存为 `output/video.mp4`，音频保存为独立 M4A（内部编码为 AAC）。
-M07 再进行 H.264/AAC 合并封装与推流，本阶段不连接 `output.url`。
+M07 已提供 H.264/AAC 合并封装与推流，设置 `output.streaming=true` / `--stream true` 后连接 `output.url`。
+默认仍仅保存本地文件；推流用法见 [M07](rtmp-streaming.md)。下文保留 M06 阶段的实现与验证记录。
+
+当前 `encoder/AudioEncoder` 属于 `lsl_audio_encoder`，`muxer/AudioFileWriter` 属于 `lsl_muxer`，
+由 `pipeline/PublisherPipeline` 组合调用。命名空间分别为 `lsl::encoder` 与 `lsl::muxer`。
 
 ## 编码参数与预处理协商
 
@@ -51,10 +55,10 @@ AAC 编码有内部延迟，一次输入可能产生零个或多个包。send �
 输出包保留编码器产生的 PTS、DTS、duration 和 side data。首包因 priming 可能有负时间戳，
 不会擅自裁掉或移到零；`parameters()` 返回的独占参数保留 AudioSpecificConfig 和
 `initial_padding`。M4A 写出器复制编码参数，保留包 side data，按流时间基换算时间戳，
-由容器处理编码延迟。这些信息同样可供后续 M07 与视频合并输出。
+由容器处理编码延迟。这些信息也供 M07 与视频合并输出。
 
 每轨的预处理、编码和本地写出在所属输入线程内串行完成，包通过 `PacketPtr` 移动交接。
-M14 再加入有界队列流水线，当前没有共享可变 AVPacket。
+M14 再加入完整的预处理/编码队列流水线；M07 已单独提供编码包复用队列，没有共享可变 AVPacket。
 
 正常 EOF / Ctrl+C 的顺序：停止输入 → 排空预处理 → 排空编码器 → 写完文件尾部并关闭。
 `finish()` 幂等并检查写尾、刷新和关闭错误；异常文件不会报告为完整输出。
@@ -85,8 +89,9 @@ JSON 中设置 `output.audio_file` 为 `""`，或使用 `--set output.audio_file
 统计日志包含 `encoded_audio_frames`、`encoded_audio_samples`、`aac_packets` 和 `aac_bytes`；
 样本数指每声道样本数，编码字节数不代表网络发送量。
 
-Windows Release 的 CMake 完整构建通过，包括 `lsl_audio_encode`、`lsl_preprocess`、
+M06 当时的 Windows Release CMake 完整构建通过，包括当时的 `lsl_audio_encode`、`lsl_preprocess`、
 `lsl_capture`、`publisher` 和 `player` 的编译、链接。
-M06 初次接入时只进行了编译。本轮用户允许测试后，已完成增益定向测试、已知音调文件回归，
+M06 初次接入时只进行了编译。在 2026-10-24 的后续音频诊断中，用户当时允许测试，
+已完成增益定向测试、已知音调文件回归，
 以及短时麦克风和 WASAPI 系统声音采集后的 AAC/M4A 解码检查。
 音源选择、弱输入处理和实测证据见 [音频诊断](audio-diagnosis.md)。

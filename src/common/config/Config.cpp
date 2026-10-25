@@ -39,7 +39,14 @@ void validateLogging(const LoggingConfig& c) {
 
 Json document(const PublisherConfig& c) {
     return {{"devices", {{"video", c.videoDevice}, {"audio", c.audioDevice}}},
-            {"output", {{"url", c.outputUrl}, {"video_file", c.videoFile}, {"audio_file", c.audioFile}}},
+            {"output", {{"url", c.outputUrl}, {"video_file", c.videoFile}, {"audio_file", c.audioFile},
+                        {"streaming", c.streaming.enabled},
+                        {"connect_timeout_ms", c.streaming.connectTimeoutMs},
+                        {"write_timeout_ms", c.streaming.writeTimeoutMs},
+                        {"reconnect_attempts", c.streaming.reconnectAttempts},
+                        {"reconnect_delay_ms", c.streaming.reconnectDelayMs},
+                        {"queue_capacity", c.streaming.queueCapacity},
+                        {"max_interleave_delta_ms", c.streaming.maxInterleaveDeltaMs}}},
             {"video", {{"width", c.video.width}, {"height", c.video.height},
                        {"fps", c.video.fps}, {"bitrate", c.video.bitrate}}},
             {"video_encoder", {{"gop_size", c.videoEncoder.gopSize},
@@ -47,7 +54,8 @@ Json document(const PublisherConfig& c) {
                                {"low_latency", c.videoEncoder.lowLatency}}},
             {"audio", {{"sample_rate", c.audio.sampleRate}, {"channels", c.audio.channels},
                        {"bitrate", c.audio.bitrate}}},
-            {"capture", {{"source", c.capture.source}, {"audio_source", c.capture.audioSource},
+            {"capture", {{"source", c.capture.source}, {"video_source", c.capture.videoSource},
+                         {"audio_source", c.capture.audioSource},
                          {"file", c.capture.file},
                          {"loop", c.capture.loop}, {"realtime", c.capture.realtime},
                          {"video", c.capture.video}, {"audio", c.capture.audio},
@@ -240,6 +248,15 @@ void validate(const PublisherConfig& c) {
     url(c.outputUrl, true);
     mediaFile(c.videoFile, "output.video_file", ".mp4");
     mediaFile(c.audioFile, "output.audio_file", ".m4a");
+    range(c.streaming.connectTimeoutMs, 100, 60000, "output.connect_timeout_ms");
+    range(c.streaming.writeTimeoutMs, 100, 60000, "output.write_timeout_ms");
+    range(c.streaming.reconnectAttempts, 0, 100, "output.reconnect_attempts");
+    range(c.streaming.reconnectDelayMs, 0, 60000, "output.reconnect_delay_ms");
+    range(c.streaming.queueCapacity, 8, 4096, "output.queue_capacity");
+    range(c.streaming.maxInterleaveDeltaMs, 1, 5000, "output.max_interleave_delta_ms");
+    if (c.streaming.enabled && c.capture.source == "file" && !c.capture.realtime) {
+        fail("capture.realtime", "must be true when streaming a local file");
+    }
     range(c.video.width, 2, 7680, "video.width");
     range(c.video.height, 2, 4320, "video.height");
     if (c.video.width % 2 != 0 || c.video.height % 2 != 0) {
@@ -257,6 +274,9 @@ void validate(const PublisherConfig& c) {
     range(c.audio.bitrate, 16000, 512000, "audio.bitrate");
     if (c.capture.source != "devices" && c.capture.source != "file") {
         fail("capture.source", "expected devices or file");
+    }
+    if (c.capture.videoSource != "desktop" && c.capture.videoSource != "camera") {
+        fail("capture.video_source", "expected desktop or camera");
     }
     if (c.capture.audioSource != "microphone" && c.capture.audioSource != "system") {
         fail("capture.audio_source", "expected microphone or system");
@@ -313,6 +333,14 @@ PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& ove
     c.outputUrl = data["output"]["url"].get<std::string>();
     c.videoFile = data["output"]["video_file"].get<std::string>();
     c.audioFile = data["output"]["audio_file"].get<std::string>();
+    const auto& output = data["output"];
+    c.streaming.enabled = output["streaming"].get<bool>();
+    c.streaming.connectTimeoutMs = integer(output["connect_timeout_ms"], "output.connect_timeout_ms");
+    c.streaming.writeTimeoutMs = integer(output["write_timeout_ms"], "output.write_timeout_ms");
+    c.streaming.reconnectAttempts = integer(output["reconnect_attempts"], "output.reconnect_attempts");
+    c.streaming.reconnectDelayMs = integer(output["reconnect_delay_ms"], "output.reconnect_delay_ms");
+    c.streaming.queueCapacity = integer(output["queue_capacity"], "output.queue_capacity");
+    c.streaming.maxInterleaveDeltaMs = integer(output["max_interleave_delta_ms"], "output.max_interleave_delta_ms");
     c.video.width = integer(data["video"]["width"], "video.width");
     c.video.height = integer(data["video"]["height"], "video.height");
     c.video.fps = integer(data["video"]["fps"], "video.fps");
@@ -325,6 +353,7 @@ PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& ove
     c.audio.bitrate = integer(data["audio"]["bitrate"], "audio.bitrate");
     const auto& capture = data["capture"];
     c.capture.source = capture["source"].get<std::string>();
+    c.capture.videoSource = capture["video_source"].get<std::string>();
     c.capture.audioSource = capture["audio_source"].get<std::string>();
     c.capture.file = capture["file"].get<std::string>();
     c.capture.loop = capture["loop"].get<bool>();

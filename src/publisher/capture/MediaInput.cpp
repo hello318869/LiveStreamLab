@@ -16,6 +16,7 @@ extern "C" {
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <string_view>
 
 namespace lsl::capture {
 namespace {
@@ -90,7 +91,10 @@ struct MediaInput::Impl {
         deadlineUs = 0;
         format.reset(raw);
         options.reset(rawOptions);
-        error::throwIfFFmpegFailed(result, "capture", "open input (check device name, permissions, busy device and requested format)");
+        const bool desktop = backend && std::string_view(backend->name) == "gdigrab";
+        error::throwIfFFmpegFailed(result, "capture", desktop
+            ? "open Windows desktop (check interactive desktop access and permissions)"
+            : "open input (check device name, permissions, busy device and requested format)");
         if (options && av_dict_count(options.get())) {
             const auto* unknown = av_dict_get(options.get(), "", nullptr, AV_DICT_IGNORE_SUFFIX);
             throw error::AppError("capture", error::InvalidConfig, std::string("unsupported input option: ") + unknown->key);
@@ -283,6 +287,27 @@ void MediaInput::openDevice(Kind kind, const config::PublisherConfig& config) {
     impl_->requireClosed();
     config::validate(config);
     impl_->timeoutMs = config.capture.timeoutMs;
+    if (kind == Kind::Video && config.capture.videoSource == "desktop") {
+#ifdef _WIN32
+        detail::registerDevices();
+        const auto* backend = av_find_input_format("gdigrab");
+        if (!backend) throw error::AppError("capture", error::NotImplemented,
+            "FFmpeg was built without gdigrab; desktop capture requires this input backend");
+        media::DictionaryPtr options;
+        setOption(options, "framerate", std::to_string(config.video.fps));
+        setOption(options, "draw_mouse", "1");
+        // 不设置 video_size：gdigrab 将其视为裁剪范围。完整虚拟桌面由 M03 缩放到输出宽高。
+        // 非阻塞读包沿用既有 EAGAIN 等待、停止标志和超时，不需要摄像头枚举或设备名称。
+        try {
+            impl_->open("desktop", backend, std::move(options));
+            impl_->addDecoder(Kind::Video, true);
+            impl_->sourceDescription = "desktop: full Windows virtual desktop (cursor included)";
+        } catch (...) { close(); throw; }
+        return;
+#else
+        throw error::ConfigError("capture.video_source: desktop capture currently requires Windows; use --video-source camera");
+#endif
+    }
     if (kind == Kind::Audio && config.capture.audioSource == "system") {
         try {
             impl_->systemAudio = std::make_unique<SystemAudioInput>();
@@ -376,6 +401,12 @@ std::optional<CapturedFrame> MediaInput::readFrame() {
 }
 
 std::string MediaInput::sourceDescription() const { return impl_->sourceDescription; }
+
+bool MediaInput::hasTrack(Kind kind) const noexcept {
+    if (impl_->systemAudio && kind == Kind::Audio) return true;
+    return std::any_of(impl_->decoders.begin(), impl_->decoders.end(),
+        [kind](const Impl::Decoder& decoder) { return decoder.kind == kind; });
+}
 
 void MediaInput::requestStop() noexcept {
     impl_->stopped = true;

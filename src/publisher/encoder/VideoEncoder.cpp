@@ -1,4 +1,4 @@
-#include "publisher/encode/VideoEncoder.hpp"
+#include "publisher/encoder/VideoEncoder.hpp"
 
 extern "C" {
 #include <libavutil/imgutils.h>
@@ -11,7 +11,7 @@ extern "C" {
 #include <string_view>
 #include <utility>
 
-namespace lsl::encode {
+namespace lsl::encoder {
 namespace {
 
 constexpr std::string_view module = "video-encode";
@@ -226,4 +226,4 @@ VideoEncoderStats VideoEncoder::stats() const noexcept { return impl_->counters;
 
 std::string VideoEncoder::codecName() const { return impl_->context->codec->name; }
 
-} // namespace lsl::encode
+} // namespace lsl::encoder

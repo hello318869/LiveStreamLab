@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace lsl::encode {
+namespace lsl::encoder {
 
 struct AudioEncoderOptions {
     int sampleRate = 48000;
@@ -55,4 +55,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace lsl::encode
+} // namespace lsl::encoder

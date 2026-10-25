@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace lsl::encode {
+namespace lsl::muxer {
 
 // M06 的单路 AAC 本地输出；M07 再处理音视频交织和网络推流。
 // 单线程使用，接收独占 AVPacket；编码器必须启用 AV_CODEC_FLAG_GLOBAL_HEADER。
@@ -32,4 +32,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace lsl::encode
+} // namespace lsl::muxer

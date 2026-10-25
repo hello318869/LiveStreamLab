@@ -48,6 +48,8 @@ public:
     std::optional<CapturedFrame> readFrame();
     // 已打开的实际设备或文件，供启动日志明确显示音源。
     std::string sourceDescription() const;
+    // 在 open 后、所属输入线程中查询实际启用的轨道；文件允许缺少其中一轨。
+    bool hasTrack(Kind kind) const noexcept;
     void requestStop() noexcept;
     void close() noexcept; // 幂等，close 后可再次 open；已打开时再次 open 会报错
 

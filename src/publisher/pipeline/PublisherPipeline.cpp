@@ -1,9 +1,10 @@
-#include "publisher/capture/CaptureApp.hpp"
+#include "publisher/pipeline/PublisherPipeline.hpp"
 #include "publisher/capture/MediaInput.hpp"
-#include "publisher/encode/AudioEncoder.hpp"
-#include "publisher/encode/AudioFileWriter.hpp"
-#include "publisher/encode/VideoEncoder.hpp"
-#include "publisher/encode/VideoFileWriter.hpp"
+#include "publisher/encoder/AudioEncoder.hpp"
+#include "publisher/muxer/AudioFileWriter.hpp"
+#include "publisher/encoder/VideoEncoder.hpp"
+#include "publisher/muxer/VideoFileWriter.hpp"
+#include "publisher/rtmp/RtmpPublisher.hpp"
 #include "publisher/preprocess/AudioPreprocessor.hpp"
 #include "publisher/preprocess/VideoPreprocessor.hpp"
 
@@ -27,7 +28,7 @@ extern "C" {
 #include <sstream>
 #include <thread>
 
-namespace lsl::capture {
+namespace lsl::pipeline {
 namespace {
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires a lock-free stop flag");
 std::atomic<bool> stopRequested{false};
@@ -51,8 +52,8 @@ private:
     Handler oldTerminate_;
 };
 
-std::string describe(const AVFrame& frame, Kind kind) {
-    if (kind == Kind::Video) {
+std::string describe(const AVFrame& frame, capture::Kind kind) {
+    if (kind == capture::Kind::Video) {
         const auto* format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame.format));
         return std::to_string(frame.width) + "x" + std::to_string(frame.height) + " " + (format ? format : "unknown");
     }
@@ -126,7 +127,7 @@ preprocess::VideoPreprocessOptions videoOptions(const config::PublisherConfig& c
 }
 
 preprocess::AudioPreprocessOptions audioOptions(const config::PublisherConfig& config,
-                                               const encode::AudioEncoder& encoder) {
+                                               const encoder::AudioEncoder& encoder) {
     preprocess::AudioPreprocessOptions options;
     // M06 先打开 AAC 编码器，再用它实际接受的格式与 frame_size 组织 PCM。
     options.sampleRate = encoder.sampleRate();
@@ -139,18 +140,18 @@ preprocess::AudioPreprocessOptions audioOptions(const config::PublisherConfig& c
     return options;
 }
 
-encode::AudioEncoderOptions audioEncoderOptions(const config::PublisherConfig& config) {
-    encode::AudioEncoderOptions options;
+encoder::AudioEncoderOptions audioEncoderOptions(const config::PublisherConfig& config) {
+    encoder::AudioEncoderOptions options;
     options.sampleRate = config.audio.sampleRate;
     options.channels = config.audio.channels;
     options.bitrate = config.audio.bitrate;
     options.preferredSampleFormat = av_get_sample_fmt(config.preprocess.audio.sampleFormat.c_str());
-    options.globalHeader = !config.audioFile.empty();
+    options.globalHeader = !config.audioFile.empty() || config.streaming.enabled;
     return options;
 }
 
-encode::VideoEncoderOptions encoderOptions(const config::PublisherConfig& config, const AVFrame& firstFrame) {
-    encode::VideoEncoderOptions options;
+encoder::VideoEncoderOptions encoderOptions(const config::PublisherConfig& config, const AVFrame& firstFrame) {
+    encoder::VideoEncoderOptions options;
     options.width = config.video.width;
     options.height = config.video.height;
     options.fps = config.video.fps;
@@ -164,8 +165,8 @@ encode::VideoEncoderOptions encoderOptions(const config::PublisherConfig& config
     options.colorPrimaries = firstFrame.color_primaries;
     options.colorTransfer = firstFrame.color_trc;
     options.chromaLocation = firstFrame.chroma_location;
-    // MP4 的 SPS/PPS 存在流参数中；后续 M07 可按实际输出格式选择此标志。
-    options.globalHeader = !config.videoFile.empty();
+    // MP4 与 FLV 都需要从编码参数取得 SPS/PPS，即使禁用本地文件也必须启用。
+    options.globalHeader = !config.videoFile.empty() || config.streaming.enabled;
     return options;
 }
 } // namespace
@@ -174,10 +175,10 @@ int runPublisher(const config::PublisherConfig& config,
                  const config::CommandLineOptions& options, logging::Logger& logger) {
     if (options.listDevices) {
         bool failed = false;
-        for (const auto kind : {Kind::Video, Kind::Audio}) {
+        for (const auto kind : {capture::Kind::Video, capture::Kind::Audio}) {
             try {
-                const auto devices = listDevices(kind);
-                std::cout << kindName(kind) << " devices: " << devices.size() << '\n';
+                const auto devices = capture::listDevices(kind);
+                std::cout << capture::kindName(kind) << " devices: " << devices.size() << '\n';
                 for (const auto& device : devices) {
                     std::cout << "  " << device.description << "\n    id: " << device.id << '\n';
                 }
@@ -189,21 +190,21 @@ int runPublisher(const config::PublisherConfig& config,
         return failed ? 1 : 0;
     }
     if (!options.deviceOptions.empty()) {
-        const auto kind = options.deviceOptions == "video" ? Kind::Video : Kind::Audio;
-        printDeviceOptions(kind, kind == Kind::Video ? config.videoDevice : config.audioDevice);
+        const auto kind = options.deviceOptions == "video" ? capture::Kind::Video : capture::Kind::Audio;
+        capture::printDeviceOptions(kind, kind == capture::Kind::Video ? config.videoDevice : config.audioDevice);
         return 0;
     }
 
     SignalScope signals;
-    std::vector<std::unique_ptr<MediaInput>> inputs;
-    std::vector<Kind> kinds;
+    std::vector<std::unique_ptr<capture::MediaInput>> inputs;
+    std::vector<capture::Kind> kinds;
     if (config.capture.source == "file") {
-        inputs.push_back(std::make_unique<MediaInput>());
-        kinds.push_back(Kind::Video); // 文件线程同时处理所启用的音视频轨。
+        inputs.push_back(std::make_unique<capture::MediaInput>());
+        kinds.push_back(capture::Kind::Video); // 文件线程同时处理所启用的音视频轨。
     } else {
-        for (const auto kind : {Kind::Video, Kind::Audio}) {
-            if ((kind == Kind::Video && !config.capture.video) || (kind == Kind::Audio && !config.capture.audio)) continue;
-            inputs.push_back(std::make_unique<MediaInput>());
+        for (const auto kind : {capture::Kind::Video, capture::Kind::Audio}) {
+            if ((kind == capture::Kind::Video && !config.capture.video) || (kind == capture::Kind::Audio && !config.capture.audio)) continue;
+            inputs.push_back(std::make_unique<capture::MediaInput>());
             kinds.push_back(kind);
         }
     }
@@ -216,12 +217,29 @@ int runPublisher(const config::PublisherConfig& config,
     std::vector<std::thread> workers;
     // 两个设备使用同一个时钟原点，保留启动偏移；文件的 M02 时间戳已经共用零点。
     const std::int64_t originUs = config.capture.source == "file" ? 0 : av_gettime_relative();
+    std::unique_ptr<rtmp::RtmpPublisher> streaming;
+    if (config.streaming.enabled) {
+        streaming = std::make_unique<rtmp::RtmpPublisher>(config, logger);
+        if (config.capture.source != "file") streaming->start(config.capture.video, config.capture.audio);
+    }
+    const auto reportStreaming = [&](const std::string& phase) {
+        const auto stats = streaming->stats();
+        logger.log(logging::Level::Info, "network", phase + ": sent_packets=" + std::to_string(stats.sentPackets)
+            + " sent_payload_bytes=" + std::to_string(stats.sentBytes)
+            + " average_bitrate_bps=" + std::to_string(stats.averageBitrate)
+            + " duration_seconds=" + std::to_string(stats.durationSeconds)
+            + " dropped_packets=" + std::to_string(stats.droppedPackets)
+            + " network_errors=" + std::to_string(stats.networkErrors)
+            + " reconnects=" + std::to_string(stats.reconnects));
+    };
     const auto stopAll = [&] {
         cancelling = true;
         for (auto& input : inputs) input->requestStop();
+        // 网络中断不等待编码排空：直播尾包允许丢弃，本地录制仍走正常写尾路径。
+        if (streaming) streaming->requestStop();
     };
     const auto joinAll = [&] { for (auto& worker : workers) if (worker.joinable()) worker.join(); };
-    logger.log(logging::Level::Info, "capture", "M02-M06 capture, preprocessing and H.264/AAC encoding started. Ctrl+C stops processing.");
+    logger.log(logging::Level::Info, "capture", "M02-M07 capture, preprocessing and H.264/AAC encoding started. Ctrl+C stops processing.");
     try {
         for (std::size_t i = 0; i < inputs.size(); ++i) {
             workers.emplace_back([&, i] {
@@ -231,12 +249,12 @@ int runPublisher(const config::PublisherConfig& config,
                 std::uint64_t audioSamples = 0;
                 std::unique_ptr<preprocess::VideoPreprocessor> video;
                 std::unique_ptr<preprocess::AudioPreprocessor> audio;
-                // 每轨的预处理、编码与本地写出都在所属输入线程串行执行。
-                // M14 再引入有界队列；交接的包结构已由 PacketPtr 独占。
-                std::unique_ptr<encode::VideoEncoder> encoder;
-                std::unique_ptr<encode::VideoFileWriter> videoFile;
-                std::unique_ptr<encode::AudioEncoder> audioEncoder;
-                std::unique_ptr<encode::AudioFileWriter> audioFile;
+                // 每轨预处理、编码与本地写出留在所属输入线程；M07 独占网络复用线程。
+                // M14 再拆分完整流水线；交给网络的包结构由 PacketPtr 独占。
+                std::unique_ptr<encoder::VideoEncoder> encoder;
+                std::unique_ptr<muxer::VideoFileWriter> videoFile;
+                std::unique_ptr<encoder::AudioEncoder> audioEncoder;
+                std::unique_ptr<muxer::AudioFileWriter> audioFile;
                 AudioLevels inputAudioLevels;
                 AudioLevels outputAudioLevels;
                 bool reportedVideo = false;
@@ -285,34 +303,38 @@ int runPublisher(const config::PublisherConfig& config,
                 };
                 const auto writePackets = [&](std::vector<media::PacketPtr> packets) {
                     for (auto& packet : packets) {
+                        if (streaming) streaming->submitVideo(videoFile ? media::referencePacket(*packet) : std::move(packet));
                         if (videoFile) videoFile->write(std::move(packet));
-                        // 禁用本地输出时只做编码统计，后续 M07 在此接收独占编码包。
                     }
                 };
                 const auto writeAudioPackets = [&](std::vector<media::PacketPtr> packets) {
                     for (auto& packet : packets) {
+                        if (streaming) streaming->submitAudio(audioFile ? media::referencePacket(*packet) : std::move(packet));
                         if (audioFile) audioFile->write(std::move(packet));
-                        // M07 后续在此交接 AAC 包；当前每个 AVPacket 仍保持独占所有权。
                     }
                 };
-                const auto consume = [&](Kind kind, std::vector<media::FramePtr> frames) {
-                    auto& reported = kind == Kind::Video ? reportedVideo : reportedAudio;
+                const auto consume = [&](capture::Kind kind, std::vector<media::FramePtr> frames) {
+                    auto& reported = kind == capture::Kind::Video ? reportedVideo : reportedAudio;
                     for (const auto& frame : frames) {
                         if (!reported) {
-                            logger.log(logging::Level::Info, "preprocess", std::string(kindName(kind))
+                            logger.log(logging::Level::Info, "preprocess", std::string(capture::kindName(kind))
                                 + " output: " + describe(*frame, kind) + " pts=" + std::to_string(frame->pts)
                                 + " time_base=" + std::to_string(frame->time_base.num) + "/"
                                 + std::to_string(frame->time_base.den)
                                 + " samples=" + std::to_string(frame->nb_samples));
                             reported = true;
                         }
-                        if (kind == Kind::Video) {
+                        if (kind == capture::Kind::Video) {
                             // 首个视频帧到来时才建文件，音频文件输入不会留下空 MP4。
                             if (!encoder) {
-                                encoder = std::make_unique<encode::VideoEncoder>(encoderOptions(config, *frame));
+                                encoder = std::make_unique<encoder::VideoEncoder>(encoderOptions(config, *frame));
+                                if (streaming) {
+                                    const auto parameters = encoder->parameters();
+                                    streaming->setVideoParameters(*parameters, encoder->timeBase());
+                                }
                                 if (!config.videoFile.empty()) {
                                     const auto parameters = encoder->parameters();
-                                    videoFile = std::make_unique<encode::VideoFileWriter>(
+                                    videoFile = std::make_unique<muxer::VideoFileWriter>(
                                         config.videoFile, *parameters, encoder->timeBase());
                                     logger.log(logging::Level::Info, "video_encode", "Saving H.264 video to " + config.videoFile);
                                 }
@@ -326,7 +348,7 @@ int runPublisher(const config::PublisherConfig& config,
                             // 音频输入先完成编码参数协商；只有实际 PCM 输出才创建文件。
                             if (!audioFile && !config.audioFile.empty()) {
                                 const auto parameters = audioEncoder->parameters();
-                                audioFile = std::make_unique<encode::AudioFileWriter>(
+                                audioFile = std::make_unique<muxer::AudioFileWriter>(
                                     config.audioFile, *parameters, audioEncoder->timeBase());
                                 logger.log(logging::Level::Info, "audio_encode", "Saving AAC audio to " + config.audioFile);
                             }
@@ -338,21 +360,37 @@ int runPublisher(const config::PublisherConfig& config,
                     // dshow 的 COM 初始化与释放、设备读包都留在同一工作线程。
                     if (config.capture.source == "file") input.openFile(config);
                     else input.openDevice(kinds[i], config);
+                    if (streaming && config.capture.source == "file") {
+                        streaming->start(input.hasTrack(capture::Kind::Video), input.hasTrack(capture::Kind::Audio));
+                    }
                     logger.log(logging::Level::Info, "capture", "Opened source: " + input.sourceDescription());
-                    if (config.capture.video && (config.capture.source == "file" || kinds[i] == Kind::Video)) {
+                    if (config.capture.video && (config.capture.source == "file" || kinds[i] == capture::Kind::Video)) {
                         video = std::make_unique<preprocess::VideoPreprocessor>(videoOptions(config), originUs);
                     }
-                    while (auto captured = input.readFrame()) {
-                        auto& count = captured->kind == Kind::Video ? videoFrames : audioFrames;
+                    for (;;) {
+                        std::optional<capture::CapturedFrame> captured;
+                        try {
+                            captured = input.readFrame();
+                        } catch (const error::FFmpegError& e) {
+                            // 主动停止读包也要进入下方编码刷新，保全本地 MP4 / M4A 尾部。
+                            if (cancelling.load() && e.module == "capture" && e.code == AVERROR_EXIT) break;
+                            throw;
+                        }
+                        if (!captured) break;
+                        auto& count = captured->kind == capture::Kind::Video ? videoFrames : audioFrames;
                         if (count++ == 0) logger.log(logging::Level::Info, "capture",
-                            std::string(kindName(captured->kind)) + " input: " + describe(*captured->frame, captured->kind));
-                        if (captured->kind == Kind::Audio) audioSamples += static_cast<std::uint64_t>(captured->frame->nb_samples);
-                        if (captured->kind == Kind::Video) {
-                            consume(Kind::Video, video->process(*captured->frame, captured->timestampUs));
+                            std::string(capture::kindName(captured->kind)) + " input: " + describe(*captured->frame, captured->kind));
+                        if (captured->kind == capture::Kind::Audio) audioSamples += static_cast<std::uint64_t>(captured->frame->nb_samples);
+                        if (captured->kind == capture::Kind::Video) {
+                            consume(capture::Kind::Video, video->process(*captured->frame, captured->timestampUs));
                         } else {
                             inputAudioLevels.add(*captured->frame);
                             if (!audioEncoder) {
-                                audioEncoder = std::make_unique<encode::AudioEncoder>(audioEncoderOptions(config));
+                                audioEncoder = std::make_unique<encoder::AudioEncoder>(audioEncoderOptions(config));
+                                if (streaming) {
+                                    const auto parameters = audioEncoder->parameters();
+                                    streaming->setAudioParameters(*parameters, audioEncoder->timeBase());
+                                }
                                 audio = std::make_unique<preprocess::AudioPreprocessor>(
                                     audioOptions(config, *audioEncoder), originUs);
                                 const auto* format = av_get_sample_fmt_name(audioEncoder->sampleFormat());
@@ -369,7 +407,7 @@ int runPublisher(const config::PublisherConfig& config,
                                         "PCM sample format and frame size follow the opened AAC encoder, overriding preprocessing preferences.");
                                 }
                             }
-                            consume(Kind::Audio, audio->process(*captured->frame, captured->timestampUs));
+                            consume(capture::Kind::Audio, audio->process(*captured->frame, captured->timestampUs));
                         }
                         const auto now = av_gettime_relative();
                         if (now - lastReportUs >= 1000000) {
@@ -379,8 +417,8 @@ int runPublisher(const config::PublisherConfig& config,
                     }
                     // EOF 或正常停止时，排空重采样延迟与 FIFO；错误退出时直接 RAII 清理。
                     if (!failed.load()) {
-                        if (video) consume(Kind::Video, video->flush());
-                        if (audio) consume(Kind::Audio, audio->flush());
+                        if (video) consume(capture::Kind::Video, video->flush());
+                        if (audio) consume(capture::Kind::Audio, audio->flush());
                         // 先排空编码器延迟包，再写 MP4 尾部；Ctrl+C 与文件 EOF 路径一致。
                         if (encoder) writePackets(encoder->flush());
                         if (audioEncoder) writeAudioPackets(audioEncoder->flush());
@@ -411,6 +449,10 @@ int runPublisher(const config::PublisherConfig& config,
                     if (!failure) failure = std::current_exception();
                     failed = true;
                 }
+                if (streaming) {
+                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Video) streaming->finishVideo();
+                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Audio) streaming->finishAudio();
+                }
                 input.close();
                 logger.log(logging::Level::Info, "capture", "processing ended: " + counts());
                 ++done;
@@ -418,8 +460,15 @@ int runPublisher(const config::PublisherConfig& config,
             });
         }
         std::unique_lock<std::mutex> lock(stateMutex);
+        auto lastStreamingReportUs = av_gettime_relative();
         while (done.load() != inputs.size()) {
+            if (streaming) streaming->checkError();
             if (stopRequested || failed.load()) stopAll();
+            const auto now = av_gettime_relative();
+            if (streaming && now - lastStreamingReportUs >= 1000000) {
+                reportStreaming("RTMP stats");
+                lastStreamingReportUs = now;
+            }
             changed.wait_for(lock, std::chrono::milliseconds(50));
         }
         lock.unlock();
@@ -430,6 +479,10 @@ int runPublisher(const config::PublisherConfig& config,
         throw;
     }
     if (failure) std::rethrow_exception(failure);
+    if (streaming) {
+        streaming->finish();
+        reportStreaming("RTMP ended");
+    }
     return 0;
 }
-} // namespace lsl::capture
+} // namespace lsl::pipeline

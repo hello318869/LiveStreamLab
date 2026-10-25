@@ -1,4 +1,4 @@
-#include "publisher/encode/VideoFileWriter.hpp"
+#include "publisher/muxer/VideoFileWriter.hpp"
 
 extern "C" {
 #include <libavutil/mathematics.h>
@@ -7,7 +7,7 @@ extern "C" {
 #include <filesystem>
 #include <utility>
 
-namespace lsl::encode {
+namespace lsl::muxer {
 namespace {
 
 constexpr const char* module = "video-file";
@@ -127,4 +127,4 @@ void VideoFileWriter::finish() {
     }
 }
 
-} // namespace lsl::encode
+} // namespace lsl::muxer

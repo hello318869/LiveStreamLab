@@ -23,10 +23,17 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
                        {"--height", "video.height"}, {"--fps", "video.fps"},
                        {"--video-file", "output.video_file"},
                        {"--audio-file", "output.audio_file"},
+                       {"--stream", "output.streaming"},
+                       {"--connect-timeout", "output.connect_timeout_ms"},
+                       {"--write-timeout", "output.write_timeout_ms"},
+                       {"--reconnect-attempts", "output.reconnect_attempts"},
+                       {"--reconnect-delay", "output.reconnect_delay_ms"},
+                       {"--mux-queue-capacity", "output.queue_capacity"},
                        {"--video-bitrate", "video.bitrate"}, {"--audio-bitrate", "audio.bitrate"},
                        {"--gop-size", "video_encoder.gop_size"}, {"--preset", "video_encoder.preset"},
                        {"--low-latency", "video_encoder.low_latency"},
                        {"--source", "capture.source"}, {"--input-file", "capture.file"},
+                       {"--video-source", "capture.video_source"},
                        {"--audio-source", "capture.audio_source"},
                        {"--loop", "capture.loop"}, {"--realtime", "capture.realtime"},
                        {"--capture-video", "capture.video"}, {"--capture-audio", "capture.audio"},
@@ -116,8 +123,8 @@ std::string commandLineHelp(AppKind app) {
             "  --log-file PATH          Append UTF-8 logs to a file\n"
             "  --log-console BOOL       true or false (console logs go to stderr)\n";
     if (publisher) {
-        help += "  --video-device NAME      Video capture device name\n"
-                "  --width N --height N     Even video dimensions\n"
+        help += "  --video-device NAME      Camera name (used with --video-source camera)\n"
+                "  --width N --height N     Even output dimensions; also requested from cameras\n"
                 "  --fps N                  Video frame rate\n"
                 "  --video-bitrate BPS      Video bitrate in bit/s\n"
                 "  --video-file PATH        M05 video-only MP4 (default: output/video.mp4)\n"
@@ -126,9 +133,18 @@ std::string commandLineHelp(AppKind app) {
                 "  --low-latency BOOL       Disable B frames and tune for low latency\n"
                 "  --audio-bitrate BPS      AAC bitrate in bit/s\n"
                 "  --audio-file PATH        M06 audio-only M4A (default: output/audio.m4a)\n"
+                "  --stream BOOL            Enable M07 FLV/RTMP output to --url (default: false)\n"
+                "  --connect-timeout MS     RTMP connection timeout (100..60000)\n"
+                "  --write-timeout MS       RTMP write timeout (100..60000)\n"
+                "  --reconnect-attempts N   Retry a failed connection 0..100 times; 0 disables retries\n"
+                "  --reconnect-delay MS     Delay between connection attempts (0..60000)\n"
+                "  --mux-queue-capacity N   Maximum queued encoded packets (8..4096)\n"
                 "  --list-devices           Enumerate cameras and microphones\n"
-                "  --list-options KIND      Print video/audio device capabilities\n"
+                "  --list-options KIND      Print camera (video) / microphone (audio) capabilities\n"
                 "  --source devices|file    Select live devices or a local file\n"
+                "  --video-source MODE      devices only: desktop (default, Windows) or camera\n"
+                "                           desktop captures the full virtual desktop with cursor\n"
+                "                           camera: select input with --video-device NAME\n"
                 "  --audio-source MODE      devices only: microphone (default) or system\n"
                 "                           microphone: select input with --audio-device NAME\n"
                 "                           system: Windows default output loopback; no mixing\n"
@@ -138,7 +154,7 @@ std::string commandLineHelp(AppKind app) {
                 "  --capture-video BOOL     Enable video capture/track\n"
                 "  --capture-audio BOOL     Enable audio capture/track\n"
                 "  --capture-timeout MS     Device I/O timeout (100..60000)\n"
-                "  --video-format FORMAT    Device pixel format/codec, e.g. mjpeg\n"
+                "  --video-format FORMAT    Camera pixel format/codec, e.g. mjpeg\n"
                 "  --scale-algorithm NAME   nearest, bilinear, bicubic or lanczos\n"
                 "  --resize-mode MODE       fit (letterbox), crop or stretch\n"
                 "  --rotation DEGREES       Clockwise 0, 90, 180 or 270\n"
@@ -151,9 +167,11 @@ std::string commandLineHelp(AppKind app) {
     }
     help += "\nPrecedence: defaults < JSON file < command line; last override wins.\n"
             "Options accept --name value and --name=value.\n"
-            "Publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M06).\n"
-            "M05 writes video-only MP4; M06 writes audio-only M4A; streaming via --url is M07.\n"
+            "Publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M07).\n"
+            "M05 writes video-only MP4; M06 writes audio-only M4A; --stream true enables M07 RTMP output.\n"
             "Use --set output.video_file= or --set output.audio_file= to disable local output.\n"
+            "Use config/publisher-stream.json for RTMP output without separate local recordings.\n"
+            "Streaming a local file requires --realtime true.\n"
             "Player playback belongs to later modules.\n";
     return help;
 }

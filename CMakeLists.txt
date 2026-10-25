@@ -72,28 +72,39 @@ add_library(lsl_preprocess STATIC
 target_link_libraries(lsl_preprocess PUBLIC lsl_common)
 lsl_set_warnings(lsl_preprocess)
 
-add_library(lsl_video_encode STATIC
-    src/publisher/encode/VideoEncoder.cpp
-    src/publisher/encode/VideoFileWriter.cpp)
-target_link_libraries(lsl_video_encode PUBLIC lsl_common)
-lsl_set_warnings(lsl_video_encode)
+add_library(lsl_video_encoder STATIC src/publisher/encoder/VideoEncoder.cpp)
+target_link_libraries(lsl_video_encoder PUBLIC lsl_common)
+lsl_set_warnings(lsl_video_encoder)
 
-add_library(lsl_audio_encode STATIC
-    src/publisher/encode/AudioEncoder.cpp
-    src/publisher/encode/AudioFileWriter.cpp)
-target_link_libraries(lsl_audio_encode PUBLIC lsl_common)
-lsl_set_warnings(lsl_audio_encode)
+add_library(lsl_audio_encoder STATIC src/publisher/encoder/AudioEncoder.cpp)
+target_link_libraries(lsl_audio_encoder PUBLIC lsl_common)
+lsl_set_warnings(lsl_audio_encoder)
+
+add_library(lsl_muxer STATIC
+    src/publisher/muxer/VideoFileWriter.cpp
+    src/publisher/muxer/AudioFileWriter.cpp)
+target_link_libraries(lsl_muxer PUBLIC lsl_common)
+lsl_set_warnings(lsl_muxer)
+
+add_library(lsl_rtmp STATIC src/publisher/rtmp/RtmpPublisher.cpp)
+target_link_libraries(lsl_rtmp PUBLIC lsl_common)
+lsl_set_warnings(lsl_rtmp)
 
 add_library(lsl_capture STATIC
     src/publisher/capture/DeviceManager.cpp
     src/publisher/capture/MediaInput.cpp
-    src/publisher/capture/SystemAudioInput.cpp
-    src/publisher/capture/CaptureApp.cpp)
-target_link_libraries(lsl_capture PUBLIC lsl_common PRIVATE lsl_preprocess lsl_video_encode lsl_audio_encode)
+    src/publisher/capture/SystemAudioInput.cpp)
+target_link_libraries(lsl_capture PUBLIC lsl_common)
 if(WIN32)
     target_link_libraries(lsl_capture PRIVATE ole32 oleaut32 strmiids uuid)
 endif()
 lsl_set_warnings(lsl_capture)
+
+# 流水线负责组合采集、预处理、编码及输出；采集模块不依赖下游。
+add_library(lsl_publisher_pipeline STATIC src/publisher/pipeline/PublisherPipeline.cpp)
+target_link_libraries(lsl_publisher_pipeline PUBLIC lsl_common
+    PRIVATE lsl_capture lsl_preprocess lsl_video_encoder lsl_audio_encoder lsl_muxer lsl_rtmp)
+lsl_set_warnings(lsl_publisher_pipeline)
 
 if(LSL_BUILD_APPS)
     foreach(app publisher player)
@@ -102,7 +113,7 @@ if(LSL_BUILD_APPS)
         lsl_set_warnings(${app})
         lsl_copy_runtime(${app})
     endforeach()
-    target_link_libraries(publisher PRIVATE lsl_capture)
+    target_link_libraries(publisher PRIVATE lsl_publisher_pipeline)
     target_link_libraries(player PRIVATE SDL3::SDL3)
     if(WIN32)
         add_custom_command(TARGET player POST_BUILD

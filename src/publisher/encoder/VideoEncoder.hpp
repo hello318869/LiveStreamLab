@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace lsl::encode {
+namespace lsl::encoder {
 
 struct VideoEncoderOptions {
     int width = 1280;
@@ -58,4 +58,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace lsl::encode
+} // namespace lsl::encoder

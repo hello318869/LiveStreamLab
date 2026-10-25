@@ -1,0 +1,18 @@
+{
+  "capture": {
+    "source": "devices",
+    "video_source": "desktop"
+  },
+  "output": {
+    "url": "rtmp://127.0.0.1/live/livestream",
+    "video_file": "",
+    "audio_file": "",
+    "streaming": true,
+    "connect_timeout_ms": 5000,
+    "write_timeout_ms": 5000,
+    "reconnect_attempts": 5,
+    "reconnect_delay_ms": 1000,
+    "queue_capacity": 256,
+    "max_interleave_delta_ms": 500
+  }
+}
