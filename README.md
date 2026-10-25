@@ -1,14 +1,18 @@
 # LiveStreamLab
 
 C++17 + FFmpeg + SDL3 音视频直播学习工程，详细模块见上级目录的 `方案.md`。
-当前已实现 M01 基础框架、M02 音视频输入、M03/M04 音视频预处理、M05/M06 视频/音频编码与 M07 FLV/RTMP 推流。主播端可以枚举设备、查看能力、
+当前已实现 M01 基础框架、M02 音视频输入、M03/M04 音视频预处理、M05/M06 视频/音频编码、
+M07 FLV/RTMP 推流、M09 网络拉流及解封装、M10 视频解码、M11 音频解码播放与 M12 SDL3 视频显示。主播端可以枚举设备、查看能力、
 默认采集 Windows 桌面画面，摄像头可选；音频可选择麦克风或系统声音，也支持按时间戳读取、循环本地文件。
 视频经过格式转换、缩放、帧率控制及可选画面处理；音频经过重采样、声道转换和固定帧长缓存。
 视频继续编码为 H.264，默认自动保存到 `output/video.mp4`；目录不存在时自动创建。
 音频继续编码为 AAC-LC，单独保存到 `output/audio.m4a`。
 设备模式可选择麦克风或 Windows 系统声音，支持软件增益与音频电平日志。
 MP4 仅含视频、M4A 仅含音频。启用 M07 后，独立复用线程将 H.264/AAC 合并为 FLV 并推送至 RTMP/RTMPS 地址；
-包含超时、可中断 I/O、有限重连与推流统计。观众端播放和 SRS 部署属于后续模块。
+包含超时、可中断 I/O、有限重连与推流统计。观众端 `player` 已接入 RTMP/HTTP-FLV 收包、
+流信息、音视频有界队列、重连和统计，并通过视频解码线程和 SDL3 主线程显示画面。
+当前音频由独立解码线程和 SDL3 回调输出；视频按自己的 PTS 控制显示节奏，音画同步 M13 尚未实现。
+M08 SRS 部署仍按原阶段单独安排。
 
 主播端目录已按《方案.md》统一为 `capture`、`preprocess`、`encoder`、`muxer`、`rtmp`、`pipeline`。
 `pipeline/PublisherPipeline` 组合各处理模块，采集模块仅负责输入。目录、命名空间与 CMake 职责对应见
@@ -128,13 +132,51 @@ Windows 摄像头与麦克风使用 DirectShow。设备占用、权限不足、�
 # 桌面画面 + Windows 系统声音，不混入麦克风
 .\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --audio-source system
 
-# 使用外部 ffplay 接收同一路直播；自研 player 尚未实现播放
+# 也可使用外部 ffplay 接收同一路直播
 ffplay rtmp://127.0.0.1/live/livestream
 ```
 
 SRS 在另一台机器时，将推流与播放 URL 中的 `127.0.0.1` 换成服务器地址。
 默认 `publisher.json` 保持本地录制，只有 `--stream true` 或 `output.streaming=true` 才连接网络。
 连接超时、重连、丢包恢复、统计口径与停止行为见 [M07 说明](docs/rtmp-streaming.md)。
+
+## M09/M10/M12 拉流、视频解码与播放
+
+先准备正在推流的 SRS。以下是从工程根目录构建和启动的方法；启动命令本次未执行：
+
+```powershell
+# 只构建观众端；不运行测试
+cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+cmake --build build/cmake --config Release --target player --parallel 1 -- /nodeReuse:false
+
+# 默认 HTTP-FLV 输入，解码视频并在 SDL3 窗口显示，同时播放音频
+.\build\cmake\bin\Release\player.exe --config config\player.json
+
+# 同一路 RTMP 输入
+.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream
+
+# 调整单次读包超时、重连次数与接收缓存时长
+.\build\cmake\bin\Release\player.exe --read-timeout 5000 --reconnect-attempts 5 --max-buffer-ms 2000
+
+# 设置初始窗口大小；也可 --fullscreen true 全屏启动
+.\build\cmake\bin\Release\player.exe --width 960 --height 540 --vsync true
+
+# 调整播放器音量；--play-audio false 可关闭音频输出
+.\build\cmake\bin\Release\player.exe --volume 50
+```
+
+`player` 将视频包送入 FFmpeg 软件解码器，输出 YUV420P/NV12，由 SDL3 上传纹理并等比显示。
+窗口可调整大小；按 F、Alt+Enter 或双击切换全屏，Esc、关闭窗口或 Ctrl+C 停止。
+音频使用 FFmpeg 解码，经 libswresample 转为固定输出采样率/声道数的交错 F32 PCM，
+通过有界 SPSC 环形缓冲交给 SDL3 音频流回调；支持只有视频或只有音频的输入，不保存媒体文件。
+Space 暂停/恢复音频，M 静音，↑/↓ 调节 10% 音量；这些操作不暂停视频，也不改变系统音量。
+音画同步尚未实现，声音与画面可能存在偏差。
+日志提供流编码参数、代次、解码/显示 FPS、耗时、上传次数、积压与丢帧信息。
+缓冲超限会清理两路积压并等待下一视频关键帧；断线后重新发现流参数。
+默认将网络 EOF 作为直播断流重连；`--reconnect-attempts 0` 禁用重连，此时正常 EOF 排空后退出。
+解码帧队列按 8 帧、64 MiB、500 ms 限制积压，主线程另保留最多一帧等待显示；
+重连换代会清除旧解码器、排队帧、画面与视频时钟。
+接口和网络缓冲见 [M09 说明](docs/network-demuxing.md)，播放路径与边界见 [M10/M12 说明](docs/video-playback.md)。
 
 ## 实现说明
 
@@ -143,6 +185,9 @@ SRS 在另一台机器时，将推流与播放 URL 中的 `127.0.0.1` 换成服�
 - [M05 H.264 编码与自动保存](docs/video-encoding.md)
 - [M06 AAC 编码、尾帧与自动保存](docs/audio-encoding.md)
 - [M07 FLV 封装、RTMP 推流、时间戳与重连](docs/rtmp-streaming.md)
+- [M09 网络拉流、解封装、接收缓冲与重连](docs/network-demuxing.md)
+- [M10/M12 视频解码、SDL3 显示与播放节奏](docs/video-playback.md)
+- [M11 音频解码、重采样、SDL3 播放与控制](docs/audio-playback.md)
 - [音源选择、弱音频修复与测试结果](docs/audio-diagnosis.md)
 - [配置字段与命令行](docs/configuration.md)
 - [日志、错误处理与清理](docs/logging-and-errors.md)
@@ -154,3 +199,13 @@ M07 实现时已通过 Windows Release 的 CMake 完整编译；当时按项目�
 实际构建命令见 [M07 说明](docs/rtmp-streaming.md)，网络连接、接收播放和重连表现仍待用户运行验收。
 2026-10-25 本次新增默认桌面采集与可选摄像头入口，未构建、未运行测试、未做真实桌面采集；
 此前构建或测试记录不作为本次修改的运行验收结果。
+2026-10-25 M09 阶段已通过 Windows Release 的 `player` 编译、链接；当时测试保持关闭，
+未启动程序、未运行测试、未连接 SRS。持续收包、网络恢复和后续播放效果仍需另行运行验收，
+实际成功的构建命令见 [M09 说明](docs/network-demuxing.md)。
+2026-10-25 本次 M10/M12 已通过 CMake 配置与 Windows Release 的 `player` 编译、链接；
+未启动程序、未运行测试、未连接 SRS，成功命令见 [M10/M12 说明](docs/video-playback.md)。
+M09 的历史构建记录不代表此次解码、窗口显示、真实播放或重连效果已验证。
+
+2026-10-25 M11 音频解码与 SDL3 播放已接入，CMake 配置与 Release 的 `player` 编译、链接通过。
+本次未启动程序、未运行测试、未连接 SRS；声音、连续性和设备兼容性仍待实际运行验收。
+音画同步 M13 未实现，详见 [M11 说明](docs/audio-playback.md)。

@@ -74,9 +74,21 @@ Json document(const PublisherConfig& c) {
 }
 
 Json document(const PlayerConfig& c) {
-    return {{"input", {{"url", c.inputUrl}}},
+    return {{"input", {{"url", c.inputUrl},
+                        {"connect_timeout_ms", c.demux.connectTimeoutMs},
+                        {"read_timeout_ms", c.demux.readTimeoutMs},
+                        {"reconnect_attempts", c.demux.reconnectAttempts},
+                        {"reconnect_delay_ms", c.demux.reconnectDelayMs},
+                        {"queue_capacity", c.demux.queueCapacity},
+                        {"max_buffer_ms", c.demux.maxBufferMs},
+                        {"max_queue_bytes", c.demux.maxQueueBytes},
+                        {"discontinuity_threshold_ms", c.demux.discontinuityThresholdMs}}},
             {"audio", {{"device", c.audioDevice}, {"sample_rate", c.sampleRate},
-                       {"channels", c.channels}}},
+                       {"channels", c.channels}, {"enabled", c.audioPlayback.enabled},
+                       {"buffer_ms", c.audioPlayback.bufferMs}, {"volume", c.audioPlayback.volume},
+                       {"muted", c.audioPlayback.muted}, {"paused", c.audioPlayback.paused}}},
+            {"video", {{"width", c.video.width}, {"height", c.video.height},
+                       {"vsync", c.video.vsync}, {"fullscreen", c.video.fullscreen}}},
             {"logging", document(c.logging)}};
 }
 
@@ -321,6 +333,18 @@ void validate(const PlayerConfig& c) {
     url(c.inputUrl, false);
     device(c.audioDevice, "audio.device");
     audio(c.sampleRate, c.channels);
+    range(c.audioPlayback.bufferMs, 100, 2000, "audio.buffer_ms");
+    range(c.audioPlayback.volume, 0, 100, "audio.volume");
+    range(c.video.width, 160, 7680, "video.width");
+    range(c.video.height, 90, 4320, "video.height");
+    range(c.demux.connectTimeoutMs, 100, 60000, "input.connect_timeout_ms");
+    range(c.demux.readTimeoutMs, 100, 60000, "input.read_timeout_ms");
+    range(c.demux.reconnectAttempts, 0, 100, "input.reconnect_attempts");
+    range(c.demux.reconnectDelayMs, 0, 60000, "input.reconnect_delay_ms");
+    range(c.demux.queueCapacity, 8, 4096, "input.queue_capacity");
+    range(c.demux.maxBufferMs, 100, 60000, "input.max_buffer_ms");
+    range(c.demux.maxQueueBytes, 1048576, 268435456, "input.max_queue_bytes");
+    range(c.demux.discontinuityThresholdMs, 100, 60000, "input.discontinuity_threshold_ms");
 }
 
 PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& overrides) {
@@ -385,10 +409,28 @@ PlayerConfig parsePlayerConfig(std::string_view text, const Overrides& overrides
     merge(data, parse(text));
     applyOverrides(data, overrides);
     PlayerConfig c;
-    c.inputUrl = data["input"]["url"].get<std::string>();
+    const auto& input = data["input"];
+    c.inputUrl = input["url"].get<std::string>();
+    c.demux.connectTimeoutMs = integer(input["connect_timeout_ms"], "input.connect_timeout_ms");
+    c.demux.readTimeoutMs = integer(input["read_timeout_ms"], "input.read_timeout_ms");
+    c.demux.reconnectAttempts = integer(input["reconnect_attempts"], "input.reconnect_attempts");
+    c.demux.reconnectDelayMs = integer(input["reconnect_delay_ms"], "input.reconnect_delay_ms");
+    c.demux.queueCapacity = integer(input["queue_capacity"], "input.queue_capacity");
+    c.demux.maxBufferMs = integer(input["max_buffer_ms"], "input.max_buffer_ms");
+    c.demux.maxQueueBytes = integer(input["max_queue_bytes"], "input.max_queue_bytes");
+    c.demux.discontinuityThresholdMs = integer(input["discontinuity_threshold_ms"], "input.discontinuity_threshold_ms");
     c.audioDevice = data["audio"]["device"].get<std::string>();
     c.sampleRate = integer(data["audio"]["sample_rate"], "audio.sample_rate");
     c.channels = integer(data["audio"]["channels"], "audio.channels");
+    c.audioPlayback.enabled = data["audio"]["enabled"].get<bool>();
+    c.audioPlayback.bufferMs = integer(data["audio"]["buffer_ms"], "audio.buffer_ms");
+    c.audioPlayback.volume = integer(data["audio"]["volume"], "audio.volume");
+    c.audioPlayback.muted = data["audio"]["muted"].get<bool>();
+    c.audioPlayback.paused = data["audio"]["paused"].get<bool>();
+    c.video.width = integer(data["video"]["width"], "video.width");
+    c.video.height = integer(data["video"]["height"], "video.height");
+    c.video.vsync = data["video"]["vsync"].get<bool>();
+    c.video.fullscreen = data["video"]["fullscreen"].get<bool>();
     c.logging = loggingConfig(data["logging"]);
     validate(c);
     return c;

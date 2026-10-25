@@ -46,6 +46,19 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
                        {"--audio-sample-format", "preprocess.audio.sample_format"},
                        {"--audio-gain-db", "preprocess.audio.gain_db"},
                        {"--audio-frame-size", "preprocess.audio.frame_size"}});
+    } else {
+        fields.insert({{"--width", "video.width"}, {"--height", "video.height"},
+                       {"--vsync", "video.vsync"}, {"--fullscreen", "video.fullscreen"},
+                       {"--play-audio", "audio.enabled"}, {"--audio-buffer-ms", "audio.buffer_ms"},
+                       {"--volume", "audio.volume"}, {"--mute", "audio.muted"},
+                       {"--audio-paused", "audio.paused"},
+                       {"--connect-timeout", "input.connect_timeout_ms"},
+                       {"--read-timeout", "input.read_timeout_ms"},
+                       {"--reconnect-attempts", "input.reconnect_attempts"},
+                       {"--reconnect-delay", "input.reconnect_delay_ms"},
+                       {"--packet-queue-capacity", "input.queue_capacity"},
+                       {"--max-buffer-ms", "input.max_buffer_ms"},
+                       {"--max-queue-bytes", "input.max_queue_bytes"}});
     }
     CommandLineOptions result;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -164,15 +177,37 @@ std::string commandLineHelp(AppKind app) {
                 "  --audio-sample-format FMT PCM format; AAC encoder format takes priority\n"
                 "  --audio-gain-db DB       Software PCM gain (-60..30 dB; default: 0)\n"
                 "  --audio-frame-size N     PCM frame size; AAC encoder value takes priority\n";
+    } else {
+        help += "  --width N --height N     Initial window size (default: 1280x720)\n"
+                "  --vsync BOOL            Request vertical sync (default: true)\n"
+                "  --fullscreen BOOL       Start fullscreen (default: false)\n"
+                "  --play-audio BOOL       Decode and play audio (default: true)\n"
+                "  --audio-buffer-ms MS    PCM ring target depth (100..2000; default: 500)\n"
+                "  --volume N              Player audio volume (0..100; default: 100)\n"
+                "  --mute BOOL             Mute audio (default: false)\n"
+                "  --audio-paused BOOL     Start with audio paused (default: false)\n"
+                "  --connect-timeout MS     Input connection/probe timeout (100..60000)\n"
+                "  --read-timeout MS        Input packet read timeout (100..60000)\n"
+                "  --reconnect-attempts N   Retry a failed connection 0..100 times; 0 disables retries\n"
+                "  --reconnect-delay MS     Delay between connection attempts (0..60000)\n"
+                "  --packet-queue-capacity N Maximum packets in each audio/video queue (8..4096)\n"
+                "  --max-buffer-ms MS       Maximum queued media span/residence time (100..60000)\n"
+                "  --max-queue-bytes N      Total queued media bytes (1048576..268435456)\n";
     }
     help += "\nPrecedence: defaults < JSON file < command line; last override wins.\n"
-            "Options accept --name value and --name=value.\n"
-            "Publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M07).\n"
-            "M05 writes video-only MP4; M06 writes audio-only M4A; --stream true enables M07 RTMP output.\n"
-            "Use --set output.video_file= or --set output.audio_file= to disable local output.\n"
-            "Use config/publisher-stream.json for RTMP output without separate local recordings.\n"
-            "Streaming a local file requires --realtime true.\n"
-            "Player playback belongs to later modules.\n";
+            "Options accept --name value and --name=value.\n";
+    if (publisher) {
+        help += "Publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M07).\n"
+                "M05 writes video-only MP4; M06 writes audio-only M4A; --stream true enables M07 RTMP output.\n"
+                "Use --set output.video_file= or --set output.audio_file= to disable local output.\n"
+                "Use config/publisher-stream.json for RTMP output without separate local recordings.\n"
+                "Streaming a local file requires --realtime true.\n";
+    } else {
+        help += "Player receives RTMP/RTMPS or HTTP/HTTPS-FLV, decodes and plays video/audio with SDL3 (M09-M12).\n"
+                "F / Alt+Enter / double click: fullscreen; Escape / close / Ctrl+C: stop.\n"
+                "Space: pause audio only; M: mute; Up/Down: volume +/-10%.\n"
+                "Video follows its own PTS clock; audio/video synchronization (M13) is not implemented.\n";
+    }
     return help;
 }
 
@@ -208,7 +243,8 @@ std::vector<std::string> commandLineArguments(int argc, char* argv[]) {
     return args;
 }
 
-int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action) {
+int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action,
+                 const PlayerAction& playerAction) {
     std::unique_ptr<logging::Logger> logger;
     const auto report = [&](const error::AppError& e) {
         if (logger && logger->hasOutput() &&
@@ -227,14 +263,15 @@ int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& act
         LoggingConfig logConfig;
         std::string json;
         std::optional<PublisherConfig> publisherConfig;
+        std::optional<PlayerConfig> playerConfig;
         if (app == AppKind::Publisher) {
             publisherConfig = loadPublisherConfig(options.configFile, options.overrides);
             logConfig = publisherConfig->logging;
             json = toJson(*publisherConfig);
         } else {
-            const auto config = loadPlayerConfig(options.configFile, options.overrides);
-            logConfig = config.logging;
-            json = toJson(config);
+            playerConfig = loadPlayerConfig(options.configFile, options.overrides);
+            logConfig = playerConfig->logging;
+            json = toJson(*playerConfig);
         }
         logger = std::make_unique<logging::Logger>(logging::Options{
             logConfig.level, logConfig.console, std::filesystem::u8path(logConfig.file)});
@@ -246,6 +283,7 @@ int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& act
         if (options.printConfig) std::cout << json << '\n';
         else if (options.checkConfig) std::cout << "Configuration OK\n";
         else if (publisherConfig && action) return action(*publisherConfig, options, *logger);
+        else if (playerConfig && playerAction) return playerAction(*playerConfig, options, *logger);
         else throw error::AppError("pipeline", error::NotImplemented,
             "media pipelines are pending. Use --check-config or --print-config.");
         return 0;

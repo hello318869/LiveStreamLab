@@ -1,6 +1,7 @@
 {
-  "capture": {
+  "capture": {    
     "source": "devices",
+    "audio_source": "system",
     "video_source": "desktop"
   },
   "output": {

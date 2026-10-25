@@ -34,7 +34,7 @@
   "capture": {
     "source": "devices",
     "video_source": "desktop",
-    "audio_source": "microphone",
+    "audio_source": "system",
     "file": "",
     "loop": false,
     "realtime": true,

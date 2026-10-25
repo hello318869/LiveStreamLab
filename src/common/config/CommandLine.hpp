@@ -25,7 +25,9 @@ std::string commandLineHelp(AppKind app);
 std::vector<std::string> commandLineArguments(int argc, char* argv[]);
 
 using PublisherAction = std::function<int(const PublisherConfig&, const CommandLineOptions&, logging::Logger&)>;
-// 共用配置、日志初始化与顶层异常处理；主播端通过 action 接入当前媒体模块。
-int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action = {});
+using PlayerAction = std::function<int(const PlayerConfig&, const CommandLineOptions&, logging::Logger&)>;
+// 共用配置、日志初始化与顶层异常处理；两端通过各自 action 接入媒体模块。
+int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action = {},
+                 const PlayerAction& playerAction = {});
 
 } // namespace lsl::config

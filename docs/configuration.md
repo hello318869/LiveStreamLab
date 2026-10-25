@@ -47,9 +47,34 @@
 | `preprocess.audio.gain_db` | `0` | -60–30 dB，重采样后、编码前的软件 PCM 增益；0 保留原电平，不修改系统设备音量 |
 | `preprocess.audio.discontinuity_threshold_ms` | `100` | 1–1000 ms，区分时间抖动与不连续 |
 
-观众端使用 `input.url`（默认 `http://127.0.0.1:8080/live/livestream.flv`，支持
-RTMP/RTMPS/HTTP/HTTPS），以及 `audio.device`、`audio.sample_rate`、`audio.channels`。
-设备、采样率、声道的默认值及规则同上；这些音频参数用于输出。
+观众端 M09 输入、M11 音频与 M12 显示字段：
+
+| 观众端字段 | 默认值 | 校验及含义 |
+|---|---|---|
+| `input.url` | `http://127.0.0.1:8080/live/livestream.flv` | RTMP/RTMPS 或 HTTP/HTTPS-FLV，主机与流路径非空 |
+| `input.connect_timeout_ms` | `5000` | 100–60000 ms，连接与流信息探测 I/O 超时 |
+| `input.read_timeout_ms` | `5000` | 100–60000 ms，单次读包 I/O 超时 |
+| `input.reconnect_attempts` | `5` | 0–100，连续故障后的最多重试次数；收到媒体包后重置故障预算 |
+| `input.reconnect_delay_ms` | `1000` | 0–60000 ms，可被停止操作中断的重试等待 |
+| `input.queue_capacity` | `256` | 8–4096，每轨编码包数量上限 |
+| `input.max_buffer_ms` | `2000` | 100–60000 ms，媒体时间跨度与排队墙钟年龄上限 |
+| `input.max_queue_bytes` | `33554432` | 1048576–268435456，两轨合计包数据与 side data 字节上限 |
+| `input.discontinuity_threshold_ms` | `1000` | 100–60000 ms，每轨明显时间戳跳变的判定阈值 |
+| `video.width` / `video.height` | 1280 / 720 | 160–7680 / 90–4320，初始窗口大小，不限制输入视频分辨率 |
+| `video.vsync` | `true` | 请求垂直同步；后端不支持时记录警告并尝试关闭 |
+| `video.fullscreen` | `false` | 是否以全屏启动；运行时可切换 |
+| `audio.device` | `default` | 默认输出设备或精确设备名；实际存在音轨时打开 |
+| `audio.sample_rate` / `audio.channels` | 48000 / 2 | 输出 PCM 参数，标准 AAC 采样率 / 1 或 2 声道 |
+| `audio.enabled` | `true` | 启用音频解码与播放；禁用后仍消费并释放音频包 |
+| `audio.buffer_ms` | `500` | 100–2000 ms，PCM 环形缓冲目标深度，实际容量至少 4096 个每声道样本 |
+| `audio.volume` | `100` | 0–100，只改变播放器音量 |
+| `audio.muted` / `audio.paused` | `false` / `false` | 启动时静音 / 仅暂停音频 |
+
+观众端音频按流参数解码，再转换为配置的输出采样率与声道数；输出设置不覆盖输入编码参数。
+音画同步尚未实现；Space 仅暂停声音，M 静音，↑/↓ 每次调节 10% 音量。
+网络缓冲见 [M09](network-demuxing.md)，视频节奏见 [M10/M12](video-playback.md)，
+音频接口、缓冲与提交侧时钟口径见 [M11](audio-playback.md)。
+主播端与观众端都接受 `video.width` / `video.height`，前者控制编码尺寸，后者只设置初始窗口尺寸。
 
 AAC 采样率：7350、8000、11025、12000、16000、22050、24000、32000、44100、48000、
 64000、88200、96000 Hz。默认 `capture.video_source=desktop` 在 Windows 通过 `gdigrab`
@@ -108,6 +133,17 @@ PCM 格式与帧长协商、尾帧和编码延迟见 [M06](audio-encoding.md)。
 推流参数为 `--stream true|false`、`--connect-timeout MS`、`--write-timeout MS`、
 `--reconnect-attempts N`、`--reconnect-delay MS` 和 `--mux-queue-capacity N`；
 交织等待可通过 `--set output.max_interleave_delta_ms=500` 修改。用法与恢复边界见 [M07](rtmp-streaming.md)。
+观众端支持 `--connect-timeout MS`、`--read-timeout MS`、`--reconnect-attempts N`、
+`--reconnect-delay MS`、`--packet-queue-capacity N`、`--max-buffer-ms MS` 和 `--max-queue-bytes N`，
+分别映射到 `input` 下的同名配置；`--connect-timeout`、`--reconnect-attempts`、`--reconnect-delay`
+在两端作用于各自的输入或输出连接。时间戳跳变阈值使用
+`--set input.discontinuity_threshold_ms=1000` 修改。
+观众端另支持 `--width N`、`--height N`、`--vsync true|false`、`--fullscreen true|false`，
+对应 `video` 显示字段。窗口缩放保持输入视频的显示宽高比；F、Alt+Enter 或双击切换全屏，
+Esc、关闭窗口或 Ctrl+C 停止。
+观众端音频支持 `--play-audio BOOL`、`--audio-buffer-ms MS`、`--volume N`、`--mute BOOL` 和
+`--audio-paused BOOL`，分别覆盖 `audio.enabled`、`audio.buffer_ms`、`audio.volume`、`audio.muted`、`audio.paused`；
+输出设备、采样率、声道沿用 `--audio-device`、`--sample-rate`、`--channels`。本次未实现音画同步。
 `--list-devices` 枚举摄像头、麦克风，`--list-options video|audio` 查询所选摄像头/麦克风能力，
 均不启动桌面采集；查询摄像头能力不要求先切换 `capture.video_source`。
 布尔值只接受 `true` / `false`，整数使用完整十进制文本。
@@ -115,6 +151,7 @@ PCM 格式与帧长协商、尾帧和编码延迟见 [M06](audio-encoding.md)。
 ```powershell
 .\build\cmake\bin\Release\publisher.exe --config config\publisher.json --fps 30 --set audio.channels=1 --print-config
 .\build\cmake\bin\Release\player.exe --audio-device "中文扬声器" --check-config
+.\build\cmake\bin\Release\player.exe --width 960 --height 540 --vsync true --fullscreen false
 ```
 
 选择音源时可从工程根目录运行以下命令；音频默认保存到 `output/audio.m4a`，已有文件需换名：
@@ -135,7 +172,8 @@ PCM 格式与帧长协商、尾帧和编码延迟见 [M06](audio-encoding.md)。
 
 Windows 从 Unicode 命令行转换为 UTF-8，支持中文配置路径与设备名。
 退出码：`0` 成功（包括文件 EOF 和 Ctrl+C 停止），`2` 配置或命令行错误，
-`1` 其他启动、采集、编码、推流错误或尚未实现的观众播放。
+`1` 其他启动、采集、编码、推流或观众拉流、视频解码及显示错误。观众端默认把直播 EOF 作为断流重连；
+禁用重连后正常 EOF 排空退出为 `0`，其他网络错误仍为 `1`。
 
 C++ 接口位于 `src/common/config/Config.hpp`：
 `parse*Config` 从字符串解析，`load*Config` 加载可选文件，

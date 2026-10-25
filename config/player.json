@@ -1,11 +1,30 @@
 {
   "input": {
-    "url": "http://127.0.0.1:8080/live/livestream.flv"
+    "url": "http://127.0.0.1:8080/live/livestream.flv",
+    "connect_timeout_ms": 5000,
+    "read_timeout_ms": 5000,
+    "reconnect_attempts": 5,
+    "reconnect_delay_ms": 1000,
+    "queue_capacity": 256,
+    "max_buffer_ms": 2000,
+    "max_queue_bytes": 33554432,
+    "discontinuity_threshold_ms": 1000
+  },
+  "video": {
+    "width": 1280,
+    "height": 720,
+    "vsync": true,
+    "fullscreen": false
   },
   "audio": {
     "device": "default",
     "sample_rate": 48000,
-    "channels": 2
+    "channels": 2,
+    "enabled": true,
+    "buffer_ms": 500,
+    "volume": 100,
+    "muted": false,
+    "paused": false
   },
   "logging": {
     "level": "INFO",

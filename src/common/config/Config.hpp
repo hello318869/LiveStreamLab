@@ -98,11 +98,40 @@ struct PublisherConfig {
     LoggingConfig logging;
 };
 
+struct DemuxConfig {
+    int connectTimeoutMs = 5000;
+    int readTimeoutMs = 5000;
+    int reconnectAttempts = 5;          // 连续故障后的最多重试次数；0 禁用重连。
+    int reconnectDelayMs = 1000;
+    int queueCapacity = 256;            // 每个音视频包队列的数量上限。
+    int maxBufferMs = 2000;             // 时间戳跨度与排队时长上限。
+    int maxQueueBytes = 33554432;       // 两个队列合计的媒体数据字节上限。
+    int discontinuityThresholdMs = 1000;
+};
+
+struct PlayerVideoConfig {
+    int width = 1280;        // 初始窗口大小；不改变视频解码分辨率。
+    int height = 720;
+    bool vsync = true;
+    bool fullscreen = false;
+};
+
+struct PlayerAudioConfig {
+    bool enabled = true;
+    int bufferMs = 500; // 应用 PCM 环形缓冲目标深度，至少容纳一个解码块。
+    int volume = 100;   // 0..100；只影响此播放器，不改变系统音量。
+    bool muted = false;
+    bool paused = false; // 仅暂停音频；M13 音画同步尚未实现。
+};
+
 struct PlayerConfig {
     std::string inputUrl = "http://127.0.0.1:8080/live/livestream.flv";
     std::string audioDevice = "default";
     int sampleRate = 48000;
     int channels = 2;
+    DemuxConfig demux;
+    PlayerVideoConfig video;
+    PlayerAudioConfig audioPlayback;
     LoggingConfig logging;
 };
 

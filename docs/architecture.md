@@ -8,6 +8,10 @@ M05 的 `lsl_video_encoder` 提供 H.264 软件编码，M06 的 `lsl_audio_encod
 M07 的 `lsl_rtmp` 提供独立复用线程、FLV 封装、RTMP/RTMPS 输出与会话重建。
 这些模块各自链接 `lsl_common`，由 `lsl_publisher_pipeline` 组合；`lsl_capture` 不依赖下游编码或输出模块。
 设备音源可选 DirectShow/ALSA 麦克风，或 Windows `SystemAudioInput` 的 WASAPI 系统回采。
+M09 的 `lsl_demuxer` 提供网络输入、媒体流快照及音视频有界包队列。
+M10 的 `lsl_video_decoder` 提供 FFmpeg 视频软件解码和显示格式适配，
+M12 的 `lsl_video_renderer` 提供 `IVideoRenderer` 接口及 SDL3 实现，链接 `lsl_common` 和 `SDL3::SDL3`。
+`lsl_player_pipeline` 组合网络输入、解码工作线程、帧交接和主线程显示，并接入 `player` 入口。
 
 2026-10-25 按《方案.md》统一目录与命名空间，运行逻辑保持原样：
 
@@ -53,4 +57,63 @@ CapturedFrame
 同时保存本地文件时，先创建独立 AVPacket 引用，再交给两个各自拥有包结构的写出路径。
 文件输入按实际存在的轨道建立输出流，支持仅音频或仅视频；设备输入按启用的轨道建立会话。
 默认 `output.streaming=false`，沿用独立 MP4/M4A 输出；`config/publisher-stream.json` 显式开启推流并禁用本地文件。
-观众播放、M08 SRS 管理和 M14 采集/处理/编码完整队列流水线仍属后续模块。
+观众音频解码播放 M11 已接入，音画同步 M13、M08 SRS 管理和 M14 完整队列流水线仍属后续模块。
+
+## M09–M12 观众端播放链路
+
+```text
+src/player/
+├── demuxer/       # lsl::demuxer：Demuxer、PacketBuffer、媒体事件与流快照
+├── decoder/       # lsl::decoder：VideoDecoder、AudioDecoder、独占视频帧/PCM块
+├── renderer/      # lsl::renderer：IVideoRenderer、SDLVideoRenderer
+├── audio/         # lsl::audio：IAudioSink、SDLAudioSink、有界 SPSC 环形缓冲
+└── pipeline/      # lsl::player：runPlayer、VideoWorker、AudioPlayback、视频队列与调度
+
+player_main
+  └─ runConfigApp：命令行 → JSON → 校验 → 日志 → 顶层异常边界
+       └─ pipeline/PlayerPipeline：runPlayer
+            ├─ Demuxer 网络线程独占 AVFormatContext
+            │    → avformat_open_input → avformat_find_stream_info
+            │    → 选择视频/音频流 → codecpar 深拷贝快照
+            │    → av_read_frame → 按 stream_index 分发
+            │         ├─ 视频 PacketPtr 有界队列
+            │         └─ 音频 PacketPtr 有界队列
+            ├─ VideoWorker 解码线程独占 AVCodecContext
+            │    ├─ 视频 Reset → 按新 codecpar 重开 VideoDecoder
+            │    └─ 视频 Packet → send/receive → YUV420P / NV12 → VideoFrameQueue
+            ├─ AudioPlayback 音频线程独占音频 AVCodecContext 与 SwrContext
+            │    → 音频 Packet → send/receive → 固定采样率/声道 F32 → IAudioSink/SPSC 环
+            ├─ SDL3 音频回调：从环取 PCM → SDL_PutAudioStreamData → 系统音频设备
+            └─ 主线程：SDL 事件 → 视频 PTS 节奏 → IVideoRenderer → SDL3 纹理显示
+```
+
+`AVPacket` 结构通过 `PacketPtr` 转移独占所有权；媒体缓冲由 FFmpeg 引用计数管理。
+`StreamInfo` 拥有独立的 `AVCodecParameters`，不会把输入上下文里的 `AVStream` 借给下游。
+`DecodedVideoFrame` 转移独占帧结构，包含 `serial`、微秒媒体 PTS 和帧时长；
+YUV420P/NV12 可直接交接，其他支持的软件格式通过 libswscale 转为 YUV420P。
+每个解码批次最多保留 32 帧、128 MiB；`VideoFrameQueue` 另限 8 帧、64 MiB、
+500 ms 媒体跨度与墙钟排队年龄，主线程另持有最多一帧等待显示。
+这些是各交接层的限额，不代表整个进程的内存上限；解码器参考帧和 SDL 纹理另外占用资源。
+
+每路队列首先交付 `Reset`，随后交付同一 `serial` 的 `Packet`。
+重连、积压清空和明显时间戳跳变都会清空两路队列并递增 `serial`。
+M10 在 `Reset` 时重开解码器和清空帧队列；主线程发现换代后丢弃待显示帧、撤下旧画面并重建视频时钟。
+已经取出的包、解码输出和待显示帧也根据当前 `serial` 丢弃，避免跨会话显示。
+当前 `VideoSchedule` 仅按视频 PTS 与单调墙钟安排显示；PTS 缺失时用帧时长补时，
+超过 500 ms 的时间戳异常重新锚定；迟到超过 100 ms 且仍有后续帧时丢弃当前帧。
+视频调度不读取音频位置，M13 音频主时钟同步尚未实现。
+M11 按输入流实际音频格式解码，再重采样为用户配置的交错 F32；音频环满时只等待音频线程，
+不阻塞视频解码。回调只取预分配环中已有样本，欠载不虚增媒体位置；提交位置不代表物理播放位置。
+没有音轨或禁用音频时不打开输出设备；纯音频流保留黑色窗口并播放声音。
+
+停止时先请求中断网络 I/O、停止并清空帧队列，等待解码线程和网络线程退出，
+最后在主线程释放 SDL 纹理、渲染器、窗口及视频子系统。正常 EOF 只有在禁用重连时才排空解码器尾帧；
+用户停止、网络失败和重连换代都不继续播放旧尾部。
+
+接口和缓冲规则见 [M09 说明](network-demuxing.md)、[M10/M12 说明](video-playback.md) 与 [M11 说明](audio-playback.md)。
+M09 阶段曾通过 Windows Release 的 `player` 编译、链接，未启动程序、未运行测试、未连接 SRS。
+本次 M10/M12 已通过 CMake 配置与 Windows Release 的 `player` 编译、链接，
+未启动程序、未运行测试、未连接 SRS；编译通过不代表真实播放已验证。
+
+M11 音频解码、SDL3 输出与独立音频线程已接入，并通过本次 CMake 配置和 Release 的 `player` 编译、链接。
+本次未启动程序、未运行测试、未连接 SRS，也未实现 M13 音画同步。

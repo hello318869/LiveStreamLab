@@ -106,6 +106,35 @@ target_link_libraries(lsl_publisher_pipeline PUBLIC lsl_common
     PRIVATE lsl_capture lsl_preprocess lsl_video_encoder lsl_audio_encoder lsl_muxer lsl_rtmp)
 lsl_set_warnings(lsl_publisher_pipeline)
 
+add_library(lsl_demuxer STATIC
+    src/player/demuxer/Demuxer.cpp
+    src/player/demuxer/PacketBuffer.cpp)
+target_link_libraries(lsl_demuxer PUBLIC lsl_common)
+lsl_set_warnings(lsl_demuxer)
+
+add_library(lsl_video_decoder STATIC src/player/decoder/VideoDecoder.cpp)
+target_link_libraries(lsl_video_decoder PUBLIC lsl_common)
+lsl_set_warnings(lsl_video_decoder)
+
+add_library(lsl_audio_decoder STATIC src/player/decoder/AudioDecoder.cpp)
+target_link_libraries(lsl_audio_decoder PUBLIC lsl_common)
+lsl_set_warnings(lsl_audio_decoder)
+
+add_library(lsl_audio_sink STATIC src/player/audio/SDLAudioSink.cpp)
+target_link_libraries(lsl_audio_sink PUBLIC lsl_common SDL3::SDL3)
+lsl_set_warnings(lsl_audio_sink)
+
+add_library(lsl_video_renderer STATIC src/player/renderer/SDLVideoRenderer.cpp)
+target_link_libraries(lsl_video_renderer PUBLIC lsl_common SDL3::SDL3)
+lsl_set_warnings(lsl_video_renderer)
+
+add_library(lsl_player_pipeline STATIC
+    src/player/pipeline/PlayerPipeline.cpp
+    src/player/pipeline/AudioPlayback.cpp)
+target_link_libraries(lsl_player_pipeline PUBLIC lsl_common
+    PRIVATE lsl_demuxer lsl_video_decoder lsl_video_renderer lsl_audio_decoder lsl_audio_sink)
+lsl_set_warnings(lsl_player_pipeline)
+
 if(LSL_BUILD_APPS)
     foreach(app publisher player)
         add_executable(${app} src/apps/${app}_main.cpp)
@@ -114,7 +143,7 @@ if(LSL_BUILD_APPS)
         lsl_copy_runtime(${app})
     endforeach()
     target_link_libraries(publisher PRIVATE lsl_publisher_pipeline)
-    target_link_libraries(player PRIVATE SDL3::SDL3)
+    target_link_libraries(player PRIVATE lsl_player_pipeline SDL3::SDL3)
     if(WIN32)
         add_custom_command(TARGET player POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
