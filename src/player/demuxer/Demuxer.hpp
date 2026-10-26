@@ -2,6 +2,7 @@
 
 #include "common/config/Config.hpp"
 #include "player/demuxer/DemuxTypes.hpp"
+#include "common/utils/NetworkStatus.hpp"
 
 namespace lsl::demuxer {
 
@@ -14,6 +15,7 @@ struct DemuxStats {
     std::uint64_t reconnects = 0;
     std::uint64_t timestampResets = 0;
     BufferStats buffer;
+    network::ConnectionStats network; // 状态、连接时长、payload 吞吐与最近网络错误。
 };
 
 // 单个网络线程独占 AVFormatContext；每轨允许一个消费者。

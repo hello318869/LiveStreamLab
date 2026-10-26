@@ -51,6 +51,7 @@ struct MediaInput::Impl {
     std::mutex waitMutex;
     std::condition_variable wake;
     int timeoutMs = 5000;
+    int desktopFps = 0;
     int active = -1;
     bool packetPending = false;
     bool inputEnded = false;
@@ -78,7 +79,7 @@ struct MediaInput::Impl {
     }
 
     void open(const std::string& url, const AVInputFormat* backend, media::DictionaryPtr options,
-              AVCodecID videoCodec = AV_CODEC_ID_NONE) {
+              AVCodecID videoCodec = AV_CODEC_ID_NONE, std::int64_t existingDeadline = 0) {
         AVFormatContext* raw = avformat_alloc_context();
         if (!raw) throw std::bad_alloc{};
         raw->interrupt_callback = {interrupt, this};
@@ -86,7 +87,8 @@ struct MediaInput::Impl {
         if (!file) raw->flags |= AVFMT_FLAG_NONBLOCK;
         if (videoCodec != AV_CODEC_ID_NONE) raw->video_codec_id = videoCodec;
         auto* rawOptions = options.release();
-        armTimeout();
+        if (existingDeadline) deadlineUs = existingDeadline;
+        else armTimeout();
         const int result = avformat_open_input(&raw, url.c_str(), backend, &rawOptions);
         deadlineUs = 0;
         format.reset(raw);
@@ -137,13 +139,61 @@ struct MediaInput::Impl {
         return -1;
     }
 
+    void openDesktop(std::int64_t existingDeadline = 0) {
+        media::DictionaryPtr options;
+        setOption(options, "framerate", std::to_string(desktopFps));
+        setOption(options, "draw_mouse", "1");
+        // 不设置 video_size：完整虚拟桌面由 M03 缩放，不裁剪采集区域。
+        open("desktop", av_find_input_format("gdigrab"), std::move(options), AV_CODEC_ID_NONE, existingDeadline);
+        addDecoder(Kind::Video, true);
+    }
+
+    void releaseDesktop() noexcept {
+        packet.reset();
+        decoders.clear();
+        format.reset();
+        active = -1;
+        packetPending = false;
+    }
+
     int readPacket() {
         armTimeout();
+        const auto readDeadline = deadlineUs.load();
+        bool recovering = false;
         for (;;) {
             if (stopped) { deadlineUs = 0; return AVERROR_EXIT; }
-            int result = av_read_frame(format.get(), packet.get());
+            if (av_gettime_relative() >= readDeadline) { deadlineUs = 0; return AVERROR(ETIMEDOUT); }
+            // BitBlt 失败会使 gdigrab 返回 EIO。重建其 DC/位图和 BMP 解码器，
+            // 而非让一次桌面切换或临时拒绝访问终止整个音视频流水线。
+            if (recovering && !format) {
+                try {
+                    openDesktop(readDeadline);
+                } catch (const error::FFmpegError& e) {
+                    releaseDesktop();
+                    if (e.code != AVERROR(EIO)) throw;
+                }
+                // 重开不能为每次尝试重新获得完整超时预算，也不能清掉停止标志。
+                deadlineUs = readDeadline;
+            }
+            if (interrupt(this)) {
+                deadlineUs = 0;
+                return stopped ? AVERROR_EXIT : AVERROR(ETIMEDOUT);
+            }
+            int result = format ? av_read_frame(format.get(), packet.get()) : AVERROR(EIO);
+            if (desktopFps && result == AVERROR(EIO)) {
+                if (!recovering) av_log(nullptr, AV_LOG_WARNING,
+                    "Desktop capture temporarily unavailable; rebuilding gdigrab within the capture timeout.\n");
+                recovering = true;
+                releaseDesktop();
+                std::unique_lock<std::mutex> lock(waitMutex);
+                wake.wait_for(lock, std::chrono::microseconds(std::min<std::int64_t>(100000,
+                    std::max<std::int64_t>(0, readDeadline - av_gettime_relative()))),
+                    [&] { return stopped.load(); });
+                continue;
+            }
             if (result != AVERROR(EAGAIN)) {
                 if (result == AVERROR_EXIT && !stopped && interrupt(this)) result = AVERROR(ETIMEDOUT);
+                if (recovering && result >= 0) av_log(nullptr, AV_LOG_INFO, "Desktop capture recovered.\n");
                 deadlineUs = 0;
                 return result;
             }
@@ -293,14 +343,9 @@ void MediaInput::openDevice(Kind kind, const config::PublisherConfig& config) {
         const auto* backend = av_find_input_format("gdigrab");
         if (!backend) throw error::AppError("capture", error::NotImplemented,
             "FFmpeg was built without gdigrab; desktop capture requires this input backend");
-        media::DictionaryPtr options;
-        setOption(options, "framerate", std::to_string(config.video.fps));
-        setOption(options, "draw_mouse", "1");
-        // 不设置 video_size：gdigrab 将其视为裁剪范围。完整虚拟桌面由 M03 缩放到输出宽高。
-        // 非阻塞读包沿用既有 EAGAIN 等待、停止标志和超时，不需要摄像头枚举或设备名称。
         try {
-            impl_->open("desktop", backend, std::move(options));
-            impl_->addDecoder(Kind::Video, true);
+            impl_->desktopFps = config.video.fps;
+            impl_->openDesktop();
             impl_->sourceDescription = "desktop: full Windows virtual desktop (cursor included)";
         } catch (...) { close(); throw; }
         return;
@@ -419,6 +464,7 @@ void MediaInput::close() noexcept {
     impl_->decoders.clear();
     impl_->format.reset();
     impl_->deadlineUs = 0;
+    impl_->desktopFps = 0;
     impl_->active = -1;
     impl_->packetPending = impl_->inputEnded = impl_->finished = false;
     impl_->file = impl_->loop = impl_->loopHadFrame = false;

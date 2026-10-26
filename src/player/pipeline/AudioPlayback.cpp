@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <mutex>
 #include <string>
@@ -21,6 +22,8 @@ struct AudioPlayback::Impl {
     mutable std::mutex mutex;
     AudioPlaybackStats counters;
     std::exception_ptr failure;
+    std::mutex waitMutex;
+    std::condition_variable wake;
     std::thread worker;
 
     Impl(const config::PlayerConfig& options, demuxer::Demuxer& source,
@@ -30,11 +33,18 @@ struct AudioPlayback::Impl {
     }
     ~Impl() { stop(); }
 
-    void stop() noexcept {
-        stopping.store(true, std::memory_order_relaxed);
+    void requestStop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(waitMutex);
+            stopping.store(true, std::memory_order_relaxed);
+        }
         input.requestStop();
+        wake.notify_all();
+    }
+    void join() noexcept {
         if (worker.joinable()) worker.join();
     }
+    void stop() noexcept { requestStop(); join(); }
     void update(const decoder::AudioDecodeStats& stats) {
         std::lock_guard<std::mutex> lock(mutex);
         counters.decode = stats;
@@ -48,7 +58,10 @@ struct AudioPlayback::Impl {
                 if (sink->enqueue(block)) break;
                 // 不任意删音频采样。独立线程可等待，而视频解码与主线程继续运行。
                 // 每次短等后检查停止/换代，暂停或断流不会使 join 永久等待。
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                std::unique_lock<std::mutex> lock(waitMutex);
+                wake.wait_for(lock, std::chrono::milliseconds(2), [&] {
+                    return stopping.load(std::memory_order_relaxed);
+                });
             }
         }
     }
@@ -121,6 +134,8 @@ AudioPlayback::AudioPlayback(const config::PlayerConfig& options, demuxer::Demux
                              audio::IAudioSink* sink, logging::Logger& logger)
     : impl_(std::make_unique<Impl>(options, input, sink, logger)) {}
 AudioPlayback::~AudioPlayback() = default;
+void AudioPlayback::requestStop() noexcept { impl_->requestStop(); }
+void AudioPlayback::join() noexcept { impl_->join(); }
 void AudioPlayback::stop() noexcept { impl_->stop(); }
 AudioPlaybackStats AudioPlayback::stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);

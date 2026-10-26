@@ -321,8 +321,9 @@ void VideoDecoder::reset(const demuxer::TrackInfo& track, std::uint64_t serial) 
         "import video stream codec parameters");
     state.context->pkt_timebase = track.timeBase;
     state.context->max_pixels = maxPixels;
-    // 限制解码线程及引用帧的放大；不设置 LOW_DELAY，保留带 B 帧输入所需的合法重排。
+    // 只在同一帧内并行，避免帧级线程额外缓存后续帧；B 帧仍按码流正常重排。
     state.context->thread_count = 2;
+    state.context->thread_type = FF_THREAD_SLICE;
     error::throwIfFFmpegFailed(avcodec_open2(state.context.get(), codec, nullptr), module, "open video decoder");
     state.logger.log(logging::Level::Info, module, "opened decoder=" + std::string(codec->name) +
         " serial=" + std::to_string(serial));

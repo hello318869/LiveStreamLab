@@ -82,6 +82,7 @@ struct RtmpPublisher::Impl {
     bool finishing = false;
     std::exception_ptr failure;
     PublisherStats counters;
+    network::ConnectionMonitor monitor;
     std::uint64_t submittedPackets = 0; // mutex 保护；区分空输入与未能发布任何已编码内容。
     std::uint64_t queueGeneration = 0;
     std::int64_t startedAtUs = 0;
@@ -89,6 +90,7 @@ struct RtmpPublisher::Impl {
     std::atomic<bool> stopped{false};
     std::atomic<std::int64_t> ioDeadlineUs{0};
     std::atomic<std::int64_t> drainDeadlineUs{0};
+    std::atomic<std::int64_t> lastProgressUs{0}; // 成功建连或写媒体包；interrupt 同时观察。
 
     // 以下字段只由复用线程访问；生产者绝不释放 FFmpeg 正在使用的上下文。
     media::OutputFormatPtr context;
@@ -135,7 +137,32 @@ struct RtmpPublisher::Impl {
         const auto now = av_gettime_relative();
         const auto operation = state.ioDeadlineUs.load(std::memory_order_relaxed);
         const auto draining = state.drainDeadlineUs.load(std::memory_order_relaxed);
-        return (operation != 0 && now >= operation) || (draining != 0 && now >= draining);
+        return (operation != 0 && now >= operation) || (draining != 0 && now >= draining) ||
+            state.inactive(now);
+    }
+
+    bool inactive(std::int64_t now) const noexcept {
+        const auto progress = lastProgressUs.load(std::memory_order_relaxed);
+        return options.inactivityTimeoutMs > 0 && progress != 0 &&
+            now - progress >= static_cast<std::int64_t>(options.inactivityTimeoutMs) * 1000;
+    }
+
+    void checkIo(int result, const char* operation) const {
+        const auto end = ioDeadlineUs.load(std::memory_order_relaxed);
+        const auto now = av_gettime_relative();
+        if (result < 0 && !stopped.load(std::memory_order_relaxed) &&
+            ((end != 0 && now >= end) || inactive(now))) {
+            throw error::FFmpegError("network", AVERROR(ETIMEDOUT), operation);
+        }
+        error::throwIfFFmpegFailed(result, "network", operation);
+    }
+
+    void changeState(network::ConnectionState state) {
+        const auto previous = monitor.stats().state;
+        monitor.setState(state);
+        const auto current = monitor.stats().state;
+        if (current != previous) logger.log(logging::Level::Info, "network",
+            std::string("RTMP state=") + network::stateName(current));
     }
 
     void deadline(int milliseconds) noexcept {
@@ -152,6 +179,7 @@ struct RtmpPublisher::Impl {
 
     void requestStop() noexcept {
         stopped.store(true, std::memory_order_relaxed);
+        monitor.requestStop();
         {
             std::lock_guard<std::mutex> lock(mutex);
             clearQueues();
@@ -225,12 +253,14 @@ struct RtmpPublisher::Impl {
         ++submittedPackets;
         const auto queued = tracks[0].queue.size() + tracks[1].queue.size();
         if (queued >= static_cast<std::size_t>(options.queueCapacity)) {
-            // 不能阻塞生产者：本地文件的同一线程还要继续读出另一个轨道。
+            // 上游唯一输出线程还要处理另一轨与本地录制，不能被网络队列永久阻塞。
             // 丢掉积压后由复用线程等待下一关键帧，避免输出断裂的预测链。
             clearQueues();
             ++queueGeneration;
         }
         track.queue.push_back(Item{std::move(packet), dtsUs, av_gettime_relative()});
+        counters.queueHighWaterMark = std::max(counters.queueHighWaterMark,
+            tracks[0].queue.size() + tracks[1].queue.size());
         changed.notify_all();
     }
 
@@ -286,6 +316,7 @@ struct RtmpPublisher::Impl {
     }
 
     void openSession() {
+        changeState(reopening ? network::ConnectionState::Reconnecting : network::ConnectionState::Connecting);
         AVFormatContext* raw = nullptr;
         error::throwIfFFmpegFailed(avformat_alloc_output_context2(&raw, nullptr, "flv", nullptr),
                                    "mux", "allocate FLV output context");
@@ -320,23 +351,26 @@ struct RtmpPublisher::Impl {
         const int opened = avio_open2(&context->pb, url.c_str(), AVIO_FLAG_WRITE,
                                      &context->interrupt_callback, &dictionary);
         networkOptions.reset(dictionary);
-        error::throwIfFFmpegFailed(opened, "network", "connect RTMP output");
+        checkIo(opened, "connect RTMP output");
         media::DictionaryPtr muxOptions;
         // 直播不可 seek；不尝试回填 FLV duration/filesize。
         setOption(muxOptions, "flvflags", "no_duration_filesize");
         dictionary = muxOptions.release();
-        deadline(options.connectTimeoutMs);
+        // 打开连接与 FLV 头共享一次连接预算，不因分阶段调用延长上限。
         const int header = avformat_write_header(context.get(), &dictionary);
         muxOptions.reset(dictionary);
-        error::throwIfFFmpegFailed(header, "network", "write FLV header");
+        checkIo(header, "write FLV header");
         headerWritten = true;
         ioDeadlineUs.store(0, std::memory_order_relaxed);
+        lastProgressUs.store(av_gettime_relative(), std::memory_order_relaxed);
+        monitor.connected();
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (reopening) ++counters.reconnects;
         }
         reopening = false;
-        logger.log(logging::Level::Info, "mux", "RTMP session ready: FLV, H.264/AAC encoder headers; stream time bases negotiated");
+        logger.log(logging::Level::Info, "mux", std::string("RTMP state=") + network::stateName(monitor.stats().state)
+            + "; session ready: FLV, H.264/AAC encoder headers; stream time bases negotiated");
         for (const auto streamIndex : streamIndices) {
             if (streamIndex < 0) continue;
             const auto* stream = context->streams[streamIndex];
@@ -355,6 +389,12 @@ struct RtmpPublisher::Impl {
         std::unique_lock<std::mutex> lock(mutex);
         for (;;) {
             if (stopped.load(std::memory_order_relaxed) || expired()) return false;
+            if (allEnded() && tracks[0].queue.empty() && tracks[1].queue.empty()) return false;
+            // 即使没有可复用包、编码参数或关键帧，也必须能发现长期没有媒体进展。
+            // take 的异常由 run 内同一个恢复边界处理，不绕过退避策略。
+            if (!finishing && inactive(av_gettime_relative())) {
+                throw error::FFmpegError("network", AVERROR(ETIMEDOUT), "RTMP media inactivity timeout");
+            }
             if (!ready()) {
                 changed.wait_for(lock, std::chrono::milliseconds(20));
                 continue;
@@ -473,8 +513,10 @@ struct RtmpPublisher::Impl {
         const auto dts = packet->dts;
         deadline(options.writeTimeoutMs);
         const int written = av_interleaved_write_frame(context.get(), packet.get());
-        error::throwIfFFmpegFailed(written, "network", "write interleaved FLV packet");
+        checkIo(written, "write interleaved FLV packet");
         ioDeadlineUs.store(0, std::memory_order_relaxed);
+        lastProgressUs.store(av_gettime_relative(), std::memory_order_relaxed);
+        monitor.media(bytes);
         outputDts[index] = dts;
         consecutiveFailures = 0;
         pendingNetworkFailure = nullptr;
@@ -490,7 +532,8 @@ struct RtmpPublisher::Impl {
         const auto ioDeadline = ioDeadlineUs.load(std::memory_order_relaxed);
         // 本模块 interrupt callback 的 deadline 以 AVERROR_EXIT 报告；服务器正常关闭
         // 可能映射为 EOF/EIO。这些网络状态同样可重连，配置/内存/协议错误不重试。
-        const bool timedOut = ioDeadline != 0 && av_gettime_relative() >= ioDeadline;
+        const auto now = av_gettime_relative();
+        const bool timedOut = (ioDeadline != 0 && now >= ioDeadline) || inactive(now);
         const bool retryable = problem.recoverable || problem.code == AVERROR_EOF ||
             problem.code == AVERROR(EIO) || (problem.code == AVERROR_EXIT && timedOut);
         bool finishingNow;
@@ -500,21 +543,33 @@ struct RtmpPublisher::Impl {
             finishingNow = finishing;
             clearQueues();
         }
+        monitor.recordError(problem.code, problem.what());
+        const bool canRetry = retryable && !finishingNow &&
+            (options.reconnectAttempts < 0 || consecutiveFailures < options.reconnectAttempts);
+        // 关闭协议也可能等待网络：已知断开时立即结束 STREAMING 状态与连接计时。
+        changeState(canRetry ? network::ConnectionState::Reconnecting : network::ConnectionState::Error);
         // 连接可能残留半个 FLV tag；绝不在旧上下文上继续写下一会话。
         closeSession(false);
-        if (!retryable || finishingNow || consecutiveFailures >= options.reconnectAttempts) throw problem;
-        ++consecutiveFailures;
+        if (!canRetry) throw problem;
+        if (consecutiveFailures < std::numeric_limits<int>::max()) ++consecutiveFailures;
+        const auto retryDelay = network::reconnectDelayMs(options.reconnectDelayMs,
+            options.reconnectMaxDelayMs, static_cast<std::uint64_t>(consecutiveFailures));
+        monitor.retry(consecutiveFailures, retryDelay);
         recovering = true;
         reopening = true;
         awaitingKey = true;
         hasSessionOrigin = false;
         cutoffUs = std::numeric_limits<std::int64_t>::min();
-        logger.log(logging::Level::Warn, "network", "RTMP I/O failed; rebuilding session, retry " +
-                   std::to_string(consecutiveFailures) + "/" + std::to_string(options.reconnectAttempts), problem.code);
+        logger.log(logging::Level::Warn, "network", "RTMP state=RECONNECTING; rebuilding session, retry " +
+                   std::to_string(consecutiveFailures) + "/" +
+                   (options.reconnectAttempts < 0 ? "unlimited" : std::to_string(options.reconnectAttempts)) +
+                   " delay_ms=" + std::to_string(retryDelay) + ": " + problem.what(), problem.code);
         std::unique_lock<std::mutex> lock(mutex);
-        changed.wait_for(lock, std::chrono::milliseconds(options.reconnectDelayMs), [&] {
+        changed.wait_for(lock, std::chrono::milliseconds(retryDelay), [&] {
             return stopped.load(std::memory_order_relaxed) || finishing;
         });
+        // 退避本身不算新一轮的无数据；下一轮仍须在此预算内取得关键帧并发送。
+        lastProgressUs.store(av_gettime_relative(), std::memory_order_relaxed);
         return !stopped.load(std::memory_order_relaxed) && !finishing;
     }
 
@@ -523,8 +578,8 @@ struct RtmpPublisher::Impl {
             for (;;) {
                 Item item;
                 std::size_t index = 0;
-                if (!take(item, index)) break;
                 try {
+                    if (!take(item, index)) break;
                     if (!context) openSession();
                     write(item, index);
                 } catch (const error::FFmpegError& e) {
@@ -532,7 +587,7 @@ struct RtmpPublisher::Impl {
                     pendingNetworkFailure = std::make_exception_ptr(e);
                     {
                         std::lock_guard<std::mutex> lock(mutex);
-                        ++counters.droppedPackets; // 当前包已被 mux 消费或其发送状态未知，不重发。
+                        if (item.packet) ++counters.droppedPackets; // 发送状态未知的包不重发；等待超时没有当前包。
                     }
                     if (!recover(e)) break;
                 }
@@ -547,6 +602,7 @@ struct RtmpPublisher::Impl {
                     std::lock_guard<std::mutex> lock(mutex);
                     ++counters.networkErrors;
                 }
+                monitor.recordError(trailer, error::ffmpegErrorString(trailer));
                 throw error::FFmpegError("network", trailer, "finish FLV output");
             }
             bool noOutput;
@@ -565,8 +621,21 @@ struct RtmpPublisher::Impl {
                 failure = std::current_exception();
                 stopped.store(true, std::memory_order_relaxed);
             }
+            changeState(network::ConnectionState::Error);
             closeSession(false);
+            // recover 已记录的同一异常不重复计数；后续不同的致命异常覆盖旧错误描述。
+            try { std::rethrow_exception(failure); }
+            catch (const error::AppError& problem) {
+                const auto previous = monitor.stats();
+                if (previous.lastErrorCode != problem.code || previous.lastErrorMessage != problem.what()) {
+                    monitor.recordError(problem.code, problem.what());
+                }
+            }
+            catch (const std::exception& problem) { monitor.recordError(error::Unexpected, problem.what()); }
+            catch (...) { monitor.recordError(error::Unexpected, "unknown RTMP worker failure"); }
         }
+        monitor.finish(static_cast<bool>(failure));
+        logger.log(logging::Level::Info, "network", std::string("RTMP state=") + network::stateName(monitor.stats().state));
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (expired()) logger.log(logging::Level::Warn, "mux", "Network drain deadline reached; dropping remaining streaming packets");
@@ -590,7 +659,15 @@ void RtmpPublisher::start(bool video, bool audio) {
     state.tracks[1].enabled = audio;
     state.startedAtUs = av_gettime_relative();
     state.started = true;
-    state.worker = std::thread([&state] { state.run(); });
+    state.lastProgressUs.store(state.startedAtUs, std::memory_order_relaxed);
+    state.monitor.start();
+    try { state.worker = std::thread([&state] { state.run(); }); }
+    catch (...) {
+        state.failure = std::current_exception();
+        state.monitor.recordError(error::Unexpected, "cannot start RTMP worker thread");
+        state.monitor.finish(true);
+        throw;
+    }
 }
 
 void RtmpPublisher::setVideoParameters(const AVCodecParameters& p, AVRational t) { impl_->setParameters(0, p, t); }
@@ -604,6 +681,7 @@ void RtmpPublisher::checkError() const { impl_->checkError(); }
 
 void RtmpPublisher::finish() {
     auto& state = *impl_;
+    state.monitor.setState(network::ConnectionState::Stopping);
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         if (!state.finishing) {
@@ -615,6 +693,7 @@ void RtmpPublisher::finish() {
     }
     state.changed.notify_all();
     if (state.worker.joinable()) state.worker.join();
+    if (!state.started) state.monitor.finish();
     state.checkError();
 }
 
@@ -622,6 +701,10 @@ PublisherStats RtmpPublisher::stats() const {
     const auto& state = *impl_;
     std::lock_guard<std::mutex> lock(state.mutex);
     auto result = state.counters;
+    result.network = state.monitor.stats();
+    result.videoQueued = state.tracks[0].queue.size();
+    result.audioQueued = state.tracks[1].queue.size();
+    result.queuedPackets = result.videoQueued + result.audioQueued;
     if (state.startedAtUs != 0) {
         const auto end = state.endedAtUs == 0 ? av_gettime_relative() : state.endedAtUs;
         result.durationSeconds = static_cast<double>(end - state.startedAtUs) / AV_TIME_BASE;

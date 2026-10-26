@@ -1,4 +1,4 @@
-# M07 FLV 封装与 RTMP 推流
+# M07 / M15 FLV 封装与 RTMP 推流
 
 M07 将已有 H.264/AAC 编码器的输出交给 `RtmpPublisher`，由一个专用线程完成 FLV 封装与
 RTMP/RTMPS 网络写出。实现位于 `src/publisher/rtmp/RtmpPublisher.hpp/.cpp`，由
@@ -39,7 +39,7 @@ ffplay rtmp://127.0.0.1/live/livestream
 
 远程服务器应替换主机地址，应用名/流名应与服务端配置一致。
 OBS 可在“媒体源”中取消“本地文件”，将相同 RTMP 地址填入输入地址。
-自研 `player` 仍属于后续观众端模块，不能用它验证本次推流。
+自研 `player` 已接入拉流、解码与同步播放；本次未启动它验证推流。
 仅传 `--url` 会覆盖地址，开启推流还需要 `--stream true` 或配置中的 `output.streaming=true`。
 设备视频默认 `capture.video_source=desktop`。桌面采集读取完整虚拟桌面与鼠标，随后缩放到
 配置的编码尺寸；`--video-source camera` 才使用 `--video-device` 和 `--video-format`。
@@ -54,13 +54,16 @@ OBS 可在“媒体源”中取消“本地文件”，将相同 RTMP 地址填�
 | `streaming` | `false` | 是否建立 FLV/RTMP 输出 |
 | `connect_timeout_ms` | `5000` | 100–60000 ms，连接及写头阶段超时 |
 | `write_timeout_ms` | `5000` | 100–60000 ms，写包、写尾和关闭阶段超时 |
-| `reconnect_attempts` | `5` | 0–100，失败后的最多重试次数；0 禁止重连 |
-| `reconnect_delay_ms` | `1000` | 0–60000 ms，重连等待间隔 |
+| `reconnect_attempts` | `5` | -1–100，连续故障的最多重试次数；-1 持续重试，0 禁止重连 |
+| `reconnect_delay_ms` | `1000` | 0–60000 ms，首次重连等待间隔；后续按 2 倍退避 |
+| `reconnect_max_delay_ms` | `30000` | 0–60000 ms，退避上限，不小于首次等待间隔 |
+| `inactivity_timeout_ms` | `15000` | 100–600000 ms，无成功媒体发送的时限；0 禁用 |
 | `queue_capacity` | `256` | 8–4096，应用侧待复用编码包上限 |
 | `max_interleave_delta_ms` | `500` | 1–5000 ms，交织等待控制 |
 
 快捷参数为 `--stream`、`--connect-timeout`、`--write-timeout`、`--reconnect-attempts`、
-`--reconnect-delay`、`--mux-queue-capacity`。所有字段也可用 `--set output.字段=值` 覆盖。
+`--reconnect-delay`、`--reconnect-max-delay`、`--inactivity-timeout`、`--mux-queue-capacity`。
+所有字段也可用 `--set output.字段=值` 覆盖。
 推流采用文件输入时要求 `capture.realtime=true`，防止离线编码速度持续超出实时网络输出。
 
 ## 接口与交接
@@ -102,24 +105,41 @@ FLV 不能提供与 MP4/M4A 相同的样本级 priming/尾部裁剪表示，不�
 
 ## 线程、所有权与网络恢复
 
-采集线程仍串行完成解码、预处理、编码与可选本地写出。推流包以独占 `PacketPtr` 交给有界队列，
-由专用复用线程串行调用 `av_interleaved_write_frame()`；生产线程不并发操作输出上下文。
+M14 中采集线程只完成输入读取/解码，再通过两路有界原始帧队列交给独立的音视频预处理/编码线程。
+编码参数、独占包及结束事件先进入共同的有界输出事件队列，由唯一输出线程完成本地 MP4/M4A 写出，
+并按轨顺序提交 `RtmpPublisher`。其内部专用线程独占 FLV 上下文，串行调用
+`av_interleaved_write_frame()`，其他线程不并发操作该输出上下文。
 同时本地录制时，独立引用产生不同的 `AVPacket` 结构，某一路 rescale 或消费包不会修改另一路元数据。
 
 网络慢或断线时队列不能无限增长。超过容量时舍弃积压包并恢复到可解码边界；
 有视频的会话从关键帧恢复，并丢弃早于恢复边界的音频。恢复前可能短暂没有画面/声音，
-不保证故障期间的内容完整保留。M14 的完整采集/编码流水线队列仍未在本阶段展开。
+不保证故障期间的内容完整保留。采集到编码的背压、原始视频丢帧与完整停止顺序见
+[M14 多线程流水线](threading.md)。
 
-连接与写入均设置超时，`AVIOInterruptCB` 根据停止请求与当前 I/O 截止时间中断阻塞操作。
-网络失败时关闭旧会话，按配置有限重试，并重新创建输出上下文、流和封装头。
-编码器继续生产，复用器等待新的关键帧；最坏等候时间还受 GOP 和编码器延迟影响。
+连接与写入均设置超时，`AVIOInterruptCB` 根据停止请求、当前 I/O 截止时间和无媒体进展时限中断阻塞操作。
+连接打开与写 FLV 头共用一次连接预算。超时中断统一转换为网络 `ETIMEDOUT`，用户取消不计作网络故障。
+网络失败时关闭旧会话，按配置重试，并重新创建输出上下文、流和封装头。
+退避顺序为 base、2×base、4×base……，默认最多 30 秒；仅成功发送媒体包才重置连续失败预算，
+不能仅凭打开 TCP 或写出 FLV 头就视为已经恢复。`reconnect_attempts=-1` 允许持续重试，停止请求仍能唤醒退避等待。
+编码器继续有界生产，复用器等待新的关键帧；等候时间受 GOP、编码器延迟和无数据时限共同约束。
+等待编码参数、关键帧或待发包时同样检查无数据时限，不能只依赖正在执行的网络写入超时。
+成功建连/写包及退避结束会建立下一轮进展基准，退避本身不消耗下一轮无数据预算。
+系统音源本来可能长时间无声、低帧率或 GOP 特别大时，应按需求增大或禁用无数据时限。
 重试耗尽后异常回传到主线程，主线程停止采集、回收线程并经既有日志边界报告。
 地址由 FFmpeg 解析，不在应用日志中输出含认证信息或流密钥的完整 URL。
 
-正常 EOF 时，先排空预处理与编码器并标记各轨结束，再尝试排空复用队列、写尾并关闭输出。
+状态由 `common/utils/NetworkStatus.hpp` 的线程安全快照提供：
+`IDLE → CONNECTING → STREAMING`；可恢复故障进入 `RECONNECTING`，恢复后回到 `STREAMING`；
+停止/排空进入 `STOPPING`，资源回收完成回到 `IDLE`；不可恢复错误停留在 `ERROR`。
+只有实际连接和 FLV 头建立成功才进入 `STREAMING`；迟到的成功操作不能将 `STOPPING` 恢复成工作状态。
+`ERROR` 不被随后主线程的清理停止覆盖。两端一致的规则与边界见 [M15 网络可靠性](network-reliability.md)。
+
+正常 EOF 时，输入线程先关闭输入与原始帧队列；处理线程排空已入队媒体、预处理与编码器，
+输出线程按事件顺序提交包并标记各轨结束，再尝试排空 RTMP 复用队列、写尾并关闭输出。
 `finish()` 使用总计 `write_timeout_ms` 的收尾预算，进入收尾后不再重连；超时则舍弃剩余网络包并记录日志。
 此前已发生且尚未恢复的网络故障仍会报告；有编码输入但未成功交付任何包时也返回错误。
-Ctrl+C 会立即请求中断网络 I/O 并舍弃网络队列尾包，采集线程仍排空编码器并尽力写完本地 MP4/M4A。
+Ctrl+C 会立即请求中断网络 I/O 并舍弃网络队列尾包，同时停止输入并关闭原始帧队列；
+处理线程排空已入队媒体与编码器，输出线程尽力写完本地 MP4/M4A。
 因此主动停止不保证最后一批编码包已经推送，不会为了等待断开的服务器而无限阻塞退出。
 强制结束进程不保证写尾或本地文件完整性。
 
@@ -131,6 +151,14 @@ Ctrl+C 会立即请求中断网络 I/O 并舍弃网络队列尾包，采集线�
 不等于网卡流量，也不证明服务器或观众已经接收。平均码率使用相同字节口径计算。
 主播端每秒及结束时输出 `sent_packets`、`sent_payload_bytes`、`average_bitrate_bps`、`duration_seconds`、
 `dropped_packets`、`network_errors` 与 `reconnects`，对应同一份统计。
+
+M15 在 `PublisherStats.network` 中增加 `ConnectionStats`：状态、成功连接次数、累计安排重试次数、
+连续失败次数、当前退避间隔、当前/上一连接时长、累计已连接时长、距媒体进展的时长、最近错误码与描述。
+旧 `reconnects` 仍表示成功重建会话次数，`network.reconnectAttempts` 表示安排过的重试次数，两者可能不同。
+日志字段为 `state`、`connections`、`retry_attempts`、`consecutive_failures`、`retry_delay_ms`、
+`connection_seconds`、`connected_seconds`、`idle_seconds`、`last_error_code` 和 `last_error`。
+`network.averageBitrate` 使用编码 payload 字节除以整个运行时间，包含连接与退避等待；
+已连接时长不包含重连等待，停止完成后时长冻结。错误描述在恢复成功后保留，以便追查最近一次故障。
 
 历史记录：2026-10-25 的 M07 实现已通过 Windows Release 的 CMake 完整编译，生成 `publisher.exe` / `player.exe`：
 

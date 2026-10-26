@@ -12,7 +12,7 @@ struct AudioSinkOptions {
     std::string device = "default";
     int sampleRate = 48000;
     int channels = 2;
-    int bufferMs = 500;
+    int bufferMs = 100;
     int volume = 100;
     bool muted = false;
     bool paused = false;
@@ -25,6 +25,7 @@ struct AudioSinkStats {
     std::uint64_t callbacks = 0;
     std::uint64_t serial = 0;
     std::size_t queuedFrames = 0; // 仅应用 PCM 环；SDL 内部缓存另列。
+    std::size_t highWaterMarkFrames = 0; // 会话内应用 PCM 环的最大积压，换代不清零。
     std::size_t capacityFrames = 0; // 至少 4096 帧，bufferMs 不是绝对容量上限。
     std::size_t sdlQueuedBytes = 0;
     std::size_t sdlAvailableBytes = 0;

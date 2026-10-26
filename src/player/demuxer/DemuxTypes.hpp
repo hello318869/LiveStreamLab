@@ -42,7 +42,10 @@ struct BufferStats {
     std::uint64_t overflows = 0;
     std::size_t videoPackets = 0;
     std::size_t audioPackets = 0;
+    std::size_t videoHighWaterMark = 0;
+    std::size_t audioHighWaterMark = 0;
     std::size_t bytes = 0;
+    std::size_t peakBytes = 0;
     std::int64_t bufferedMs = 0;
     std::uint64_t serial = 0;
 };

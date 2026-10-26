@@ -1,4 +1,10 @@
 {
+  "pipeline": {
+    "video_queue_capacity": 8,
+    "audio_queue_capacity": 32,
+    "packet_queue_capacity": 256,
+    "max_video_age_ms": 200
+  },
   "capture": {
     "source": "file",
     "file": "sample.mp4",

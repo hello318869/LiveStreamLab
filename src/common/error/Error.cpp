@@ -17,6 +17,8 @@ bool isRecoverableFFmpegError(std::string_view module, int code) noexcept {
     if (code == AVERROR(EAGAIN) || code == AVERROR(EINTR)) return true;
     return module == "network" && (code == AVERROR(ETIMEDOUT) ||
         code == AVERROR(ECONNRESET) || code == AVERROR(ECONNREFUSED) ||
+        code == AVERROR(ECONNABORTED) || code == AVERROR(ENETDOWN) ||
+        code == AVERROR(ENETUNREACH) || code == AVERROR(EHOSTUNREACH) ||
         code == AVERROR(EPIPE) || code == AVERROR_HTTP_SERVER_ERROR);
 }
 

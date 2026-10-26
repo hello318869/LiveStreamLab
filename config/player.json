@@ -5,6 +5,8 @@
     "read_timeout_ms": 5000,
     "reconnect_attempts": 5,
     "reconnect_delay_ms": 1000,
+    "reconnect_max_delay_ms": 30000,
+    "inactivity_timeout_ms": 15000,
     "queue_capacity": 256,
     "max_buffer_ms": 2000,
     "max_queue_bytes": 33554432,
@@ -21,7 +23,7 @@
     "sample_rate": 48000,
     "channels": 2,
     "enabled": true,
-    "buffer_ms": 500,
+    "buffer_ms": 100,
     "volume": 100,
     "muted": false,
     "paused": false
@@ -31,6 +33,10 @@
     "drop_threshold_ms": 100,
     "audio_wait_ms": 500,
     "discontinuity_threshold_ms": 1000
+  },
+  "pipeline": {
+    "video_queue_capacity": 3,
+    "max_video_age_ms": 200
   },
   "logging": {
     "level": "INFO",

@@ -1,4 +1,4 @@
-# M09 网络拉流与解封装
+# M09 / M15 网络拉流、解封装与恢复
 
 M09 从 RTMP/RTMPS 或 HTTP/HTTPS-FLV 地址读取直播数据，解析媒体流信息，并把视频、音频
 `AVPacket` 分别送入有界队列。实现位于 `src/player/demuxer`，应用编排位于
@@ -7,6 +7,8 @@ M11 的独立音频线程解码音频包并经 SDL3 音频回调输出；关闭�
 M13 已接入音频主时钟同步；不保存媒体文件。音频接口见 [M11 说明](audio-playback.md)，
 同步与降级见 [M13 说明](av-sync.md)。
 视频链路、窗口操作和帧缓冲见 [M10/M12 说明](video-playback.md)。
+M15 补齐统一网络状态、指数退避与持续重试、有效媒体超时和连接统计；两端统一规则见
+[网络可靠性与状态管理](network-reliability.md)。
 
 M09 阶段已通过 Windows Release 的 `player` 编译、链接；当时测试保持关闭，未启动程序、未运行测试、
 未连接 SRS。本次 M10/M12 已通过 CMake 配置与 Windows Release 的 `player` 编译、链接，
@@ -30,6 +32,9 @@ cmake --build build/cmake --config Release --target player --parallel
 
 # 调整连接/读取超时及重连预算
 .\build\cmake\bin\Release\player.exe --connect-timeout 5000 --read-timeout 5000 --reconnect-attempts 5 --reconnect-delay 1000
+
+# 持续重连：等待 1/2/4/8/16/30 秒，之后保持 30 秒；Ctrl+C 可中断等待
+.\build\cmake\bin\Release\player.exe --reconnect-attempts -1 --reconnect-delay 1000 --reconnect-max-delay 30000 --inactivity-timeout 15000
 
 # 调整接收缓冲，每轨 256 包、两轨合计 32 MiB、最多 2 秒
 .\build\cmake\bin\Release\player.exe --packet-queue-capacity 256 --max-buffer-ms 2000 --max-queue-bytes 33554432
@@ -59,15 +64,21 @@ avformat_open_input
        └─ audio stream_index → 音频队列
 ```
 
-M09 解封装支持只有音频或只有视频的直播；当前 M10/M12 播放入口要求存在视频流，
-纯音频输入由 M11 播放声音，窗口保持黑色。其他流的数据包不送入音视频队列。
+解封装与播放支持只有音频或只有视频的直播；纯音频输入由 M11 播放声音，窗口保持黑色。
+其他流的数据包不送入音视频队列。
 编码格式、分辨率、采样率和声道等参数来自输入流，使用 `StreamInfo` 快照交付给下游。
 快照拥有深拷贝的 `AVCodecParameters`，输入上下文关闭后仍然有效；下游不持有借用的 `AVStream`。
 队列移动交接 `PacketPtr`，每个 `AVPacket` 结构只有一个所有者；需要分发给多个消费者时，应
 另行使用 `media::referencePacket()` 创建独立包引用。
 
-连接和探测使用 `input.connect_timeout_ms`，单次读取使用 `input.read_timeout_ms`。
-FFmpeg 中断回调检查停止标志及当前 I/O 截止时间；重试等待也可以中断。
+打开和流探测共用 `input.connect_timeout_ms` 预算，单次读取使用 `input.read_timeout_ms`。
+直播输入设置 `fps_probe_size=0`：参数完整后不再为了估算帧率额外读取一批视频帧。
+保留原 2 MiB / 3 秒分析上限与探测期间的媒体包，以兼容必要的序列头和轨道初始化；
+这些上限不是固定预缓冲。开流日志的 `probe_ms` 只统计流信息探测，不包含连接耗时。
+优化依据与限制见 [延迟回退优化](latency.md)。
+FFmpeg 中断回调检查停止标志、当前 I/O 截止时间和独立的有效媒体截止时间；重试等待也可以中断。
+持续 EAGAIN/EINTR 不重新开启单次读预算；即使不断收到无关流、损坏包或空包，
+也不能延长 `input.inactivity_timeout_ms`。关闭输入也保留单次读超时与停止中断。
 `Ctrl+C` 由主线程转为停止请求，网络线程负责释放自己的上下文，退场时等待线程结束。
 `start()` 只允许调用一次；停止操作可重复调用。
 
@@ -86,14 +97,33 @@ FFmpeg 中断回调检查停止标志及当前 I/O 截止时间；重试等待�
 只有音频的输入不等待视频关键帧。单包大于字节上限也会丢弃并重置预测链。
 此策略会造成内容跳跃，目标是在直播中限制积压；不适合作为完整无损文件读取器。
 
-`BufferStats` 提供当前视频/音频包数、总字节数、缓冲时长和 `serial`，并累计接收、丢包、
-重置与超限次数。`DemuxStats` 另外统计两路已读包数、忽略包数、流量、连接、重连和时间戳重置。
+`BufferStats` 提供当前视频/音频包数、总字节数、缓冲时长、积压峰值和 `serial`，并累计接收、丢包、
+重置与超限次数。`DemuxStats` 另外统计两路已读包数、忽略包数、流量、连接、重连和时间戳重置，
+`DemuxStats.network` 提供线程安全的连接状态、当前/上一连接时长、累计已连接时长、运行时长、
+payload 平均码率、有效媒体空闲时间、连续失败次数、重试延时和最近一次错误码/描述。
+平均码率只包含所选音视频流的有效非空 payload，不包含协议开销；分母包含连接及重试等待。
+通过网络收到但被关键帧/积压策略丢弃的有效包仍计入 payload，不能据此认定播放已恢复。
 应用日志报告这些指标；收到包只证明接收链路，不能据此认定解码或播放正常。
 
 ## 重连和时间戳
 
-网络故障后先清空旧队列，按 `input.reconnect_delay_ms` 等待，再重新打开输入。
-`input.reconnect_attempts` 是连续故障的重试预算；成功收到媒体包后重置预算。
+首次启动进入 CONNECTING，流参数发现成功后进入 STREAMING。网络故障先进入 RECONNECTING，
+撤销旧流快照并清空两路队列、递增 `serial`，随后关闭旧上下文，再等待和重新打开输入。
+等待期间的 `Reset` 不带 `streams`，令解码器、PCM、画面和同步基准立即清理；
+不能使用旧编码参数在断线期间重新创建解码器。终止重试时进入 ERROR，清理过程不覆盖该状态。
+主动停止经过 STOPPING 后回到 IDLE；正常 EOF 结束也回到 IDLE。
+
+`input.reconnect_attempts` 是连续故障的重试预算，默认 5；`-1` 表示持续重试，`0` 禁用重试。
+首个错误后的等待为 `input.reconnect_delay_ms`，连续失败时每次翻倍，最大
+`input.reconnect_max_delay_ms`，默认 30000 ms。两者均可为 0，但上限不能小于初始等待。
+只有 `PacketBuffer` 接受的有效非空媒体才重置失败预算；仅 TCP/流头成功、收到损坏包、空包，
+或等待关键帧时持续收到不可交给下游的 P 帧，都不视为恢复。
+不可恢复的内存、参数、协议、解封装器缺失、HTTP 认证/权限错误直接结束，不无限重连。
+
+`input.inactivity_timeout_ms` 默认 15000 ms：新连接从流参数发现成功计时，以最近一次
+被队列接受的有效媒体更新时间。超时按网络 ETIMEDOUT 处理，允许进入重连。
+它与单次读取超时相互独立；设为 `0` 可禁用有效媒体检测，单次读取超时仍生效。
+由于恢复需要视频关键帧，该值应大于上游最长 GOP 时长，否则合法长 GOP 也可能触发超时。
 每次新连接重新解析媒体流，流编号、编码参数或时间基可以变化，新的快照随 `Reset` 交付。
 默认将网络 EOF 当作直播断流并重连。设置 `--reconnect-attempts 0` 后，正常 EOF 允许缓存排空
 并以 `0` 退出；其他网络错误以 `1` 退出。配置错误仍以 `2` 退出。
@@ -112,7 +142,7 @@ FFmpeg 中断回调检查停止标志及当前 I/O 截止时间；重试等待�
 
 | 事件 | 下游动作 |
 |---|---|
-| `Reset` | 保存 `serial` 与 `streams`；清理旧解码器、解码帧队列和播放时钟，按新参数重新建立状态 |
+| `Reset` | 保存 `serial`；清理旧解码器、帧队列和播放时钟，有新 `streams` 才按参数重建，断线的空快照继续等待 |
 | `Packet` | 根据 `track` 和快照的流时间基处理 `packet`，保留其 `serial` |
 | `Timeout` | 暂时没有事件，继续处理停止或应用控制 |
 | `End` | 本轨缓存已排空；先检查网络错误，仅正常 EOF 且禁用重连时刷新解码尾帧后结束 |
@@ -127,3 +157,6 @@ M09 本身不拥有解码器，通过事件明确下游的清理和重建边界�
 `finish()` 的队列行为是排空后交付 `End`；`stop()` 立即清空并唤醒消费者。
 停止和队列结束可重复调用。`Demuxer::checkError()` 将网络工作线程失败重新抛给应用顶层，
 避免工作线程异常静默丢失。
+
+M15 本次按项目要求未运行测试、未启动播放器或连接 SRS；编译记录与运行验收边界见
+[M15 说明](network-reliability.md)。

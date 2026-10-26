@@ -57,10 +57,11 @@ AppError/FFmpegError。返回的帧由调用方独占，不会被下一次读取
 复用帧或包时使用 `referenceFrame/referencePacket`，内部调用 `av_frame_ref/av_packet_ref`。
 引用共享底层缓冲，修改前先调用 FFmpeg 的 make_writable 接口。
 
-当前入口在 `pipeline/PublisherPipeline.cpp` 的读取循环将帧交给 M03/M04，继续交给 M05/M06 编码并分别自动保存。
+当前入口在 `pipeline/PublisherPipeline.cpp` 的采集线程将独占帧交给音视频各自的有界原始帧队列，
+M03/M04 预处理与 M05/M06 编码分别在视频、音频处理线程完成；本地保存由唯一输出线程执行。
 参见 [预处理接口与时间轴](preprocessing.md)、[视频编码与文件输出](video-encoding.md)
 和 [AAC 音频编码](audio-encoding.md)。
-后续 M14 再建立完整的有界队列与流水线。
+M14 的队列容量、背压、线程与收尾顺序见 [多线程流水线](threading.md)。
 
 ## 时间戳与文件节奏
 
@@ -80,18 +81,28 @@ AppError/FFmpegError。返回的帧由调用方独占，不会被下一次读取
 
 ## 启停与线程边界
 
-一个设备对应一个工作线程；文件的音视频轨共用一个解复用线程。
+一个设备对应一个采集线程；文件的音视频轨共用一个解复用/输入解码线程，再按轨分发到有界队列。
 每个输入的 open/read/close 在同一线程执行，防止 DirectShow COM 与上下文跨线程释放。
 已在所属线程 close 的空输入对象可在主线程析构；仍持有媒体资源的对象须在所属线程析构。
 只有 `requestStop()` 可由其他线程调用：它设置原子停止标志并唤醒文件节奏等待。
 
-禁止在读取时从另一个线程直接 close。停止顺序为：requestStop → 读取返回 → 工作线程 close → join。
+禁止在读取时从另一个线程直接 close。停止顺序为：requestStop → 读取返回 →
+采集线程 close 输入及原始帧队列 → 处理线程排空预处理/编码 → 输出线程完成本地文件尾部 → join。
+Ctrl+C 同时关闭原始队列，唤醒被背压阻塞的生产者；此前已入队的媒体仍由下游排空。
 重复 close 安全；已打开的输入再次 open 会报错，close 后允许重新打开。
-工作线程发生错误后停止其他输入，所有线程退出后由原有顶层异常处理记录错误并返回 1。
+工作线程发生错误后立即停止其他输入、中止交接队列并中断 RTMP；
+所有线程退出后由原有顶层异常处理记录错误并返回 1。
 
 DirectShow 读包采用 `AVFMT_FLAG_NONBLOCK`，无数据时短暂等待并检查停止/超时；
 文件 I/O 配置 `AVIOInterruptCB`。Linux V4L2/ALSA 同样使用非阻塞请求。
 驱动在设备初始化等内部调用中可能不响应 FFmpeg 中断，不能据此保证任意故障驱动都能限时退出。
+
+Windows 桌面 `gdigrab` 读包遇到 `EIO` 时，在同一个采集线程释放并重建 GDI 输入和 BMP 解码器，
+每次重试间隔最多 100 ms，沿用本次读包的 `capture.timeout_ms` 总预算（默认 5000 ms）。
+恢复不会清除停止标志或重置公共媒体时钟；音频线程继续运行。日志会记录
+`Desktop capture temporarily unavailable` 和 `Desktop capture recovered`。
+持续故障超过预算仍报告采集超时并停止；首次打开失败、其他输入类型及其他错误仍直接报错。
+`requestStop()` 也会唤醒恢复等待。故障注入与运行记录见 [M14/M15 修复验证](m14-m15-fixes.md)。
 
 实现依据：[FFmpeg gdigrab 桌面设备说明](https://ffmpeg.org/ffmpeg-devices.html#gdigrab)、
 [gdigrab 读包实现](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/gdigrab.c)、
@@ -103,5 +114,7 @@ DirectShow 读包采用 `AVFMT_FLAG_NONBLOCK`，无数据时短暂等待并检�
 
 历史接入已补齐 M01 媒体引用接口及 M02 采集实现、入口和配置，并接入后续预处理、编码与输出。
 此前 publisher 的 Windows Release 编译记录不作为本次修改的验证结果。
-2026-10-25 本次新增默认 Windows 桌面采集与可选摄像头；按项目要求未构建、未运行测试，
-也未做真实桌面采集。桌面尺寸、鼠标、停止行为及录制/推流表现仍待实际运行验收。
+2026-10-25 的变更新增默认 Windows 桌面采集与可选摄像头；当时按项目要求未构建、未运行测试，
+也未做真实桌面采集。当前 M14 的构建记录见 [多线程流水线](threading.md)，
+2026-10-26 已在真实桌面及系统音频流水线验证临时采集故障恢复、超时和停止；
+具体运行范围及尚未覆盖的场景见 [M14/M15 修复验证](m14-m15-fixes.md)。

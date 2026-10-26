@@ -5,12 +5,12 @@
 #include "player/demuxer/Demuxer.hpp"
 #include "player/renderer/SDLVideoRenderer.hpp"
 #include "player/sync/AVSynchronizer.hpp"
+#include "player/pipeline/VideoFrameQueue.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <deque>
 #include <exception>
 #include <mutex>
 #include <optional>
@@ -41,137 +41,30 @@ private:
     Handler terminate_;
 };
 
-// 视频交接保留在 player/pipeline；完整通用队列属于 M14。
-// 原始帧可以直接丢弃，不破坏解码器内部的 H.264 参考帧链。
-class VideoFrameQueue {
-public:
-    struct Snapshot {
-        decoder::VideoDecodeStats decode;
-        std::uint64_t consumedPackets = 0;
-        std::uint64_t dropped = 0;
-        std::size_t queued = 0;
-        std::size_t bytes = 0;
-        bool finished = false;
-    };
-    void reset(std::uint64_t serial) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        discardAll();
-        serial_ = serial;
-    }
-    void push(decoder::DecodedVideoFrame frame) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stopped_ || frame.serial != serial_) { ++state_.dropped; return; }
-        const auto bytes = frameBytes(*frame.frame);
-        if (bytes > maxBytes) { ++state_.dropped; return; }
-        const auto now = Clock::now();
-        expire(now);
-        while (!queue_.empty() && (queue_.size() >= maxFrames ||
-               bytes > maxBytes - state_.bytes || spanExceeded(frame.timestampUs))) dropFront();
-        queue_.push_back(Item{std::move(frame), now, bytes});
-        state_.bytes += bytes;
-    }
-    std::optional<decoder::DecodedVideoFrame> pop() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        expire(Clock::now());
-        if (queue_.empty()) return std::nullopt;
-        auto result = std::move(queue_.front().frame);
-        state_.bytes -= queue_.front().bytes;
-        queue_.pop_front();
-        return result;
-    }
-    void consumed() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++state_.consumedPackets;
-    }
-    void noteDropped() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++state_.dropped;
-    }
-    void update(const decoder::VideoDecodeStats& stats) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        state_.decode = stats;
-    }
-    void finish(std::exception_ptr failure = {}) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        failure_ = failure;
-        state_.finished = true;
-    }
-    void stop() noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopped_ = true;
-        discardAll();
-    }
-    Snapshot snapshot() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (failure_) std::rethrow_exception(failure_);
-        auto result = state_;
-        result.queued = queue_.size();
-        return result;
-    }
-private:
-    static constexpr std::size_t maxFrames = 8;
-    static constexpr std::size_t maxBytes = 64 * 1024 * 1024;
-    static constexpr auto maxAge = std::chrono::milliseconds(500);
-    struct Item {
-        decoder::DecodedVideoFrame frame;
-        Clock::time_point arrived;
-        std::size_t bytes;
-    };
-    static std::size_t frameBytes(const AVFrame& frame) {
-        // 实际引用缓冲大小包含 stride 对齐；共享缓冲重复计数是保守上界。
-        std::size_t result = 0;
-        const auto add = [&](const AVBufferRef* buffer) {
-            if (buffer) result += std::min(buffer->size, maxBytes + 1);
-        };
-        for (const auto* buffer : frame.buf) add(buffer);
-        for (int i = 0; i < frame.nb_extended_buf; ++i) add(frame.extended_buf[i]);
-        return result;
-    }
-    bool spanExceeded(std::int64_t timestamp) const {
-        const auto first = queue_.front().frame.timestampUs;
-        return timestamp != AV_NOPTS_VALUE && first != AV_NOPTS_VALUE &&
-            static_cast<long double>(timestamp) - first > 500000.0L;
-    }
-    void dropFront() {
-        state_.bytes -= queue_.front().bytes;
-        queue_.pop_front();
-        ++state_.dropped;
-    }
-    void discardAll() {
-        state_.dropped += queue_.size();
-        queue_.clear();
-        state_.bytes = 0;
-    }
-    void expire(Clock::time_point now) {
-        while (!queue_.empty() && now - queue_.front().arrived >= maxAge) dropFront();
-    }
-    mutable std::mutex mutex_;
-    std::deque<Item> queue_;
-    Snapshot state_;
-    std::exception_ptr failure_;
-    std::uint64_t serial_ = 0;
-    bool stopped_ = false;
-};
-
 // 解码上下文只属于此工作线程。析构覆盖正常停止、网络错误和 SDL 异常路径。
 class VideoWorker {
 public:
     VideoWorker(demuxer::Demuxer& input, VideoFrameQueue& frames, logging::Logger& logger)
         : input_(input), frames_(frames), logger_(logger), thread_([this] { run(); }) {}
     ~VideoWorker() { stop(); }
-    void stop() noexcept {
+    void requestStop() noexcept {
         stopping_.store(true, std::memory_order_relaxed);
         input_.requestStop();
         frames_.stop();
+    }
+    void join() noexcept {
         if (thread_.joinable()) thread_.join();
     }
+    void stop() noexcept { requestStop(); join(); }
 private:
     void publish(std::vector<decoder::DecodedVideoFrame> output) {
         for (auto& frame : output) {
             // 网络线程可能已经换代，Reset 还没被本线程取到。
             if (stopping_.load(std::memory_order_relaxed)) return;
-            if (frame.serial == input_.stats().buffer.serial) frames_.push(std::move(frame));
-            else frames_.noteDropped();
+            const auto serial = frame.serial;
+            frames_.push(std::move(frame), [&] {
+                return !stopping_.load(std::memory_order_relaxed) && serial == input_.stats().buffer.serial;
+            });
         }
     }
     void run() noexcept {
@@ -243,16 +136,25 @@ void report(logging::Logger& logger, const demuxer::DemuxStats& network,
         " render_us/frame=" + std::to_string(display.renderedFrames ?
             display.renderTimeUs / display.renderedFrames : 0) +
         " uploads=" + std::to_string(display.textureUploads) +
-        " frame_queue=" + std::to_string(frames.queued) + " frame_bytes=" + std::to_string(frames.bytes) +
+        " frame_queue=" + std::to_string(frames.queued) +
+        " frame_queue_peak=" + std::to_string(frames.highWaterMark) +
+        " frame_bytes=" + std::to_string(frames.bytes) +
+        " frame_peak_bytes=" + std::to_string(frames.peakBytes) +
         " frame_drops=" + std::to_string(frames.dropped + display.droppedFrames + frames.decode.droppedFrames) +
         " decode_errors=" + std::to_string(frames.decode.decodeErrors) +
         " decoder_packet_drops=" + std::to_string(frames.decode.droppedPackets) +
         " packet_drops=" + std::to_string(network.buffer.droppedPackets) +
+        " packet_queue_video=" + std::to_string(network.buffer.videoPackets) +
+        " packet_queue_audio=" + std::to_string(network.buffer.audioPackets) +
+        " packet_queue_video_peak=" + std::to_string(network.buffer.videoHighWaterMark) +
+        " packet_queue_audio_peak=" + std::to_string(network.buffer.audioHighWaterMark) +
+        " packet_peak_bytes=" + std::to_string(network.buffer.peakBytes) +
         " audio_decoded=" + std::to_string(audioDecode.decode.decodedFrames) +
         " audio_samples=" + std::to_string(audioDecode.decode.outputSamples) +
         " audio_errors=" + std::to_string(audioDecode.decode.decodeErrors) +
         " audio_submitted=" + std::to_string(audioOutput.submittedFrames) +
         " audio_queued=" + std::to_string(audioOutput.queuedFrames) +
+        " audio_queue_peak=" + std::to_string(audioOutput.highWaterMarkFrames) +
         " audio_underruns=" + std::to_string(audioOutput.underruns) +
         " audio_dropped=" + std::to_string(audioOutput.droppedFrames) +
         " audio_paused=" + std::to_string(audioOutput.paused) +
@@ -271,7 +173,18 @@ void report(logging::Logger& logger, const demuxer::DemuxStats& network,
         " audio_buffered_ms=" + std::to_string(audioClock.bufferedUs / 1000.0) +
         " audio_device_latency_ms=" + std::to_string(audioClock.deviceLatencyUs / 1000.0) +
         " buffer_ms=" + std::to_string(network.buffer.bufferedMs) +
-        " retries=" + std::to_string(network.reconnects));
+        " retries=" + std::to_string(network.reconnects) +
+        " network_state=" + lsl::network::stateName(network.network.state) +
+        " connection_seconds=" + std::to_string(network.network.connectionSeconds) +
+        " connected_seconds=" + std::to_string(network.network.connectedSeconds) +
+        " network_uptime_seconds=" + std::to_string(network.network.uptimeSeconds) +
+        " input_payload_bitrate_bps=" + std::to_string(network.network.averageBitrate) +
+        " input_idle_seconds=" + std::to_string(network.network.idleSeconds) +
+        " network_errors=" + std::to_string(network.network.networkErrors) +
+        " retry_delay_ms=" + std::to_string(network.network.retryDelayMs) +
+        " consecutive_failures=" + std::to_string(network.network.consecutiveFailures) +
+        " last_network_error_code=" + std::to_string(network.network.lastErrorCode) +
+        " last_network_error=" + network.network.lastErrorMessage);
 }
 } // namespace
 
@@ -282,7 +195,7 @@ int runPlayer(const config::PlayerConfig& config, const config::CommandLineOptio
                                   config.video.vsync, config.video.fullscreen}, logger);
     renderer::IVideoRenderer& display = sdl;
     demuxer::Demuxer input(config, logger);
-    VideoFrameQueue frames;
+    VideoFrameQueue frames(config);
     std::unique_ptr<audio::SDLAudioSink> sdlAudio;
     if (config.audioPlayback.enabled) {
         audio::AudioSinkOptions options;
@@ -300,9 +213,12 @@ int runPlayer(const config::PlayerConfig& config, const config::CommandLineOptio
     VideoWorker worker(input, frames, logger);
     AudioPlayback audioWorker(config, input, audioOutput, logger);
     logger.log(logging::Level::Info, "player",
-        "M09-M13 playback; audio master with estimated device latency; F/Alt+Enter/double click fullscreen, Space A/V pause, M mute, Up/Down volume, Escape/close/Ctrl+C stop.");
+        "M09-M15 playback; bounded handoff, network state/recovery and audio master with estimated device latency; F/Alt+Enter/double click fullscreen, Space A/V pause, M mute, Up/Down volume, Escape/close/Ctrl+C stop.");
     std::optional<decoder::DecodedVideoFrame> pending;
-    sync::AVSynchronizer schedule(config.sync);
+    auto syncOptions = config.sync;
+    // 最大视频年龄按播放时钟衡量，而不是按提前解码的时间衡量。
+    syncOptions.dropThresholdMs = std::min(syncOptions.dropThresholdMs, config.pipeline.maxVideoAgeMs);
+    sync::AVSynchronizer schedule(syncOptions);
     auto lastReport = Clock::now();
     auto previousFrames = frames.snapshot();
     auto previousDisplay = display.stats();
@@ -395,8 +311,11 @@ int runPlayer(const config::PlayerConfig& config, const config::CommandLineOptio
         // 短暂让出 CPU，保持窗口事件、停止和网络换代检查及时。
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    audioWorker.stop();
-    worker.stop();
+    input.requestStop();
+    audioWorker.requestStop();
+    worker.requestStop();
+    audioWorker.join();
+    worker.join();
     input.join();
     if (audioOutput) audioOutput->stop();
     if (!stoppedByUser) {

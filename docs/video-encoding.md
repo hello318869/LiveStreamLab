@@ -62,14 +62,17 @@ JSON 中的 `output.video_file` 设为 `""`，或使用 `--set output.video_file
 ## 接口、所有权与停止顺序
 
 ```text
-MediaInput → CapturedFrame → VideoPreprocessor → VideoEncoder
-  → 独占 PacketPtr → VideoFileWriter → output/video.mp4
+采集线程：MediaInput → CapturedFrame → 原始视频有界队列
+处理线程：VideoPreprocessor → VideoEncoder → 独占参数/PacketPtr → 输出事件有界队列
+输出线程：VideoFileWriter → output/video.mp4（按配置另交给 RTMP 网络队列）
 ```
 
 `lsl_video_encoder` 仅包含 `encoder/VideoEncoder`；`muxer/VideoFileWriter` 属于 `lsl_muxer`。
 两者均链接 `lsl_common`，由 `pipeline/PublisherPipeline` 组合调用。
-编码器、写出器和视频预处理器都在视频输入所属线程内调用。
-M14 的完整处理队列流水线尚未实现；本地写出直接交接独占包，M07 使用独立的复用队列，均不共享可变 AVPacket。
+M14 中视频预处理器与编码器由视频处理线程独占，本地写出器由唯一输出线程独占，
+采集、处理和输出之间通过有界队列移交媒体对象。实时输入优先在编码前丢旧原始帧；
+输出队列满时等待容量，不任意删除本地录制的编码包。两条输出路径使用独立包引用，
+不共享可变 AVPacket。容量和线程生命周期见 [多线程流水线](threading.md)。
 
 - `encode(const AVFrame&)` 返回零个、一个或多个编码包。send 返回 EAGAIN 时先 receive，
   然后重送尚未被接收的同一帧；不能把 EAGAIN 当作丢帧。
@@ -79,7 +82,8 @@ M14 的完整处理队列流水线尚未实现；本地写出直接交接独占�
   首个预处理帧的色彩描述用于初始化编码上下文与输出流。
 - 写出器复制流参数，写头后按实际流时间基调用 `av_packet_rescale_ts()`，
   消费传入的 `PacketPtr`，保留关键帧标志。
-- EOF / Ctrl+C：停止输入 → flush 预处理 → flush 编码器至 EOF → 写完 MP4 尾部 → 关闭 I/O。
+- EOF / Ctrl+C：停止输入、关闭输入和原始帧队列 → 排空已入队视频 →
+  flush 预处理及编码器至 EOF → 输出线程排空事件、写完 MP4 尾部并关闭 I/O。
   `flush()` 与 `finish()` 均可重复调用；结束后不能继续提交数据。
 - 编码或写文件失败会经现有异常边界报告；析构只尽力收尾并释放资源，失败文件不视为完整输出。
   强制结束进程可能来不及写 MP4 尾部，应使用正常停止。
@@ -87,7 +91,7 @@ M14 的完整处理队列流水线尚未实现；本地写出直接交接独占�
 统计日志新增编码输入帧数、编码包数、编码字节数和关键帧包数，
 均为本地编码统计，不代表网络发送量。
 
-## 本次完成边界（2026-10-24）
+## M05 阶段完成边界（2026-10-24）
 
 M05 实现已接入 CMake、主播端、配置与命令行。当时 Windows Release 完整构建通过，
 包括当时的 `lsl_video_encode`、`publisher`、SDL3 与 `player` 的编译、链接。

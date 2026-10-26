@@ -2,19 +2,26 @@
 
 #include "common/config/Config.hpp"
 #include "common/media/FFmpegResources.hpp"
+#include "common/utils/NetworkStatus.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
 namespace lsl::rtmp {
 
 struct PublisherStats {
+    network::ConnectionStats network;
     // 成功交给 av_interleaved_write_frame 的编码 payload，不含 FLV/RTMP/TCP 开销。
     std::uint64_t sentBytes = 0;
     std::uint64_t sentPackets = 0;
     std::uint64_t droppedPackets = 0;
     std::uint64_t networkErrors = 0;
     std::uint64_t reconnects = 0;
+    std::size_t videoQueued = 0;
+    std::size_t audioQueued = 0;
+    std::size_t queuedPackets = 0;
+    std::size_t queueHighWaterMark = 0; // 会话期间两轨合计的最大排队包数。
     double durationSeconds = 0;
     double averageBitrate = 0;
 };

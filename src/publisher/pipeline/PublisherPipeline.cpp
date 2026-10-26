@@ -1,5 +1,6 @@
 #include "publisher/pipeline/PublisherPipeline.hpp"
 #include "publisher/capture/MediaInput.hpp"
+#include "common/queue/BoundedBlockingQueue.hpp"
 #include "publisher/encoder/AudioEncoder.hpp"
 #include "publisher/muxer/AudioFileWriter.hpp"
 #include "publisher/encoder/VideoEncoder.hpp"
@@ -196,293 +197,436 @@ int runPublisher(const config::PublisherConfig& config,
     }
 
     SignalScope signals;
+    using Clock = std::chrono::steady_clock;
+    struct RawFrame {
+        capture::CapturedFrame captured;
+        Clock::time_point queuedAt;
+    };
+    struct OutputEvent {
+        enum class Type { Start, Parameters, Packet, End };
+        Type type = Type::Packet;
+        capture::Kind kind = capture::Kind::Video;
+        bool video = false;
+        bool audio = false;
+        media::CodecParametersPtr parameters;
+        AVRational timeBase{0, 1};
+        media::PacketPtr packet;
+    };
+    queue::BoundedBlockingQueue<RawFrame> videoFrames(config.pipeline.videoQueueCapacity);
+    queue::BoundedBlockingQueue<RawFrame> audioFrames(config.pipeline.audioQueueCapacity);
+    queue::BoundedBlockingQueue<OutputEvent> output(config.pipeline.packetQueueCapacity);
+    const bool realtime = config.capture.source != "file" || config.capture.realtime;
+    const auto originUs = config.capture.source == "file" ? std::int64_t{0} : av_gettime_relative();
+    std::atomic<std::uint64_t> droppedVideo{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<unsigned> encodersLeft{2};
+    std::atomic<bool> cancelling{false};
+    std::atomic<bool> failed{false};
+    std::mutex stateMutex;
+    std::condition_variable changed;
+    std::exception_ptr failure;
     std::vector<std::unique_ptr<capture::MediaInput>> inputs;
     std::vector<capture::Kind> kinds;
+    std::vector<std::thread> workers;
     if (config.capture.source == "file") {
         inputs.push_back(std::make_unique<capture::MediaInput>());
-        kinds.push_back(capture::Kind::Video); // 文件线程同时处理所启用的音视频轨。
+        kinds.push_back(capture::Kind::Video); // 一个文件只由一个线程解复用，随后分流两轨。
     } else {
         for (const auto kind : {capture::Kind::Video, capture::Kind::Audio}) {
-            if ((kind == capture::Kind::Video && !config.capture.video) || (kind == capture::Kind::Audio && !config.capture.audio)) continue;
+            if (kind == capture::Kind::Video ? !config.capture.video : !config.capture.audio) continue;
             inputs.push_back(std::make_unique<capture::MediaInput>());
             kinds.push_back(kind);
         }
     }
-    std::mutex stateMutex;
-    std::condition_variable changed;
-    std::atomic<std::size_t> done{0};
-    std::exception_ptr failure;
-    std::atomic<bool> failed{false};
-    std::atomic<bool> cancelling{false};
-    std::vector<std::thread> workers;
-    // 两个设备使用同一个时钟原点，保留启动偏移；文件的 M02 时间戳已经共用零点。
-    const std::int64_t originUs = config.capture.source == "file" ? 0 : av_gettime_relative();
     std::unique_ptr<rtmp::RtmpPublisher> streaming;
-    if (config.streaming.enabled) {
-        streaming = std::make_unique<rtmp::RtmpPublisher>(config, logger);
-        if (config.capture.source != "file") streaming->start(config.capture.video, config.capture.audio);
-    }
-    const auto reportStreaming = [&](const std::string& phase) {
-        const auto stats = streaming->stats();
-        logger.log(logging::Level::Info, "network", phase + ": sent_packets=" + std::to_string(stats.sentPackets)
-            + " sent_payload_bytes=" + std::to_string(stats.sentBytes)
-            + " average_bitrate_bps=" + std::to_string(stats.averageBitrate)
-            + " duration_seconds=" + std::to_string(stats.durationSeconds)
-            + " dropped_packets=" + std::to_string(stats.droppedPackets)
-            + " network_errors=" + std::to_string(stats.networkErrors)
-            + " reconnects=" + std::to_string(stats.reconnects));
-    };
-    const auto stopAll = [&] {
-        cancelling = true;
+    if (config.streaming.enabled) streaming = std::make_unique<rtmp::RtmpPublisher>(config, logger);
+
+    // 正常停止保留已入队数据，错误停止丢弃缓存；两条路径都唤醒所有队列等待者。
+    const auto stopAll = [&](bool abort) {
+        cancelling.store(true);
         for (auto& input : inputs) input->requestStop();
-        // 网络中断不等待编码排空：直播尾包允许丢弃，本地录制仍走正常写尾路径。
+        if (abort) {
+            videoFrames.abort();
+            audioFrames.abort();
+            output.abort();
+        } else {
+            videoFrames.close();
+            audioFrames.close();
+        }
+        // 网络尾包允许舍弃，独立本地文件仍由输出线程写完尾部。
         if (streaming) streaming->requestStop();
+        changed.notify_all();
     };
-    const auto joinAll = [&] { for (auto& worker : workers) if (worker.joinable()) worker.join(); };
-    logger.log(logging::Level::Info, "capture", "M02-M07 capture, preprocessing and H.264/AAC encoding started. Ctrl+C stops processing.");
+    const auto recordFailure = [&](std::exception_ptr problem) {
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            if (!failure) failure = std::move(problem);
+        }
+        failed.store(true);
+        stopAll(true);
+    };
+    const auto joinAll = [&] {
+        for (auto& worker : workers) if (worker.joinable()) worker.join();
+    };
+    // 工作线程统一异常边界；异常产生处立即中断其他阶段，避免主线程 join 时才发现阻塞。
+    const auto launch = [&](auto work) {
+        workers.emplace_back([&, work = std::move(work)]() mutable {
+            try { work(); }
+            catch (...) { recordFailure(std::current_exception()); }
+            ++done;
+            changed.notify_all();
+        });
+    };
+    const auto reportQueues = [&] {
+        const auto video = videoFrames.stats();
+        const auto audio = audioFrames.stats();
+        const auto packets = output.stats();
+        logger.log(logging::Level::Info, "pipeline", "queues video=" + std::to_string(video.size)
+            + "/" + std::to_string(video.capacity) + " video_high=" + std::to_string(video.highWaterMark)
+            + " audio=" + std::to_string(audio.size) + "/" + std::to_string(audio.capacity)
+            + " audio_high=" + std::to_string(audio.highWaterMark)
+            + " output=" + std::to_string(packets.size) + "/" + std::to_string(packets.capacity)
+            + " output_high=" + std::to_string(packets.highWaterMark)
+            + " aborted_raw_video=" + std::to_string(video.discarded)
+            + " aborted_raw_audio=" + std::to_string(audio.discarded)
+            + " aborted_output_events=" + std::to_string(packets.discarded)
+            + " dropped_raw_video=" + std::to_string(droppedVideo.load()));
+        if (streaming) {
+            const auto stats = streaming->stats();
+            logger.log(logging::Level::Info, "network", "RTMP sent_packets=" + std::to_string(stats.sentPackets)
+                + " sent_payload_bytes=" + std::to_string(stats.sentBytes)
+                + " average_bitrate_bps=" + std::to_string(stats.averageBitrate)
+                + " duration_seconds=" + std::to_string(stats.durationSeconds)
+                + " dropped_packets=" + std::to_string(stats.droppedPackets)
+                + " queued_video=" + std::to_string(stats.videoQueued)
+                + " queued_audio=" + std::to_string(stats.audioQueued)
+                + " queued_packets=" + std::to_string(stats.queuedPackets)
+                + " queue_high=" + std::to_string(stats.queueHighWaterMark)
+                + " network_errors=" + std::to_string(stats.networkErrors)
+                + " reconnects=" + std::to_string(stats.reconnects)
+                + " state=" + network::stateName(stats.network.state)
+                + " connections=" + std::to_string(stats.network.connections)
+                + " retry_attempts=" + std::to_string(stats.network.reconnectAttempts)
+                + " consecutive_failures=" + std::to_string(stats.network.consecutiveFailures)
+                + " retry_delay_ms=" + std::to_string(stats.network.retryDelayMs)
+                + " connection_seconds=" + std::to_string(stats.network.connectionSeconds)
+                + " connected_seconds=" + std::to_string(stats.network.connectedSeconds)
+                + " idle_seconds=" + std::to_string(stats.network.idleSeconds)
+                + " last_error_code=" + std::to_string(stats.network.lastErrorCode)
+                + " last_error=" + stats.network.lastErrorMessage);
+        }
+    };
+    const auto sendParameters = [&](capture::Kind kind, media::CodecParametersPtr parameters, AVRational timeBase) {
+        OutputEvent event;
+        event.type = OutputEvent::Type::Parameters;
+        event.kind = kind;
+        event.parameters = std::move(parameters);
+        event.timeBase = timeBase;
+        return output.push(std::move(event));
+    };
+    const auto sendPackets = [&](capture::Kind kind, std::vector<media::PacketPtr> packets) {
+        for (auto& packet : packets) {
+            OutputEvent event;
+            event.kind = kind;
+            event.packet = std::move(packet);
+            if (!output.push(std::move(event))) return false;
+        }
+        return true;
+    };
+    const auto finishTrack = [&](capture::Kind kind) {
+        OutputEvent event;
+        event.type = OutputEvent::Type::End;
+        event.kind = kind;
+        output.push(std::move(event));
+        // 最后一个编码线程关闭输出队列；消费者继续读取已排队的尾包和 End。
+        if (encodersLeft.fetch_sub(1) == 1) output.close();
+    };
+
+    logger.log(logging::Level::Info, "pipeline", "M14 bounded capture -> preprocessing/encoding -> mux/output pipeline started. Ctrl+C stops processing.");
     try {
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
-            workers.emplace_back([&, i] {
-                auto& input = *inputs[i];
-                std::uint64_t videoFrames = 0;
-                std::uint64_t audioFrames = 0;
-                std::uint64_t audioSamples = 0;
-                std::unique_ptr<preprocess::VideoPreprocessor> video;
-                std::unique_ptr<preprocess::AudioPreprocessor> audio;
-                // 每轨预处理、编码与本地写出留在所属输入线程；M07 独占网络复用线程。
-                // M14 再拆分完整流水线；交给网络的包结构由 PacketPtr 独占。
-                std::unique_ptr<encoder::VideoEncoder> encoder;
-                std::unique_ptr<muxer::VideoFileWriter> videoFile;
-                std::unique_ptr<encoder::AudioEncoder> audioEncoder;
-                std::unique_ptr<muxer::AudioFileWriter> audioFile;
-                AudioLevels inputAudioLevels;
-                AudioLevels outputAudioLevels;
-                bool reportedVideo = false;
-                bool reportedAudio = false;
-                auto lastReportUs = av_gettime_relative();
-                const auto counts = [&] {
-                    auto result = "video_frames=" + std::to_string(videoFrames) + " audio_frames=" + std::to_string(audioFrames)
-                        + " audio_samples=" + std::to_string(audioSamples);
-                    if (video) {
-                        const auto s = video->stats();
-                        result += " video_out=" + std::to_string(s.outputFrames)
-                            + " dropped=" + std::to_string(s.droppedFrames)
-                            + " duplicated=" + std::to_string(s.duplicatedFrames)
-                            + " skipped_timeline=" + std::to_string(s.skippedTimelineFrames)
-                            + " input_fps=" + std::to_string(s.inputFps)
-                            + " output_fps=" + std::to_string(s.outputFps);
-                    }
-                    if (audio) {
-                        const auto s = audio->stats();
-                        result += " audio_out=" + std::to_string(s.outputFrames)
-                            + " output_samples=" + std::to_string(s.outputSamples)
-                            + " silence_samples=" + std::to_string(s.silenceSamples)
-                            + " padded_samples=" + std::to_string(s.paddedSamples)
-                            + " discarded_input_samples=" + std::to_string(s.discardedSamples)
-                            + " discontinuities=" + std::to_string(s.discontinuities)
-                            + " clipped_audio_values=" + std::to_string(s.clippedValues)
-                            + " input_audio_rms_dbfs=" + AudioLevels::db(inputAudioLevels.rms())
-                            + " audio_rms_dbfs=" + AudioLevels::db(outputAudioLevels.rms())
-                            + " audio_peak_dbfs=" + AudioLevels::db(outputAudioLevels.peak);
-                    }
-                    if (encoder) {
-                        const auto s = encoder->stats();
-                        result += " encoded_frames=" + std::to_string(s.inputFrames)
-                            + " encoded_packets=" + std::to_string(s.outputPackets)
-                            + " encoded_bytes=" + std::to_string(s.outputBytes)
-                            + " key_packets=" + std::to_string(s.keyPackets);
-                    }
-                    if (audioEncoder) {
-                        const auto s = audioEncoder->stats();
-                        result += " encoded_audio_frames=" + std::to_string(s.inputFrames)
-                            + " encoded_audio_samples=" + std::to_string(s.inputSamples)
-                            + " aac_packets=" + std::to_string(s.outputPackets)
-                            + " aac_bytes=" + std::to_string(s.outputBytes);
-                    }
-                    return result;
-                };
-                const auto writePackets = [&](std::vector<media::PacketPtr> packets) {
-                    for (auto& packet : packets) {
-                        if (streaming) streaming->submitVideo(videoFile ? media::referencePacket(*packet) : std::move(packet));
-                        if (videoFile) videoFile->write(std::move(packet));
-                    }
-                };
-                const auto writeAudioPackets = [&](std::vector<media::PacketPtr> packets) {
-                    for (auto& packet : packets) {
-                        if (streaming) streaming->submitAudio(audioFile ? media::referencePacket(*packet) : std::move(packet));
-                        if (audioFile) audioFile->write(std::move(packet));
-                    }
-                };
-                const auto consume = [&](capture::Kind kind, std::vector<media::FramePtr> frames) {
-                    auto& reported = kind == capture::Kind::Video ? reportedVideo : reportedAudio;
-                    for (const auto& frame : frames) {
-                        if (!reported) {
-                            logger.log(logging::Level::Info, "preprocess", std::string(capture::kindName(kind))
-                                + " output: " + describe(*frame, kind) + " pts=" + std::to_string(frame->pts)
-                                + " time_base=" + std::to_string(frame->time_base.num) + "/"
-                                + std::to_string(frame->time_base.den)
-                                + " samples=" + std::to_string(frame->nb_samples));
-                            reported = true;
+        // 本地两个封装上下文只在此线程创建、写入、写尾与销毁。
+        // RTMP 则由已有的唯一发送线程执行 FLV 和网络 I/O。
+        launch([&] {
+            std::unique_ptr<muxer::VideoFileWriter> videoFile;
+            std::unique_ptr<muxer::AudioFileWriter> audioFile;
+            OutputEvent event;
+            while (output.pop(event)) {
+                if (failed.load()) break;
+                switch (event.type) {
+                case OutputEvent::Type::Start:
+                    if (streaming) streaming->start(event.video, event.audio);
+                    break;
+                case OutputEvent::Type::Parameters:
+                    if (event.kind == capture::Kind::Video) {
+                        if (streaming) streaming->setVideoParameters(*event.parameters, event.timeBase);
+                        if (!config.videoFile.empty()) {
+                            videoFile = std::make_unique<muxer::VideoFileWriter>(config.videoFile, *event.parameters, event.timeBase);
+                            logger.log(logging::Level::Info, "video_encode", "Saving H.264 video to " + config.videoFile);
                         }
-                        if (kind == capture::Kind::Video) {
-                            // 首个视频帧到来时才建文件，音频文件输入不会留下空 MP4。
-                            if (!encoder) {
-                                encoder = std::make_unique<encoder::VideoEncoder>(encoderOptions(config, *frame));
-                                if (streaming) {
-                                    const auto parameters = encoder->parameters();
-                                    streaming->setVideoParameters(*parameters, encoder->timeBase());
-                                }
-                                if (!config.videoFile.empty()) {
-                                    const auto parameters = encoder->parameters();
-                                    videoFile = std::make_unique<muxer::VideoFileWriter>(
-                                        config.videoFile, *parameters, encoder->timeBase());
-                                    logger.log(logging::Level::Info, "video_encode", "Saving H.264 video to " + config.videoFile);
-                                }
-                                logger.log(logging::Level::Info, "video_encode", "encoder=" + encoder->codecName()
-                                    + " bitrate=" + std::to_string(config.video.bitrate)
-                                    + " gop=" + std::to_string(config.videoEncoder.gopSize));
-                            }
-                            writePackets(encoder->encode(*frame));
-                        } else {
-                            outputAudioLevels.add(*frame);
-                            // 音频输入先完成编码参数协商；只有实际 PCM 输出才创建文件。
-                            if (!audioFile && !config.audioFile.empty()) {
-                                const auto parameters = audioEncoder->parameters();
-                                audioFile = std::make_unique<muxer::AudioFileWriter>(
-                                    config.audioFile, *parameters, audioEncoder->timeBase());
-                                logger.log(logging::Level::Info, "audio_encode", "Saving AAC audio to " + config.audioFile);
-                            }
-                            writeAudioPackets(audioEncoder->encode(*frame));
+                    } else {
+                        if (streaming) streaming->setAudioParameters(*event.parameters, event.timeBase);
+                        if (!config.audioFile.empty()) {
+                            audioFile = std::make_unique<muxer::AudioFileWriter>(config.audioFile, *event.parameters, event.timeBase);
+                            logger.log(logging::Level::Info, "audio_encode", "Saving AAC audio to " + config.audioFile);
                         }
                     }
-                };
-                try {
-                    // dshow 的 COM 初始化与释放、设备读包都留在同一工作线程。
-                    if (config.capture.source == "file") input.openFile(config);
-                    else input.openDevice(kinds[i], config);
-                    if (streaming && config.capture.source == "file") {
-                        streaming->start(input.hasTrack(capture::Kind::Video), input.hasTrack(capture::Kind::Audio));
+                    break;
+                case OutputEvent::Type::Packet:
+                    if (event.kind == capture::Kind::Video) {
+                        if (streaming) streaming->submitVideo(videoFile ? media::referencePacket(*event.packet) : std::move(event.packet));
+                        if (videoFile) videoFile->write(std::move(event.packet));
+                    } else {
+                        if (streaming) streaming->submitAudio(audioFile ? media::referencePacket(*event.packet) : std::move(event.packet));
+                        if (audioFile) audioFile->write(std::move(event.packet));
                     }
-                    logger.log(logging::Level::Info, "capture", "Opened source: " + input.sourceDescription());
-                    if (config.capture.video && (config.capture.source == "file" || kinds[i] == capture::Kind::Video)) {
-                        video = std::make_unique<preprocess::VideoPreprocessor>(videoOptions(config), originUs);
-                    }
-                    for (;;) {
-                        std::optional<capture::CapturedFrame> captured;
-                        try {
-                            captured = input.readFrame();
-                        } catch (const error::FFmpegError& e) {
-                            // 主动停止读包也要进入下方编码刷新，保全本地 MP4 / M4A 尾部。
-                            if (cancelling.load() && e.module == "capture" && e.code == AVERROR_EXIT) break;
-                            throw;
-                        }
-                        if (!captured) break;
-                        auto& count = captured->kind == capture::Kind::Video ? videoFrames : audioFrames;
-                        if (count++ == 0) logger.log(logging::Level::Info, "capture",
-                            std::string(capture::kindName(captured->kind)) + " input: " + describe(*captured->frame, captured->kind));
-                        if (captured->kind == capture::Kind::Audio) audioSamples += static_cast<std::uint64_t>(captured->frame->nb_samples);
-                        if (captured->kind == capture::Kind::Video) {
-                            consume(capture::Kind::Video, video->process(*captured->frame, captured->timestampUs));
-                        } else {
-                            inputAudioLevels.add(*captured->frame);
-                            if (!audioEncoder) {
-                                audioEncoder = std::make_unique<encoder::AudioEncoder>(audioEncoderOptions(config));
-                                if (streaming) {
-                                    const auto parameters = audioEncoder->parameters();
-                                    streaming->setAudioParameters(*parameters, audioEncoder->timeBase());
-                                }
-                                audio = std::make_unique<preprocess::AudioPreprocessor>(
-                                    audioOptions(config, *audioEncoder), originUs);
-                                const auto* format = av_get_sample_fmt_name(audioEncoder->sampleFormat());
-                                logger.log(logging::Level::Info, "audio_encode", "encoder=" + audioEncoder->codecName()
-                                    + " sample_rate=" + std::to_string(audioEncoder->sampleRate())
-                                    + " channels=" + std::to_string(audioEncoder->channels())
-                                    + " sample_format=" + (format ? format : "unknown")
-                                    + " frame_size=" + std::to_string(audioEncoder->frameSize())
-                                    + " bitrate=" + std::to_string(config.audio.bitrate)
-                                    + " gain_db=" + std::to_string(config.preprocess.audio.gainDb));
-                                if (config.preprocess.audio.sampleFormat != (format ? format : "unknown") ||
-                                    config.preprocess.audio.frameSize != audioEncoder->frameSize()) {
-                                    logger.log(logging::Level::Info, "audio_encode",
-                                        "PCM sample format and frame size follow the opened AAC encoder, overriding preprocessing preferences.");
-                                }
-                            }
-                            consume(capture::Kind::Audio, audio->process(*captured->frame, captured->timestampUs));
-                        }
-                        const auto now = av_gettime_relative();
-                        if (now - lastReportUs >= 1000000) {
-                            logger.log(logging::Level::Info, "capture", counts() + " timestamp_us=" + std::to_string(captured->timestampUs));
-                            lastReportUs = now;
-                        }
-                    }
-                    // EOF 或正常停止时，排空重采样延迟与 FIFO；错误退出时直接 RAII 清理。
-                    if (!failed.load()) {
-                        if (video) consume(capture::Kind::Video, video->flush());
-                        if (audio) consume(capture::Kind::Audio, audio->flush());
-                        // 先排空编码器延迟包，再写 MP4 尾部；Ctrl+C 与文件 EOF 路径一致。
-                        if (encoder) writePackets(encoder->flush());
-                        if (audioEncoder) writeAudioPackets(audioEncoder->flush());
+                    break;
+                case OutputEvent::Type::End:
+                    if (event.kind == capture::Kind::Video) {
                         if (videoFile) {
                             videoFile->finish();
                             logger.log(logging::Level::Info, "video_encode", "Video file completed: " + config.videoFile);
                         }
+                        if (streaming) streaming->finishVideo();
+                    } else {
                         if (audioFile) {
                             audioFile->finish();
                             logger.log(logging::Level::Info, "audio_encode", "Audio file completed: " + config.audioFile);
                         }
-                        if (outputAudioLevels.values >= static_cast<std::uint64_t>(config.audio.sampleRate) * config.audio.channels
-                            && outputAudioLevels.rms() < std::pow(10.0, -45.0 / 20.0)) {
-                            logger.log(logging::Level::Warn, "capture",
-                                "Audio signal is very quiet (rms_dbfs=" + AudioLevels::db(outputAudioLevels.rms())
-                                + "). Check --audio-source, --audio-device, microphone input level, or --audio-gain-db.");
+                        if (streaming) streaming->finishAudio();
+                    }
+                    break;
+                }
+                // 尽早释放上一个事件的编码参数/媒体包，避免空队列等待时继续持有尾包。
+                event = OutputEvent{};
+            }
+            if (!failed.load() && streaming) streaming->finish();
+        });
+        launch([&] {
+            std::unique_ptr<preprocess::VideoPreprocessor> video;
+            std::unique_ptr<encoder::VideoEncoder> encoder;
+            bool reported = false;
+            std::uint64_t inputFrames = 0;
+            const auto consume = [&](std::vector<media::FramePtr> frames) {
+                for (const auto& frame : frames) {
+                    if (failed.load()) return;
+                    if (!reported) {
+                        logger.log(logging::Level::Info, "preprocess", "video output: " + describe(*frame, capture::Kind::Video)
+                            + " pts=" + std::to_string(frame->pts) + " time_base="
+                            + std::to_string(frame->time_base.num) + "/" + std::to_string(frame->time_base.den));
+                        reported = true;
+                    }
+                    if (!encoder) {
+                        encoder = std::make_unique<encoder::VideoEncoder>(encoderOptions(config, *frame));
+                        if (!sendParameters(capture::Kind::Video, encoder->parameters(), encoder->timeBase())) return;
+                        logger.log(logging::Level::Info, "video_encode", "encoder=" + encoder->codecName()
+                            + " bitrate=" + std::to_string(config.video.bitrate)
+                            + " gop=" + std::to_string(config.videoEncoder.gopSize));
+                    }
+                    if (!sendPackets(capture::Kind::Video, encoder->encode(*frame))) return;
+                }
+            };
+            RawFrame raw;
+            while (videoFrames.pop(raw)) {
+                if (failed.load()) break;
+                // 仅原始视频可以安全丢旧帧；文件非实时转换始终背压并保留全部输入。
+                const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - raw.queuedAt).count();
+                if (realtime && age > config.pipeline.maxVideoAgeMs && videoFrames.stats().size > 0) {
+                    ++droppedVideo;
+                    continue;
+                }
+                if (!video) video = std::make_unique<preprocess::VideoPreprocessor>(videoOptions(config), originUs);
+                ++inputFrames;
+                consume(video->process(*raw.captured.frame, raw.captured.timestampUs));
+                raw = RawFrame{};
+            }
+            if (!failed.load()) {
+                if (video) consume(video->flush());
+                if (encoder) sendPackets(capture::Kind::Video, encoder->flush());
+                finishTrack(capture::Kind::Video);
+            }
+            std::string stats = "video processing ended: input_frames=" + std::to_string(inputFrames);
+            if (video) {
+                const auto s = video->stats();
+                stats += " video_out=" + std::to_string(s.outputFrames) + " dropped=" + std::to_string(s.droppedFrames)
+                    + " duplicated=" + std::to_string(s.duplicatedFrames)
+                    + " skipped_timeline=" + std::to_string(s.skippedTimelineFrames)
+                    + " input_fps=" + std::to_string(s.inputFps) + " output_fps=" + std::to_string(s.outputFps);
+            }
+            if (encoder) {
+                const auto s = encoder->stats();
+                stats += " encoded_frames=" + std::to_string(s.inputFrames) + " encoded_packets=" + std::to_string(s.outputPackets)
+                    + " encoded_bytes=" + std::to_string(s.outputBytes) + " key_packets=" + std::to_string(s.keyPackets);
+            }
+            logger.log(logging::Level::Info, "video_encode", stats);
+        });
+        launch([&] {
+            std::unique_ptr<preprocess::AudioPreprocessor> audio;
+            std::unique_ptr<encoder::AudioEncoder> encoder;
+            AudioLevels inputLevels;
+            AudioLevels outputLevels;
+            bool parametersSent = false;
+            std::uint64_t inputFrames = 0;
+            std::uint64_t inputSamples = 0;
+            const auto consume = [&](std::vector<media::FramePtr> frames) {
+                for (const auto& frame : frames) {
+                    if (failed.load()) return;
+                    outputLevels.add(*frame);
+                    if (!parametersSent) {
+                        logger.log(logging::Level::Info, "preprocess", "audio output: " + describe(*frame, capture::Kind::Audio)
+                            + " pts=" + std::to_string(frame->pts) + " samples=" + std::to_string(frame->nb_samples));
+                        if (!sendParameters(capture::Kind::Audio, encoder->parameters(), encoder->timeBase())) return;
+                        parametersSent = true;
+                    }
+                    if (!sendPackets(capture::Kind::Audio, encoder->encode(*frame))) return;
+                }
+            };
+            RawFrame raw;
+            while (audioFrames.pop(raw)) {
+                if (failed.load()) break;
+                ++inputFrames;
+                inputSamples += static_cast<std::uint64_t>(raw.captured.frame->nb_samples);
+                inputLevels.add(*raw.captured.frame);
+                if (!encoder) {
+                    encoder = std::make_unique<encoder::AudioEncoder>(audioEncoderOptions(config));
+                    audio = std::make_unique<preprocess::AudioPreprocessor>(audioOptions(config, *encoder), originUs);
+                    const auto* format = av_get_sample_fmt_name(encoder->sampleFormat());
+                    logger.log(logging::Level::Info, "audio_encode", "encoder=" + encoder->codecName()
+                        + " sample_rate=" + std::to_string(encoder->sampleRate())
+                        + " channels=" + std::to_string(encoder->channels())
+                        + " sample_format=" + (format ? format : "unknown")
+                        + " frame_size=" + std::to_string(encoder->frameSize())
+                        + " bitrate=" + std::to_string(config.audio.bitrate)
+                        + " gain_db=" + std::to_string(config.preprocess.audio.gainDb));
+                    if (config.preprocess.audio.sampleFormat != (format ? format : "unknown") ||
+                        config.preprocess.audio.frameSize != encoder->frameSize()) {
+                        logger.log(logging::Level::Info, "audio_encode", "PCM sample format and frame size follow the opened AAC encoder, overriding preprocessing preferences.");
+                    }
+                }
+                consume(audio->process(*raw.captured.frame, raw.captured.timestampUs));
+                raw = RawFrame{};
+            }
+            if (!failed.load()) {
+                if (audio) consume(audio->flush());
+                if (encoder) sendPackets(capture::Kind::Audio, encoder->flush());
+                finishTrack(capture::Kind::Audio);
+                if (outputLevels.values >= static_cast<std::uint64_t>(config.audio.sampleRate) * config.audio.channels
+                    && outputLevels.rms() < std::pow(10.0, -45.0 / 20.0)) {
+                    logger.log(logging::Level::Warn, "capture", "Audio signal is very quiet (rms_dbfs="
+                        + AudioLevels::db(outputLevels.rms())
+                        + "). Check --audio-source, --audio-device, microphone input level, or --audio-gain-db.");
+                }
+            }
+            std::string stats = "audio processing ended: input_frames=" + std::to_string(inputFrames)
+                + " input_samples=" + std::to_string(inputSamples)
+                + " input_audio_rms_dbfs=" + AudioLevels::db(inputLevels.rms())
+                + " audio_rms_dbfs=" + AudioLevels::db(outputLevels.rms())
+                + " audio_peak_dbfs=" + AudioLevels::db(outputLevels.peak);
+            if (audio) {
+                const auto s = audio->stats();
+                stats += " audio_out=" + std::to_string(s.outputFrames) + " output_samples=" + std::to_string(s.outputSamples)
+                    + " silence_samples=" + std::to_string(s.silenceSamples) + " padded_samples=" + std::to_string(s.paddedSamples)
+                    + " discarded_input_samples=" + std::to_string(s.discardedSamples)
+                    + " discontinuities=" + std::to_string(s.discontinuities)
+                    + " clipped_audio_values=" + std::to_string(s.clippedValues);
+            }
+            if (encoder) {
+                const auto s = encoder->stats();
+                stats += " encoded_audio_frames=" + std::to_string(s.inputFrames)
+                    + " encoded_audio_samples=" + std::to_string(s.inputSamples)
+                    + " aac_packets=" + std::to_string(s.outputPackets) + " aac_bytes=" + std::to_string(s.outputBytes);
+            }
+            logger.log(logging::Level::Info, "audio_encode", stats);
+        });
+        if (config.capture.source != "file") {
+            OutputEvent start;
+            start.type = OutputEvent::Type::Start;
+            start.video = config.capture.video;
+            start.audio = config.capture.audio;
+            output.push(std::move(start));
+            if (!config.capture.video) videoFrames.close();
+            if (!config.capture.audio) audioFrames.close();
+        }
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            launch([&, i] {
+                auto& input = *inputs[i];
+                std::uint64_t videoCount = 0;
+                std::uint64_t audioCount = 0;
+                const auto closeQueues = [&] {
+                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Video) videoFrames.close();
+                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Audio) audioFrames.close();
+                };
+                try {
+                    // dshow COM、解复用、输入解码和释放均留在所属采集线程。
+                    if (config.capture.source == "file") input.openFile(config);
+                    else input.openDevice(kinds[i], config);
+                    if (config.capture.source == "file") {
+                        OutputEvent start;
+                        start.type = OutputEvent::Type::Start;
+                        start.video = input.hasTrack(capture::Kind::Video);
+                        start.audio = input.hasTrack(capture::Kind::Audio);
+                        output.push(std::move(start));
+                        if (!input.hasTrack(capture::Kind::Video)) videoFrames.close();
+                        if (!input.hasTrack(capture::Kind::Audio)) audioFrames.close();
+                    }
+                    logger.log(logging::Level::Info, "capture", "Opened source: " + input.sourceDescription());
+                    while (!cancelling.load()) {
+                        auto captured = input.readFrame();
+                        if (!captured || cancelling.load()) break;
+                        auto& count = captured->kind == capture::Kind::Video ? videoCount : audioCount;
+                        if (count++ == 0) logger.log(logging::Level::Info, "capture",
+                            std::string(capture::kindName(captured->kind)) + " input: " + describe(*captured->frame, captured->kind));
+                        RawFrame raw{std::move(*captured), Clock::now()};
+                        if (raw.captured.kind == capture::Kind::Audio) {
+                            // 音频整帧背压；不从队列中任意剔除 PCM，避免持续破音。
+                            if (!audioFrames.push(std::move(raw))) break;
+                        } else if (!realtime) {
+                            if (!videoFrames.push(std::move(raw))) break;
+                        } else if (!videoFrames.tryPush(raw)) {
+                            if (cancelling.load()) break;
+                            RawFrame old;
+                            if (videoFrames.tryPop(old)) ++droppedVideo;
+                            // 单生产者；消费者只会释放容量。关闭与此处竞争时直接停止。
+                            if (!videoFrames.tryPush(raw)) break;
                         }
                     }
                 } catch (const error::FFmpegError& e) {
-                    // 只忽略采集打开/读包被主动中断；编码和写尾失败仍须报告。
                     if (!(cancelling.load() && e.module == "capture" && e.code == AVERROR_EXIT)) {
-                        std::lock_guard<std::mutex> lock(stateMutex);
-                        if (!failure) failure = std::current_exception();
-                        failed = true;
+                        input.close();
+                        throw;
                     }
                 } catch (...) {
-                    std::lock_guard<std::mutex> lock(stateMutex);
-                    if (!failure) failure = std::current_exception();
-                    failed = true;
-                }
-                if (streaming) {
-                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Video) streaming->finishVideo();
-                    if (config.capture.source == "file" || kinds[i] == capture::Kind::Audio) streaming->finishAudio();
+                    input.close();
+                    throw;
                 }
                 input.close();
-                logger.log(logging::Level::Info, "capture", "processing ended: " + counts());
-                ++done;
-                changed.notify_one();
+                closeQueues();
+                logger.log(logging::Level::Info, "capture", "capture ended: video_frames=" + std::to_string(videoCount)
+                    + " audio_frames=" + std::to_string(audioCount));
             });
         }
-        std::unique_lock<std::mutex> lock(stateMutex);
-        auto lastStreamingReportUs = av_gettime_relative();
-        while (done.load() != inputs.size()) {
+        const auto expected = workers.size();
+        auto nextReport = Clock::now() + std::chrono::seconds(1);
+        while (done.load() != expected) {
             if (streaming) streaming->checkError();
-            if (stopRequested || failed.load()) stopAll();
-            const auto now = av_gettime_relative();
-            if (streaming && now - lastStreamingReportUs >= 1000000) {
-                reportStreaming("RTMP stats");
-                lastStreamingReportUs = now;
+            if (failed.load()) stopAll(true);
+            else if (stopRequested.load() && !cancelling.load()) stopAll(false);
+            if (Clock::now() >= nextReport) {
+                reportQueues();
+                nextReport = Clock::now() + std::chrono::seconds(1);
             }
-            changed.wait_for(lock, std::chrono::milliseconds(50));
+            std::unique_lock<std::mutex> lock(stateMutex);
+            changed.wait_for(lock, std::chrono::milliseconds(50), [&] {
+                return done.load() == expected;
+            });
         }
-        lock.unlock();
         joinAll();
     } catch (...) {
-        stopAll();
+        stopAll(true);
         joinAll();
         throw;
     }
     if (failure) std::rethrow_exception(failure);
-    if (streaming) {
-        streaming->finish();
-        reportStreaming("RTMP ended");
-    }
+    reportQueues();
     return 0;
 }
 } // namespace lsl::pipeline

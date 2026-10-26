@@ -4,6 +4,12 @@
     "audio_source": "system",
     "video_source": "desktop"
   },
+  "pipeline": {
+    "video_queue_capacity": 8,
+    "audio_queue_capacity": 32,
+    "packet_queue_capacity": 256,
+    "max_video_age_ms": 200
+  },
   "output": {
     "url": "rtmp://127.0.0.1/live/livestream",
     "video_file": "",
@@ -13,6 +19,8 @@
     "write_timeout_ms": 5000,
     "reconnect_attempts": 5,
     "reconnect_delay_ms": 1000,
+    "reconnect_max_delay_ms": 30000,
+    "inactivity_timeout_ms": 15000,
     "queue_capacity": 256,
     "max_interleave_delta_ms": 500
   }

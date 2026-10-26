@@ -16,6 +16,8 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
         {"--url", app == AppKind::Publisher ? "output.url" : "input.url"},
         {"--audio-device", app == AppKind::Publisher ? "devices.audio" : "audio.device"},
         {"--sample-rate", "audio.sample_rate"}, {"--channels", "audio.channels"},
+        {"--video-queue-capacity", "pipeline.video_queue_capacity"},
+        {"--max-video-age-ms", "pipeline.max_video_age_ms"},
         {"--log-level", "logging.level"}, {"--log-file", "logging.file"},
         {"--log-console", "logging.console"}};
     if (app == AppKind::Publisher) {
@@ -28,7 +30,11 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
                        {"--write-timeout", "output.write_timeout_ms"},
                        {"--reconnect-attempts", "output.reconnect_attempts"},
                        {"--reconnect-delay", "output.reconnect_delay_ms"},
+                       {"--reconnect-max-delay", "output.reconnect_max_delay_ms"},
+                       {"--inactivity-timeout", "output.inactivity_timeout_ms"},
                        {"--mux-queue-capacity", "output.queue_capacity"},
+                       {"--audio-queue-capacity", "pipeline.audio_queue_capacity"},
+                       {"--output-queue-capacity", "pipeline.packet_queue_capacity"},
                        {"--video-bitrate", "video.bitrate"}, {"--audio-bitrate", "audio.bitrate"},
                        {"--gop-size", "video_encoder.gop_size"}, {"--preset", "video_encoder.preset"},
                        {"--low-latency", "video_encoder.low_latency"},
@@ -56,6 +62,8 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
                        {"--read-timeout", "input.read_timeout_ms"},
                        {"--reconnect-attempts", "input.reconnect_attempts"},
                        {"--reconnect-delay", "input.reconnect_delay_ms"},
+                       {"--reconnect-max-delay", "input.reconnect_max_delay_ms"},
+                       {"--inactivity-timeout", "input.inactivity_timeout_ms"},
                        {"--packet-queue-capacity", "input.queue_capacity"},
                        {"--max-buffer-ms", "input.max_buffer_ms"},
                        {"--max-queue-bytes", "input.max_queue_bytes"}});
@@ -130,6 +138,8 @@ std::string commandLineHelp(AppKind app) {
         "  --audio-device NAME      Audio device name (default: default)\n"
         "  --sample-rate HZ         Audio sample rate\n"
         "  --channels N             1 (mono) or 2 (stereo)\n"
+        "  --video-queue-capacity N  Raw publisher / decoded player video frames (1..64)\n"
+        "  --max-video-age-ms MS    Queued realtime video age limit (20..5000)\n"
         "  --check-config           Validate and exit\n"
         "  --print-config           Print effective JSON and exit\n";
     help += "  --log-level LEVEL        DEBUG, INFO, WARN or ERROR\n"
@@ -149,9 +159,13 @@ std::string commandLineHelp(AppKind app) {
                 "  --stream BOOL            Enable M07 FLV/RTMP output to --url (default: false)\n"
                 "  --connect-timeout MS     RTMP connection timeout (100..60000)\n"
                 "  --write-timeout MS       RTMP write timeout (100..60000)\n"
-                "  --reconnect-attempts N   Retry a failed connection 0..100 times; 0 disables retries\n"
+                "  --reconnect-attempts N   Retry 0..100 times; 0 disables, -1 retries until stopped\n"
                 "  --reconnect-delay MS     Delay between connection attempts (0..60000)\n"
+                "  --reconnect-max-delay MS Exponential retry delay cap (0..60000; >= base delay)\n"
+                "  --inactivity-timeout MS  No sent media timeout (100..600000; 0 disables)\n"
                 "  --mux-queue-capacity N   Maximum queued encoded packets (8..4096)\n"
+                "  --audio-queue-capacity N Raw captured audio blocks before encoding (1..256)\n"
+                "  --output-queue-capacity N Encoded events before local muxing (8..4096)\n"
                 "  --list-devices           Enumerate cameras and microphones\n"
                 "  --list-options KIND      Print camera (video) / microphone (audio) capabilities\n"
                 "  --source devices|file    Select live devices or a local file\n"
@@ -182,14 +196,16 @@ std::string commandLineHelp(AppKind app) {
                 "  --vsync BOOL            Request vertical sync (default: true)\n"
                 "  --fullscreen BOOL       Start fullscreen (default: false)\n"
                 "  --play-audio BOOL       Decode and play audio (default: true)\n"
-                "  --audio-buffer-ms MS    PCM ring target depth (100..2000; default: 500)\n"
+                "  --audio-buffer-ms MS    PCM ring capacity (100..2000; default: 100)\n"
                 "  --volume N              Player audio volume (0..100; default: 100)\n"
                 "  --mute BOOL             Mute audio (default: false)\n"
                 "  --audio-paused BOOL     Start with audio paused (default: false)\n"
                 "  --connect-timeout MS     Input connection/probe timeout (100..60000)\n"
                 "  --read-timeout MS        Input packet read timeout (100..60000)\n"
-                "  --reconnect-attempts N   Retry a failed connection 0..100 times; 0 disables retries\n"
+                "  --reconnect-attempts N   Retry 0..100 times; 0 disables, -1 retries until stopped\n"
                 "  --reconnect-delay MS     Delay between connection attempts (0..60000)\n"
+                "  --reconnect-max-delay MS Exponential retry delay cap (0..60000; >= base delay)\n"
+                "  --inactivity-timeout MS  No valid received media timeout (100..600000; 0 disables)\n"
                 "  --packet-queue-capacity N Maximum packets in each audio/video queue (8..4096)\n"
                 "  --max-buffer-ms MS       Maximum queued media span/residence time (100..60000)\n"
                 "  --max-queue-bytes N      Total queued media bytes (1048576..268435456)\n";

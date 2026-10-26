@@ -54,6 +54,8 @@ endif()
 
 # 只注册已有实现，后续模块有代码时再添加目标。
 add_library(lsl_common STATIC
+    src/common/queue/BoundedBlockingQueue.hpp
+    src/common/utils/NetworkStatus.hpp
     src/common/config/Config.cpp
     src/common/config/CommandLine.cpp
     src/common/logger/Logger.cpp

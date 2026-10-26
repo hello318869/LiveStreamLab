@@ -45,6 +45,8 @@ Json document(const PublisherConfig& c) {
                         {"write_timeout_ms", c.streaming.writeTimeoutMs},
                         {"reconnect_attempts", c.streaming.reconnectAttempts},
                         {"reconnect_delay_ms", c.streaming.reconnectDelayMs},
+                        {"reconnect_max_delay_ms", c.streaming.reconnectMaxDelayMs},
+                        {"inactivity_timeout_ms", c.streaming.inactivityTimeoutMs},
                         {"queue_capacity", c.streaming.queueCapacity},
                         {"max_interleave_delta_ms", c.streaming.maxInterleaveDeltaMs}}},
             {"video", {{"width", c.video.width}, {"height", c.video.height},
@@ -70,6 +72,10 @@ Json document(const PublisherConfig& c) {
                            {"frame_size", c.preprocess.audio.frameSize},
                            {"gain_db", c.preprocess.audio.gainDb},
                            {"discontinuity_threshold_ms", c.preprocess.audio.discontinuityThresholdMs}}}}},
+            {"pipeline", {{"video_queue_capacity", c.pipeline.videoQueueCapacity},
+                          {"audio_queue_capacity", c.pipeline.audioQueueCapacity},
+                          {"packet_queue_capacity", c.pipeline.packetQueueCapacity},
+                          {"max_video_age_ms", c.pipeline.maxVideoAgeMs}}},
             {"logging", document(c.logging)}};
 }
 
@@ -79,6 +85,8 @@ Json document(const PlayerConfig& c) {
                         {"read_timeout_ms", c.demux.readTimeoutMs},
                         {"reconnect_attempts", c.demux.reconnectAttempts},
                         {"reconnect_delay_ms", c.demux.reconnectDelayMs},
+                        {"reconnect_max_delay_ms", c.demux.reconnectMaxDelayMs},
+                        {"inactivity_timeout_ms", c.demux.inactivityTimeoutMs},
                         {"queue_capacity", c.demux.queueCapacity},
                         {"max_buffer_ms", c.demux.maxBufferMs},
                         {"max_queue_bytes", c.demux.maxQueueBytes},
@@ -93,6 +101,8 @@ Json document(const PlayerConfig& c) {
                       {"drop_threshold_ms", c.sync.dropThresholdMs},
                       {"audio_wait_ms", c.sync.audioWaitMs},
                       {"discontinuity_threshold_ms", c.sync.discontinuityThresholdMs}}},
+            {"pipeline", {{"video_queue_capacity", c.pipeline.videoQueueCapacity},
+                          {"max_video_age_ms", c.pipeline.maxVideoAgeMs}}},
             {"logging", document(c.logging)}};
 }
 
@@ -259,6 +269,10 @@ void url(const std::string& value, bool publisher) {
 
 void validate(const PublisherConfig& c) {
     validateLogging(c.logging);
+    range(c.pipeline.videoQueueCapacity, 1, 64, "pipeline.video_queue_capacity");
+    range(c.pipeline.audioQueueCapacity, 1, 256, "pipeline.audio_queue_capacity");
+    range(c.pipeline.packetQueueCapacity, 8, 4096, "pipeline.packet_queue_capacity");
+    range(c.pipeline.maxVideoAgeMs, 20, 5000, "pipeline.max_video_age_ms");
     device(c.videoDevice, "devices.video");
     device(c.audioDevice, "devices.audio");
     url(c.outputUrl, true);
@@ -266,8 +280,15 @@ void validate(const PublisherConfig& c) {
     mediaFile(c.audioFile, "output.audio_file", ".m4a");
     range(c.streaming.connectTimeoutMs, 100, 60000, "output.connect_timeout_ms");
     range(c.streaming.writeTimeoutMs, 100, 60000, "output.write_timeout_ms");
-    range(c.streaming.reconnectAttempts, 0, 100, "output.reconnect_attempts");
+    range(c.streaming.reconnectAttempts, -1, 100, "output.reconnect_attempts");
     range(c.streaming.reconnectDelayMs, 0, 60000, "output.reconnect_delay_ms");
+    range(c.streaming.reconnectMaxDelayMs, 0, 60000, "output.reconnect_max_delay_ms");
+    if (c.streaming.reconnectMaxDelayMs < c.streaming.reconnectDelayMs) {
+        fail("output.reconnect_max_delay_ms", "must be greater than or equal to output.reconnect_delay_ms");
+    }
+    if (c.streaming.inactivityTimeoutMs != 0) {
+        range(c.streaming.inactivityTimeoutMs, 100, 600000, "output.inactivity_timeout_ms");
+    }
     range(c.streaming.queueCapacity, 8, 4096, "output.queue_capacity");
     range(c.streaming.maxInterleaveDeltaMs, 1, 5000, "output.max_interleave_delta_ms");
     if (c.streaming.enabled && c.capture.source == "file" && !c.capture.realtime) {
@@ -334,6 +355,8 @@ void validate(const PublisherConfig& c) {
 
 void validate(const PlayerConfig& c) {
     validateLogging(c.logging);
+    range(c.pipeline.videoQueueCapacity, 1, 64, "pipeline.video_queue_capacity");
+    range(c.pipeline.maxVideoAgeMs, 20, 5000, "pipeline.max_video_age_ms");
     url(c.inputUrl, false);
     device(c.audioDevice, "audio.device");
     audio(c.sampleRate, c.channels);
@@ -353,8 +376,15 @@ void validate(const PlayerConfig& c) {
     range(c.video.height, 90, 4320, "video.height");
     range(c.demux.connectTimeoutMs, 100, 60000, "input.connect_timeout_ms");
     range(c.demux.readTimeoutMs, 100, 60000, "input.read_timeout_ms");
-    range(c.demux.reconnectAttempts, 0, 100, "input.reconnect_attempts");
+    range(c.demux.reconnectAttempts, -1, 100, "input.reconnect_attempts");
     range(c.demux.reconnectDelayMs, 0, 60000, "input.reconnect_delay_ms");
+    range(c.demux.reconnectMaxDelayMs, 0, 60000, "input.reconnect_max_delay_ms");
+    if (c.demux.reconnectMaxDelayMs < c.demux.reconnectDelayMs) {
+        fail("input.reconnect_max_delay_ms", "must be greater than or equal to input.reconnect_delay_ms");
+    }
+    if (c.demux.inactivityTimeoutMs != 0) {
+        range(c.demux.inactivityTimeoutMs, 100, 600000, "input.inactivity_timeout_ms");
+    }
     range(c.demux.queueCapacity, 8, 4096, "input.queue_capacity");
     range(c.demux.maxBufferMs, 100, 60000, "input.max_buffer_ms");
     range(c.demux.maxQueueBytes, 1048576, 268435456, "input.max_queue_bytes");
@@ -377,6 +407,8 @@ PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& ove
     c.streaming.writeTimeoutMs = integer(output["write_timeout_ms"], "output.write_timeout_ms");
     c.streaming.reconnectAttempts = integer(output["reconnect_attempts"], "output.reconnect_attempts");
     c.streaming.reconnectDelayMs = integer(output["reconnect_delay_ms"], "output.reconnect_delay_ms");
+    c.streaming.reconnectMaxDelayMs = integer(output["reconnect_max_delay_ms"], "output.reconnect_max_delay_ms");
+    c.streaming.inactivityTimeoutMs = integer(output["inactivity_timeout_ms"], "output.inactivity_timeout_ms");
     c.streaming.queueCapacity = integer(output["queue_capacity"], "output.queue_capacity");
     c.streaming.maxInterleaveDeltaMs = integer(output["max_interleave_delta_ms"], "output.max_interleave_delta_ms");
     c.video.width = integer(data["video"]["width"], "video.width");
@@ -413,6 +445,11 @@ PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& ove
     c.preprocess.audio.gainDb = integer(audioPreprocess["gain_db"], "preprocess.audio.gain_db");
     c.preprocess.audio.discontinuityThresholdMs = integer(audioPreprocess["discontinuity_threshold_ms"],
         "preprocess.audio.discontinuity_threshold_ms");
+    const auto& pipeline = data["pipeline"];
+    c.pipeline.videoQueueCapacity = integer(pipeline["video_queue_capacity"], "pipeline.video_queue_capacity");
+    c.pipeline.audioQueueCapacity = integer(pipeline["audio_queue_capacity"], "pipeline.audio_queue_capacity");
+    c.pipeline.packetQueueCapacity = integer(pipeline["packet_queue_capacity"], "pipeline.packet_queue_capacity");
+    c.pipeline.maxVideoAgeMs = integer(pipeline["max_video_age_ms"], "pipeline.max_video_age_ms");
     c.logging = loggingConfig(data["logging"]);
     validate(c);
     return c;
@@ -429,6 +466,8 @@ PlayerConfig parsePlayerConfig(std::string_view text, const Overrides& overrides
     c.demux.readTimeoutMs = integer(input["read_timeout_ms"], "input.read_timeout_ms");
     c.demux.reconnectAttempts = integer(input["reconnect_attempts"], "input.reconnect_attempts");
     c.demux.reconnectDelayMs = integer(input["reconnect_delay_ms"], "input.reconnect_delay_ms");
+    c.demux.reconnectMaxDelayMs = integer(input["reconnect_max_delay_ms"], "input.reconnect_max_delay_ms");
+    c.demux.inactivityTimeoutMs = integer(input["inactivity_timeout_ms"], "input.inactivity_timeout_ms");
     c.demux.queueCapacity = integer(input["queue_capacity"], "input.queue_capacity");
     c.demux.maxBufferMs = integer(input["max_buffer_ms"], "input.max_buffer_ms");
     c.demux.maxQueueBytes = integer(input["max_queue_bytes"], "input.max_queue_bytes");
@@ -450,6 +489,9 @@ PlayerConfig parsePlayerConfig(std::string_view text, const Overrides& overrides
     c.sync.dropThresholdMs = integer(sync["drop_threshold_ms"], "sync.drop_threshold_ms");
     c.sync.audioWaitMs = integer(sync["audio_wait_ms"], "sync.audio_wait_ms");
     c.sync.discontinuityThresholdMs = integer(sync["discontinuity_threshold_ms"], "sync.discontinuity_threshold_ms");
+    const auto& pipeline = data["pipeline"];
+    c.pipeline.videoQueueCapacity = integer(pipeline["video_queue_capacity"], "pipeline.video_queue_capacity");
+    c.pipeline.maxVideoAgeMs = integer(pipeline["max_video_age_ms"], "pipeline.max_video_age_ms");
     c.logging = loggingConfig(data["logging"]);
     validate(c);
     return c;

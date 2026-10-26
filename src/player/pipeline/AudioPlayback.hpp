@@ -26,6 +26,9 @@ public:
     AudioPlayback(const AudioPlayback&) = delete;
     AudioPlayback& operator=(const AudioPlayback&) = delete;
 
+    // 控制线程先给所有工作线程发停止，再统一 join；stop 为析构兜底。
+    void requestStop() noexcept;
+    void join() noexcept;
     void stop() noexcept;
     AudioPlaybackStats stats() const; // 同时向主线程传播工作线程错误。
 

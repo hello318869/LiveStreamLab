@@ -224,8 +224,9 @@ SyncAction AVSynchronizer::evaluate(const SyncInput& input, Clock::time_point no
             error > static_cast<std::int64_t>(options_.discontinuityThresholdMs) * 1000) {
             return complete(SyncAction::Drop);
         }
-        // 待显示帧已离开有界队列，也要限制它独占等待槽位的时间；有新帧时更新候选。
-        if (input.hasNextFrame && now - pendingSince_ >=
+        // 首帧尚未与音频对齐时保留候选，不能超时后不断换成更远的未来帧。
+        // 已对齐后的异常等待仍有界，由上方漂移检查和这里的候选更新处理。
+        if (synchronized_ && input.hasNextFrame && now - pendingSince_ >=
             std::chrono::milliseconds(options_.discontinuityThresholdMs)) return complete(SyncAction::Drop);
         return wait();
     }

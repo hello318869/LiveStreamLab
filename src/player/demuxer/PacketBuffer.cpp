@@ -153,6 +153,17 @@ void PacketBuffer::invalidate() {
     impl_->changed.notify_all();
 }
 
+void PacketBuffer::disconnect() {
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->stopped) return;
+        impl_->streams.reset();
+        impl_->finished = false;
+        impl_->resetLocked();
+    }
+    impl_->changed.notify_all();
+}
+
 bool PacketBuffer::resynchronize(std::uint64_t expectedSerial) {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -203,6 +214,9 @@ bool PacketBuffer::push(TrackKind kind, media::PacketPtr packet, std::int64_t ti
 
     queue.items.push_back(Impl::Item{std::move(packet), timestampUs, now, packetBytes});
     impl_->bytes += packetBytes;
+    impl_->counters.videoHighWaterMark = std::max(impl_->counters.videoHighWaterMark, impl_->queues[0].items.size());
+    impl_->counters.audioHighWaterMark = std::max(impl_->counters.audioHighWaterMark, impl_->queues[1].items.size());
+    impl_->counters.peakBytes = std::max(impl_->counters.peakBytes, impl_->bytes);
     ++impl_->counters.acceptedPackets;
     impl_->changed.notify_all();
     return true;

@@ -16,6 +16,8 @@ public:
 
     void reset(std::shared_ptr<const StreamInfo> streams);
     void invalidate();
+    // 断线时撤销旧流快照并同时换代，消费者释放旧解码器，等待新连接的参数。
+    void disconnect();
     // 同步器按观察到的代次请求双轨换代；并发重连、停止或 EOF 后不再清理。
     bool resynchronize(std::uint64_t expectedSerial);
     bool push(TrackKind kind, media::PacketPtr packet, std::int64_t timestampUs);

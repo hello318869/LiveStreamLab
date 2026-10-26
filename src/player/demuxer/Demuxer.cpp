@@ -84,10 +84,12 @@ struct Demuxer::Impl {
     bool started = false; // start/join 由控制线程串行调用。
     std::atomic<bool> stopped{false};
     std::atomic<std::int64_t> ioDeadlineUs{0};
+    std::atomic<std::int64_t> mediaDeadlineUs{0}; // 与单次 read 预算独立；垃圾包不能延长它。
     mutable std::mutex mutex;
     std::condition_variable wake;
     std::exception_ptr failure;
     DemuxStats counters;
+    network::ConnectionMonitor connection;
 
     // 仅网络线程访问；关闭上下文也只能由该线程执行。
     media::InputFormatPtr context;
@@ -112,8 +114,10 @@ struct Demuxer::Impl {
     static int interrupt(void* opaque) noexcept {
         const auto& self = *static_cast<Impl*>(opaque);
         if (self.stopped.load(std::memory_order_relaxed)) return 1;
+        const auto now = av_gettime_relative();
         const auto deadline = self.ioDeadlineUs.load(std::memory_order_relaxed);
-        return deadline != 0 && av_gettime_relative() >= deadline;
+        const auto mediaDeadline = self.mediaDeadlineUs.load(std::memory_order_relaxed);
+        return (deadline != 0 && now >= deadline) || (mediaDeadline != 0 && now >= mediaDeadline);
     }
 
     void deadline(int milliseconds) noexcept {
@@ -122,16 +126,31 @@ struct Demuxer::Impl {
     }
 
     void checkIo(int result, const char* operation) const {
+        checkInactivity();
         const auto end = ioDeadlineUs.load(std::memory_order_relaxed);
-        if (result < 0 && !stopped.load(std::memory_order_relaxed) &&
+        if (!stopped.load(std::memory_order_relaxed) &&
             end != 0 && av_gettime_relative() >= end) {
             throw error::FFmpegError("network", AVERROR(ETIMEDOUT), operation);
         }
         error::throwIfFFmpegFailed(result, "network", operation);
     }
 
+    void renewMediaDeadline() noexcept {
+        mediaDeadlineUs.store(config.demux.inactivityTimeoutMs == 0 ? 0 :
+            av_gettime_relative() + static_cast<std::int64_t>(config.demux.inactivityTimeoutMs) * 1000,
+            std::memory_order_relaxed);
+    }
+
+    void checkInactivity() const {
+        const auto end = mediaDeadlineUs.load(std::memory_order_relaxed);
+        if (!stopped.load(std::memory_order_relaxed) && end != 0 && av_gettime_relative() >= end) {
+            throw error::FFmpegError("network", AVERROR(ETIMEDOUT), "live input produced no usable media within inactivity timeout");
+        }
+    }
+
     void close() noexcept {
         // 某些协议关闭也执行 I/O，仍保留超时/停止中断回调。
+        mediaDeadlineUs.store(0, std::memory_order_relaxed);
         deadline(config.demux.readTimeoutMs);
         context.reset();
         ioDeadlineUs.store(0, std::memory_order_relaxed);
@@ -149,6 +168,8 @@ struct Demuxer::Impl {
         context->interrupt_callback = AVIOInterruptCB{interrupt, this};
         context->probesize = 2 * 1024 * 1024;
         context->max_analyze_duration = 3000000;
+        // 按 PTS 调度直播，不必累计几十帧估算 FPS；仍完整发现编码参数并保留初始关键帧。
+        context->fps_probe_size = 0;
         media::DictionaryPtr options;
         setOption(options, "rw_timeout", std::to_string(static_cast<std::int64_t>(config.demux.readTimeoutMs) * 1000));
         if (config.inputUrl.rfind("rtmp", 0) == 0) setOption(options, "rtmp_live", "live");
@@ -163,7 +184,9 @@ struct Demuxer::Impl {
         options.reset(dictionary);
         checkIo(result, "open live input");
         // 打开和探测共享连接预算，避免无限等待缺失的轨道。
+        const auto probeStartedUs = av_gettime_relative();
         checkIo(avformat_find_stream_info(context.get(), nullptr), "discover live streams");
+        const auto probeElapsedMs = (av_gettime_relative() - probeStartedUs) / 1000;
         if (stopped.load(std::memory_order_relaxed)) return;
 
         auto info = std::make_shared<StreamInfo>();
@@ -176,11 +199,15 @@ struct Demuxer::Impl {
         streams = std::move(info);
         lastTimestamps.fill(AV_NOPTS_VALUE);
         buffer.reset(streams);
+        connection.connected(); // 停止已发生时 monitor 不会重新进入 STREAMING。
+        renewMediaDeadline();
         {
             std::lock_guard<std::mutex> lock(mutex);
             ++counters.connections;
         }
-        logger.log(logging::Level::Info, "demuxer", "session=" + std::to_string(session) +
+        logger.log(logging::Level::Info, "demuxer", std::string("input state=") +
+            network::stateName(connection.stats().state) + " session=" + std::to_string(session) +
+            " probe_ms=" + std::to_string(probeElapsedMs) +
             " video: " + describe(streams->video) + "; audio: " + describe(streams->audio));
         ioDeadlineUs.store(0, std::memory_order_relaxed);
     }
@@ -189,10 +216,12 @@ struct Demuxer::Impl {
     void readUntilEof(int& consecutiveFailures) {
         deadline(config.demux.readTimeoutMs);
         while (!stopped.load(std::memory_order_relaxed)) {
+            checkInactivity();
             media::PacketPtr packet{av_packet_alloc()};
             if (!packet) throw std::bad_alloc{};
             const int result = av_read_frame(context.get(), packet.get());
             if (stopped.load(std::memory_order_relaxed)) return;
+            checkInactivity(); // 即使 read 不断成功返回非媒体数据，也检查连续无媒体时间。
             if (result == AVERROR(EAGAIN) || result == AVERROR(EINTR)) {
                 // 不重置截止时间，持续 EAGAIN 也必须在读预算内结束。
                 const auto end = ioDeadlineUs.load(std::memory_order_relaxed);
@@ -224,6 +253,11 @@ struct Demuxer::Impl {
                 ++counters.ignoredPackets;
                 continue;
             }
+            if (packet->size == 0) {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++counters.ignoredPackets;
+                continue;
+            }
             const auto timestamp = packetTime(*packet, timeBase);
             const auto index = kind == TrackKind::Video ? 0u : 1u;
             const auto previous = lastTimestamps[index];
@@ -247,15 +281,24 @@ struct Demuxer::Impl {
                 else ++counters.audioPackets;
                 counters.bytes += static_cast<std::uint64_t>(packet->size);
             }
-            // 收到实际音视频包才恢复重试预算；仅 TCP/open 成功不足以判断恢复。
-            consecutiveFailures = 0;
-            buffer.push(kind, std::move(packet), timestamp);
+            // 实际收到的 payload 均计入吞吐量；只有能交给下游的媒体才表示恢复。
+            // 等待关键帧期间持续出现 P 帧不能无限刷新无数据检测与连续失败预算。
+            const auto receivedBytes = static_cast<std::uint64_t>(packet->size);
+            const bool accepted = buffer.push(kind, std::move(packet), timestamp);
+            connection.media(receivedBytes, accepted);
+            if (accepted) {
+                consecutiveFailures = 0;
+                renewMediaDeadline();
+            }
         }
     }
 
     void run() noexcept {
+        bool terminalFailure = false;
+        std::exception_ptr recordedError;
         try {
             int consecutiveFailures = 0;
+            logger.log(logging::Level::Info, "network", "input state=CONNECTING");
             while (!stopped.load(std::memory_order_relaxed)) {
                 try {
                     open();
@@ -263,40 +306,83 @@ struct Demuxer::Impl {
                     readUntilEof(consecutiveFailures);
                     if (stopped.load(std::memory_order_relaxed)) break;
                     if (config.demux.reconnectAttempts == 0) {
+                        connection.setState(network::ConnectionState::Stopping);
                         close();
                         buffer.finish();
+                        connection.finish();
                         return;
                     }
                     throw error::FFmpegError("network", AVERROR_EOF, "live input disconnected");
                 } catch (const error::FFmpegError& e) {
-                    close();
                     if (stopped.load(std::memory_order_relaxed)) break;
-                    // 在等待重连期间也先通知消费者清理旧解码器/显示队列。
-                    buffer.invalidate();
-                    if (!retryable(e.code) || consecutiveFailures >= config.demux.reconnectAttempts) throw;
-                    ++consecutiveFailures;
+                    recordedError = std::current_exception();
+                    connection.recordError(e.code, e.what());
+                    const bool canRetry = retryable(e.code) && (config.demux.reconnectAttempts < 0 ||
+                        consecutiveFailures < config.demux.reconnectAttempts);
+                    if (!canRetry) terminalFailure = true;
+                    connection.setState(canRetry ? network::ConnectionState::Reconnecting : network::ConnectionState::Error);
+                    // 先撤销快照/代次，令音视频线程立即释放旧解码器、PCM 和待显示帧。
+                    // 关闭协议可能仍进行 I/O，不能到 close 完毕后才清理播放侧。
+                    buffer.disconnect();
+                    streams.reset();
+                    lastTimestamps.fill(AV_NOPTS_VALUE);
+                    close();
+                    if (!canRetry) throw;
+                    if (stopped.load(std::memory_order_relaxed)) break;
+                    if (consecutiveFailures < std::numeric_limits<int>::max()) ++consecutiveFailures;
+                    const auto delay = network::reconnectDelayMs(config.demux.reconnectDelayMs,
+                        config.demux.reconnectMaxDelayMs, static_cast<std::uint64_t>(consecutiveFailures));
+                    connection.retry(consecutiveFailures, delay);
                     {
                         std::lock_guard<std::mutex> lock(mutex);
                         ++counters.reconnects;
                     }
-                    logger.log(logging::Level::Warn, "network", "input retry " +
-                        std::to_string(consecutiveFailures) + "/" + std::to_string(config.demux.reconnectAttempts) +
-                        ": " + e.what(), e.code);
-                    if (waitRetry(config.demux.reconnectDelayMs)) break;
+                    logger.log(logging::Level::Warn, "network", "input state=RECONNECTING attempt=" +
+                        std::to_string(consecutiveFailures) + "/" +
+                        (config.demux.reconnectAttempts < 0 ? "unlimited" : std::to_string(config.demux.reconnectAttempts)) +
+                        " delay_ms=" + std::to_string(delay) + ": " + e.what(), e.code);
+                    if (waitRetry(delay)) break;
                 }
             }
         } catch (...) {
-            if (!stopped.load(std::memory_order_relaxed)) {
-                std::lock_guard<std::mutex> lock(mutex);
-                failure = std::current_exception();
+            if (terminalFailure || !stopped.load(std::memory_order_relaxed)) {
+                const auto problem = std::current_exception();
+                terminalFailure = true;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    failure = problem;
+                }
+                if (problem != recordedError) {
+                    try {
+                        std::rethrow_exception(problem);
+                    } catch (const error::AppError& e) {
+                        connection.recordError(e.code, e.what());
+                    } catch (const std::exception& e) {
+                        connection.recordError(error::Unexpected, e.what());
+                    } catch (...) {
+                        connection.recordError(error::Unexpected, "unknown live input error");
+                    }
+                }
+                connection.finish(true);
+                buffer.disconnect();
+                streams.reset();
+                logger.log(logging::Level::Error, "network", "input state=ERROR: " +
+                    connection.stats().lastErrorMessage, connection.stats().lastErrorCode);
             }
         }
+        if (!terminalFailure) connection.setState(network::ConnectionState::Stopping);
         close();
         buffer.finish();
+        connection.finish(terminalFailure);
     }
 
     void requestStop() noexcept {
-        stopped.store(true, std::memory_order_relaxed);
+        {
+            // 与 waitRetry 的谓词共用锁，避免停止通知恰好发生在入睡前而丢失唤醒。
+            std::lock_guard<std::mutex> lock(mutex);
+            stopped.store(true, std::memory_order_relaxed);
+        }
+        connection.requestStop();
         buffer.stop();
         wake.notify_all();
     }
@@ -310,8 +396,16 @@ void Demuxer::start() {
     if (impl_->started || impl_->stopped.load(std::memory_order_relaxed)) {
         throw error::AppError("demuxer", error::InvalidConfig, "demuxer can only be started once");
     }
-    impl_->worker = std::thread([state = impl_.get()] { state->run(); });
-    impl_->started = true;
+    impl_->started = true; // 线程创建失败也结束本对象的启动机会，调用方应创建新会话。
+    impl_->connection.start();
+    try {
+        impl_->worker = std::thread([state = impl_.get()] { state->run(); });
+    } catch (const std::exception& e) {
+        impl_->connection.recordError(error::Unexpected, std::string("start live input worker: ") + e.what());
+        impl_->connection.finish(true);
+        impl_->buffer.finish();
+        throw;
+    }
 }
 PacketEvent Demuxer::pop(TrackKind track, int timeoutMs) { return impl_->buffer.pop(track, timeoutMs); }
 bool Demuxer::resynchronize(std::uint64_t expectedSerial) {
@@ -334,6 +428,7 @@ DemuxStats Demuxer::stats() const {
         result = impl_->counters;
     }
     result.buffer = impl_->buffer.stats();
+    result.network = impl_->connection.stats();
     return result;
 }
 

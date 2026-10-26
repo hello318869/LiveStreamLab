@@ -12,8 +12,10 @@
 | `output.streaming` | `false` | 启用 M07 FLV/RTMP 输出；`--url` 单独不会开启推流 |
 | `output.connect_timeout_ms` | `5000` | 100–60000 ms，连接与封装头阶段 I/O 超时 |
 | `output.write_timeout_ms` | `5000` | 100–60000 ms，包写入、写尾及关闭阶段 I/O 超时 |
-| `output.reconnect_attempts` | `5` | 0–100，网络故障后的最多重试次数；0 禁用重连 |
-| `output.reconnect_delay_ms` | `1000` | 0–60000 ms，重连等待间隔 |
+| `output.reconnect_attempts` | `5` | -1–100，连续故障最多重试次数；0 禁用，-1 持续重试至停止 |
+| `output.reconnect_delay_ms` | `1000` | 0–60000 ms，首次重试等待，后续按 2 倍退避 |
+| `output.reconnect_max_delay_ms` | `30000` | 0–60000 ms，退避间隔上限，不小于基础间隔 |
+| `output.inactivity_timeout_ms` | `15000` | 0 或 100–600000 ms，没有成功媒体发送的时限；0 禁用，包含等待编码参数/关键帧 |
 | `output.queue_capacity` | `256` | 8–4096，复用交接队列的编码包上限 |
 | `output.max_interleave_delta_ms` | `500` | 1–5000 ms，音视频交织等待上限 |
 | `output.video_file` | `output/video.mp4` | M05 本地 MP4 视频路径，空字符串禁用；自动建目录，拒绝覆盖已有文件 |
@@ -46,6 +48,10 @@
 | `preprocess.audio.frame_size` | `1024` | M04 独立使用时为 1–8192 个每声道样本；主播端由 AAC 实际 frame_size 覆盖 |
 | `preprocess.audio.gain_db` | `0` | -60–30 dB，重采样后、编码前的软件 PCM 增益；0 保留原电平，不修改系统设备音量 |
 | `preprocess.audio.discontinuity_threshold_ms` | `100` | 1–1000 ms，区分时间抖动与不连续 |
+| `pipeline.video_queue_capacity` | `8` | 1–64，采集后原始视频队列的帧数上限 |
+| `pipeline.audio_queue_capacity` | `32` | 1–256，采集后原始音频队列的块数上限；满时背压 |
+| `pipeline.packet_queue_capacity` | `256` | 8–4096，两路编码线程交给本地封装线程的事件总数上限 |
+| `pipeline.max_video_age_ms` | `200` | 20–5000 ms，实时输入原始视频最大排队年龄；非实时文件输入保留帧并背压 |
 
 观众端 M09 输入、M11 音频、M12 显示与 M13 同步字段：
 
@@ -54,8 +60,10 @@
 | `input.url` | `http://127.0.0.1:8080/live/livestream.flv` | RTMP/RTMPS 或 HTTP/HTTPS-FLV，主机与流路径非空 |
 | `input.connect_timeout_ms` | `5000` | 100–60000 ms，连接与流信息探测 I/O 超时 |
 | `input.read_timeout_ms` | `5000` | 100–60000 ms，单次读包 I/O 超时 |
-| `input.reconnect_attempts` | `5` | 0–100，连续故障后的最多重试次数；收到媒体包后重置故障预算 |
-| `input.reconnect_delay_ms` | `1000` | 0–60000 ms，可被停止操作中断的重试等待 |
+| `input.reconnect_attempts` | `5` | -1–100，连续故障最多重试次数；队列接受有效媒体包后重置，0 禁用，-1 持续重试 |
+| `input.reconnect_delay_ms` | `1000` | 0–60000 ms，首次重试间隔；后续按 2 倍退避，可被停止中断 |
+| `input.reconnect_max_delay_ms` | `30000` | 0–60000 ms，退避间隔上限，不小于基础间隔 |
+| `input.inactivity_timeout_ms` | `15000` | 0 或 100–600000 ms，没有队列可接受的非空音视频包的时限；0 禁用，忽略/损坏/等关键帧时拒绝的包不续期 |
 | `input.queue_capacity` | `256` | 8–4096，每轨编码包数量上限 |
 | `input.max_buffer_ms` | `2000` | 100–60000 ms，媒体时间跨度与排队墙钟年龄上限 |
 | `input.max_queue_bytes` | `33554432` | 1048576–268435456，两轨合计包数据与 side data 字节上限 |
@@ -66,15 +74,18 @@
 | `audio.device` | `default` | 默认输出设备或精确设备名；实际存在音轨时打开 |
 | `audio.sample_rate` / `audio.channels` | 48000 / 2 | 输出 PCM 参数，标准 AAC 采样率 / 1 或 2 声道 |
 | `audio.enabled` | `true` | 启用音频解码与播放；禁用后仍消费并释放音频包 |
-| `audio.buffer_ms` | `500` | 100–2000 ms，PCM 环形缓冲目标深度，实际容量至少 4096 个每声道样本 |
+| `audio.buffer_ms` | `100` | 100–2000 ms，PCM 环形缓冲容量时长，实际容量至少 4096 个每声道样本 |
 | `audio.volume` | `100` | 0–100，只改变播放器音量 |
 | `audio.muted` / `audio.paused` | `false` / `false` | 启动时静音 / 同时暂停声音与视频，暂停沿用旧字段名 |
 | `sync.tolerance_ms` | `40` | 1–100 ms，视频允许提前显示的容差 |
 | `sync.drop_threshold_ms` | `100` | 1–1000 ms，迟到丢帧阈值，且不小于容差 |
 | `sync.audio_wait_ms` | `500` | 100–5000 ms，初始音频、欠载恢复或有效时钟停滞的等待上限 |
-| `sync.discontinuity_threshold_ms` | `1000` | 500–10000 ms，调度显著失步判定及提前帧候选等待阈值，且大于丢帧阈值 |
+| `sync.discontinuity_threshold_ms` | `1000` | 500–10000 ms，调度显著失步判定及已对齐后提前帧候选等待阈值，且大于丢帧阈值 |
+| `pipeline.video_queue_capacity` | `3` | 1–64，解码后等待主线程显示的视频帧数上限，另有 64 MiB 限额 |
+| `pipeline.max_video_age_ms` | `200` | 20–5000 ms，视频相对播放时钟的迟到上限；与 `sync.drop_threshold_ms` 取较小值，有后续帧时丢弃迟到帧 |
 
 观众端音频按流参数解码，再转换为配置的输出采样率与声道数；输出设置不覆盖输入编码参数。
+解码视频队列满时背压视频线程；尚未到显示时间的帧不会因解码较早而过期。
 音频主时钟驱动视频，Space 同时暂停声音与视频，M 静音，↑/↓ 每次调节 10% 音量。
 网络缓冲见 [M09](network-demuxing.md)，视频节奏见 [M10/M12](video-playback.md)，
 音频接口与缓冲见 [M11](audio-playback.md)，估计播放时钟、降级及误差口径见 [M13](av-sync.md)。
@@ -116,6 +127,11 @@ URL 检查协议、主机/流路径是否为空及空白字符；端口、IPv6�
 
 通用快捷参数：`--url`、`--audio-device`、`--sample-rate`、`--channels`、
 `--log-level`、`--log-file`、`--log-console`。
+M14 两端另支持 `--video-queue-capacity N` 与 `--max-video-age-ms MS`；
+主播端还支持 `--audio-queue-capacity N` 和 `--output-queue-capacity N`。
+`--output-queue-capacity` 对应本地封装交接事件队列，`--mux-queue-capacity` 对应 RTMP 待发送包队列；
+观众端编码包仍通过 `input.queue_capacity` 控制，PCM 仍通过 `audio.buffer_ms` 控制。
+线程、关闭行为与积压策略见 [M14](threading.md)。
 主播端另有 `--video-device`、`--width`、`--height`、`--fps`、
 `--video-bitrate`、`--audio-bitrate`；采集参数为 `--source`、`--input-file`、`--loop`、
 `--realtime`、`--capture-video`、`--capture-audio`、`--video-source`、`--audio-source`、`--capture-timeout`、`--video-format`。
@@ -135,13 +151,20 @@ M05 默认自动保存只有视频轨的 MP4；默认关闭推流时，`output.u
 `--audio-bitrate`、`--sample-rate`、`--channels` 沿用已有音频参数。
 PCM 格式与帧长协商、尾帧和编码延迟见 [M06](audio-encoding.md)。
 推流参数为 `--stream true|false`、`--connect-timeout MS`、`--write-timeout MS`、
-`--reconnect-attempts N`、`--reconnect-delay MS` 和 `--mux-queue-capacity N`；
+`--reconnect-attempts N`、`--reconnect-delay MS`、`--reconnect-max-delay MS`、
+`--inactivity-timeout MS` 和 `--mux-queue-capacity N`；
 交织等待可通过 `--set output.max_interleave_delta_ms=500` 修改。用法与恢复边界见 [M07](rtmp-streaming.md)。
 观众端支持 `--connect-timeout MS`、`--read-timeout MS`、`--reconnect-attempts N`、
 `--reconnect-delay MS`、`--packet-queue-capacity N`、`--max-buffer-ms MS` 和 `--max-queue-bytes N`，
 分别映射到 `input` 下的同名配置；`--connect-timeout`、`--reconnect-attempts`、`--reconnect-delay`
 在两端作用于各自的输入或输出连接。时间戳跳变阈值使用
 `--set input.discontinuity_threshold_ms=1000` 修改。
+M15 两端新增 `--reconnect-max-delay MS` 与 `--inactivity-timeout MS`，
+分别映射到各自 `input` / `output` 字段；`--reconnect-attempts -1` 表示持续重试。
+基础间隔 1000 ms、上限 30000 ms 时依次等待 1、2、4、8、16、30 秒，此后维持 30 秒。
+基础间隔设为 0 会立即重试；默认值保留退避。成功传输有效媒体后重置连续故障与退避级别，
+TCP 打开成功不会独自重置故障预算。观众端媒体进展要求包被队列接受；无数据时限应大于源的正常 GOP/帧间隔，
+或设为 0 禁用。状态与统计口径见 [M15 网络可靠性](network-reliability.md)。
 观众端另支持 `--width N`、`--height N`、`--vsync true|false`、`--fullscreen true|false`，
 对应 `video` 显示字段。窗口缩放保持输入视频的显示宽高比；F、Alt+Enter 或双击切换全屏，
 Esc、关闭窗口或 Ctrl+C 停止。

@@ -118,6 +118,7 @@ struct SDLAudioSink::Impl {
     media::AudioStreamPtr stream;
     std::atomic<std::uint64_t> readPosition{0}; // 只有 callback 推进；清理时保持原值。
     std::atomic<std::uint64_t> writePosition{0};
+    std::size_t highWaterMarkFrames = 0; // 生产者写入/控制查询均持 control。
     std::atomic<std::uint64_t> serial{0};
     std::uint64_t producerSerial = 0; // 受 control 保护；clear 不冒充生产者 reset。
     std::atomic<bool> ready{false};
@@ -423,6 +424,8 @@ bool SDLAudioSink::enqueue(const decoder::DecodedAudioBlock& block) {
         impl_->endTimestamps[offset] = frameEndTimestamp(block.timestampUs, frame + 1, impl_->options.sampleRate);
     }
     impl_->writePosition.store(write + count, std::memory_order_release);
+    impl_->highWaterMarkFrames = std::max(impl_->highWaterMarkFrames,
+        static_cast<std::size_t>(write + count - read));
     impl_->nextTimestampUs = frameEndTimestamp(block.timestampUs, count, impl_->options.sampleRate);
     impl_->haveAccepted = true;
     impl_->emptySince.reset();
@@ -525,6 +528,7 @@ AudioSinkStats SDLAudioSink::stats() const {
     result.queuedFrames = static_cast<std::size_t>(impl_->writePosition.load(std::memory_order_relaxed) -
                                                  impl_->readPosition.load(std::memory_order_acquire));
     result.capacityFrames = impl_->capacityFrames;
+    result.highWaterMarkFrames = impl_->highWaterMarkFrames;
     result.paused = impl_->options.paused;
     result.muted = impl_->options.muted;
     result.volume = impl_->options.volume;
