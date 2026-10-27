@@ -16,6 +16,8 @@ if(WIN32)
 endif()
 
 option(LSL_BUILD_APPS "Build publisher and player" ON)
+option(LSL_BUILD_PUBLISHER_GUI "Build the M16.1 Qt Widgets publisher controls" ON)
+option(LSL_BUILD_PLAYER_GUI "Build the M16.2 Qt Widgets viewer controls" ON)
 option(LSL_BUILD_TESTS "Build tests" OFF)
 option(LSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -54,6 +56,8 @@ endif()
 
 # 只注册已有实现，后续模块有代码时再添加目标。
 add_library(lsl_common STATIC
+    src/common/stats/CaptureTimestamp.cpp
+    src/common/stats/PerformanceStats.hpp
     src/common/queue/BoundedBlockingQueue.hpp
     src/common/utils/NetworkStatus.hpp
     src/common/config/Config.cpp
@@ -103,7 +107,9 @@ endif()
 lsl_set_warnings(lsl_capture)
 
 # 流水线负责组合采集、预处理、编码及输出；采集模块不依赖下游。
-add_library(lsl_publisher_pipeline STATIC src/publisher/pipeline/PublisherPipeline.cpp)
+add_library(lsl_publisher_pipeline STATIC
+    src/publisher/pipeline/PublisherPipeline.cpp
+    src/publisher/pipeline/PublisherSession.cpp)
 target_link_libraries(lsl_publisher_pipeline PUBLIC lsl_common
     PRIVATE lsl_capture lsl_preprocess lsl_video_encoder lsl_audio_encoder lsl_muxer lsl_rtmp)
 lsl_set_warnings(lsl_publisher_pipeline)
@@ -136,6 +142,7 @@ lsl_set_warnings(lsl_sync)
 
 add_library(lsl_player_pipeline STATIC
     src/player/pipeline/PlayerPipeline.cpp
+    src/player/pipeline/PlayerSession.cpp
     src/player/pipeline/AudioPlayback.cpp)
 target_link_libraries(lsl_player_pipeline PUBLIC lsl_common
     PRIVATE lsl_demuxer lsl_video_decoder lsl_video_renderer lsl_audio_decoder lsl_audio_sink lsl_sync)
@@ -150,10 +157,69 @@ if(LSL_BUILD_APPS)
     endforeach()
     target_link_libraries(publisher PRIVATE lsl_publisher_pipeline)
     target_link_libraries(player PRIVATE lsl_player_pipeline SDL3::SDL3)
+
+    if(LSL_BUILD_PUBLISHER_GUI OR LSL_BUILD_PLAYER_GUI)
+        # 优先使用用户指定的 Qt；也支持工作区内安装的 Windows MSVC SDK。
+        if(WIN32 AND NOT Qt6_DIR AND NOT Qt6_ROOT)
+            file(GLOB lsl_qt_sdks "${CMAKE_CURRENT_SOURCE_DIR}/external/qt/*/msvc*_64")
+            list(SORT lsl_qt_sdks COMPARE NATURAL ORDER DESCENDING)
+            foreach(lsl_qt_sdk IN LISTS lsl_qt_sdks)
+                if(EXISTS "${lsl_qt_sdk}/lib/cmake/Qt6/Qt6Config.cmake")
+                    list(PREPEND CMAKE_PREFIX_PATH "${lsl_qt_sdk}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+        if(WIN32)
+            find_program(LSL_WINDEPLOYQT_EXECUTABLE windeployqt
+                HINTS "${Qt6_DIR}/../../../bin" REQUIRED)
+        endif()
+    endif()
+
+    if(LSL_BUILD_PUBLISHER_GUI)
+        add_library(lsl_publisher_ui STATIC src/publisher/ui/PublisherControl.cpp)
+        target_link_libraries(lsl_publisher_ui PUBLIC lsl_common
+            PRIVATE lsl_publisher_pipeline lsl_capture Qt6::Widgets)
+        lsl_set_warnings(lsl_publisher_ui)
+
+        add_executable(publisher_gui src/apps/publisher_gui_main.cpp)
+        target_link_libraries(publisher_gui PRIVATE lsl_publisher_ui lsl_publisher_pipeline)
+        lsl_set_warnings(publisher_gui)
+        lsl_copy_runtime(publisher_gui)
+    endif()
+
+    if(LSL_BUILD_PLAYER_GUI)
+        add_library(lsl_player_ui STATIC src/player/ui/PlayerControl.cpp)
+        target_link_libraries(lsl_player_ui PUBLIC lsl_common
+            PRIVATE lsl_player_pipeline Qt6::Widgets SDL3::SDL3)
+        lsl_set_warnings(lsl_player_ui)
+
+        add_executable(player_gui src/apps/player_gui_main.cpp)
+        target_link_libraries(player_gui PRIVATE lsl_player_ui lsl_player_pipeline)
+        lsl_set_warnings(player_gui)
+        lsl_copy_runtime(player_gui)
+    endif()
+
     if(WIN32)
-        add_custom_command(TARGET player POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:SDL3::SDL3>" "$<TARGET_FILE_DIR:player>" VERBATIM)
+        # 部署只分析/复制依赖，不启动目标程序；保持构建全部由 CMake 管理。
+        foreach(qt_app publisher_gui player_gui)
+            if(TARGET ${qt_app})
+                add_custom_command(TARGET ${qt_app} POST_BUILD
+                    COMMAND "${LSL_WINDEPLOYQT_EXECUTABLE}"
+                        "$<IF:$<CONFIG:Debug>,--debug,--release>"
+                        --no-translations --no-system-d3d-compiler --no-compiler-runtime
+                        --dir "$<TARGET_FILE_DIR:${qt_app}>" "$<TARGET_FILE:${qt_app}>"
+                    VERBATIM)
+            endif()
+        endforeach()
+        foreach(sdl_app player player_gui)
+            if(TARGET ${sdl_app})
+                add_custom_command(TARGET ${sdl_app} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:SDL3::SDL3>" "$<TARGET_FILE_DIR:${sdl_app}>" VERBATIM)
+            endif()
+        endforeach()
     endif()
 endif()
 

@@ -1,6 +1,8 @@
 # 构建产物
 /build/
 /out/
+# 本机 Qt SDK，通过 Qt6_DIR/CMAKE_PREFIX_PATH 或工程内 SDK 查找。
+/external/qt/
 CMakeFiles/
 CMakeUserPresets.json
 .vs/

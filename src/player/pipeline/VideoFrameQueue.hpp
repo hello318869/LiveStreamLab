@@ -106,9 +106,9 @@ public:
         }
         writable_.notify_all();
     }
-    Snapshot snapshot() const {
+    Snapshot snapshot(bool checkFailure = true) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (failure_) std::rethrow_exception(failure_);
+        if (checkFailure && failure_) std::rethrow_exception(failure_);
         auto result = state_;
         const auto queue = queue_.stats();
         result.queued = queue.size;

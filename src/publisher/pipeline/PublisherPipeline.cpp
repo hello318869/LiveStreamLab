@@ -1,4 +1,5 @@
 #include "publisher/pipeline/PublisherPipeline.hpp"
+#include "publisher/pipeline/PublisherSession.hpp"
 #include "publisher/capture/MediaInput.hpp"
 #include "common/queue/BoundedBlockingQueue.hpp"
 #include "publisher/encoder/AudioEncoder.hpp"
@@ -16,6 +17,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -160,6 +162,7 @@ encoder::VideoEncoderOptions encoderOptions(const config::PublisherConfig& confi
     options.gopSize = config.videoEncoder.gopSize;
     options.preset = config.videoEncoder.preset;
     options.lowLatency = config.videoEncoder.lowLatency;
+    options.captureTelemetry = config.capture.source != "file";
     // 编码会话的颜色描述与首个预处理帧一致，并写入 H.264 / MP4 流参数。
     options.colorRange = firstFrame.color_range;
     options.colorSpace = firstFrame.colorspace;
@@ -170,6 +173,73 @@ encoder::VideoEncoderOptions encoderOptions(const config::PublisherConfig& confi
     options.globalHeader = !config.videoFile.empty() || config.streaming.enabled;
     return options;
 }
+
+// 只在视频处理线程中使用。没有回调时不创建 scaler 或 RGB 缓冲。
+class PreviewConverter {
+public:
+    PreviewConverter(const PublisherPreviewCallback& callback, logging::Logger& logger) noexcept
+        : callback_(callback), logger_(logger) {}
+
+    void publish(const AVFrame& frame) noexcept {
+        if (!callback_) return;
+        const auto now = Clock::now();
+        if (now < nextFrame_) return;
+        nextFrame_ = now + std::chrono::milliseconds(125);
+        try {
+            if (frame.width <= 0 || frame.height <= 0) {
+                throw error::AppError("publisher-preview", error::Io, "invalid preview source size");
+            }
+            const double ratio = std::min({1.0, 960.0 / frame.width, 540.0 / frame.height});
+            auto preview = std::make_shared<PublisherPreviewFrame>();
+            preview->width = std::clamp(static_cast<int>(frame.width * ratio), 1, 960);
+            preview->height = std::clamp(static_cast<int>(frame.height * ratio), 1, 540);
+            preview->stride = (preview->width * 3 + 31) & ~31;
+            // 对齐行与尾部 padding 供 swscale SIMD 安全写入；最多约 1.49 MiB/帧。
+            preview->pixels.resize(static_cast<std::size_t>(preview->stride) * preview->height
+                + AV_INPUT_BUFFER_PADDING_SIZE);
+            scaler_.reset(sws_getCachedContext(scaler_.release(), frame.width, frame.height,
+                static_cast<AVPixelFormat>(frame.format), preview->width, preview->height,
+                AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr));
+            if (!scaler_) throw error::AppError("publisher-preview", error::Io, "cannot create preview scaler");
+            int colorspace = SWS_CS_ITU601;
+            if (frame.colorspace == AVCOL_SPC_BT709) colorspace = SWS_CS_ITU709;
+            else if (frame.colorspace == AVCOL_SPC_BT2020_NCL || frame.colorspace == AVCOL_SPC_BT2020_CL) {
+                colorspace = SWS_CS_BT2020;
+            }
+            const auto* coefficients = sws_getCoefficients(colorspace);
+            error::throwIfFFmpegFailed(sws_setColorspaceDetails(scaler_.get(), coefficients,
+                frame.color_range == AVCOL_RANGE_JPEG ? 1 : 0, coefficients, 1,
+                0, 1 << 16, 1 << 16), "publisher-preview", "configure preview colors");
+            std::array<std::uint8_t*, 4> destination{preview->pixels.data(), nullptr, nullptr, nullptr};
+            std::array<int, 4> strides{preview->stride, 0, 0, 0};
+            const int rows = sws_scale(scaler_.get(), frame.data, frame.linesize, 0, frame.height,
+                destination.data(), strides.data());
+            if (rows != preview->height) {
+                throw error::AppError("publisher-preview", error::Io, "preview conversion returned an incomplete frame");
+            }
+            preview->sequence = ++sequence_;
+            callback_(std::move(preview));
+            warned_ = false;
+        } catch (const std::exception& problem) {
+            if (!warned_) logger_.log(logging::Level::Warn, "publisher-preview", problem.what());
+            warned_ = true;
+            try { callback_({}); } catch (...) {}
+        } catch (...) {
+            if (!warned_) logger_.log(logging::Level::Warn, "publisher-preview", "unknown preview conversion failure");
+            warned_ = true;
+            try { callback_({}); } catch (...) {}
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    const PublisherPreviewCallback& callback_;
+    logging::Logger& logger_;
+    media::SwsContextPtr scaler_;
+    Clock::time_point nextFrame_{};
+    std::uint64_t sequence_ = 0;
+    bool warned_ = false;
+};
 } // namespace
 
 int runPublisher(const config::PublisherConfig& config,
@@ -197,6 +267,14 @@ int runPublisher(const config::PublisherConfig& config,
     }
 
     SignalScope signals;
+    return runPublisherPipeline(config, logger, stopRequested);
+}
+
+int runPublisherPipeline(const config::PublisherConfig& config, logging::Logger& logger,
+                         const std::atomic<bool>& stop,
+                         const PublisherStatsCallback& callback,
+                         const PublisherPreviewCallback& previewCallback) {
+    if (stop.load(std::memory_order_relaxed)) return 0;
     using Clock = std::chrono::steady_clock;
     struct RawFrame {
         capture::CapturedFrame captured;
@@ -218,6 +296,9 @@ int runPublisher(const config::PublisherConfig& config,
     const bool realtime = config.capture.source != "file" || config.capture.realtime;
     const auto originUs = config.capture.source == "file" ? std::int64_t{0} : av_gettime_relative();
     std::atomic<std::uint64_t> droppedVideo{0};
+    std::atomic<std::uint64_t> capturedVideoFrames{0};
+    std::atomic<std::uint64_t> encodedVideoFrames{0};
+    std::atomic<std::uint64_t> preprocessVideoDrops{0};
     std::atomic<std::size_t> done{0};
     std::atomic<unsigned> encodersLeft{2};
     std::atomic<bool> cancelling{false};
@@ -267,6 +348,14 @@ int runPublisher(const config::PublisherConfig& config,
     };
     const auto joinAll = [&] {
         for (auto& worker : workers) if (worker.joinable()) worker.join();
+        // 异常时输出线程可能未走到 finish；末次队列快照之前也回收 RTMP 线程。
+        if (streaming) {
+            try { streaming->finish(); }
+            catch (...) {
+                if (!failure) failure = std::current_exception();
+                failed.store(true);
+            }
+        }
     };
     // 工作线程统一异常边界；异常产生处立即中断其他阶段，避免主线程 join 时才发现阻塞。
     const auto launch = [&](auto work) {
@@ -277,7 +366,40 @@ int runPublisher(const config::PublisherConfig& config,
             changed.notify_all();
         });
     };
-    const auto reportQueues = [&] {
+    const auto pipelineSnapshot = [&] {
+        PublisherPipelineStats result;
+        auto& performance = result.performance;
+        const auto video = videoFrames.stats();
+        const auto audio = audioFrames.stats();
+        const auto events = output.stats();
+        performance.capturedVideoFrames = capturedVideoFrames.load(std::memory_order_relaxed);
+        performance.encodedVideoFrames = encodedVideoFrames.load(std::memory_order_relaxed);
+        performance.rawVideo = {video.size, video.capacity, video.highWaterMark};
+        performance.rawAudio = {audio.size, audio.capacity, audio.highWaterMark};
+        performance.outputEvents = {events.size, events.capacity, events.highWaterMark};
+        performance.rawVideoDrops = droppedVideo.load(std::memory_order_relaxed) + video.discarded;
+        performance.preprocessVideoDrops = preprocessVideoDrops.load(std::memory_order_relaxed);
+        performance.droppedVideoFrames = performance.rawVideoDrops + performance.preprocessVideoDrops;
+        performance.abortedOutputEvents = events.discarded;
+        result.encodedVideoFrames = performance.encodedVideoFrames;
+        if (streaming) {
+            const auto network = streaming->stats();
+            result.sentPackets = network.sentPackets;
+            result.sentBytes = network.sentBytes;
+            result.networkState = network.network.state;
+            performance.sentBytes = network.sentBytes;
+            performance.networkPackets = {network.queuedPackets,
+                static_cast<std::size_t>(config.streaming.queueCapacity), network.queueHighWaterMark};
+            performance.networkVideoPackets = network.videoQueued;
+            performance.networkAudioPackets = network.audioQueued;
+            performance.droppedPackets = network.droppedPackets;
+        }
+        return result;
+    };
+    auto cliSampleAt = Clock::now();
+    stats::PublisherPerformance cliPrevious;
+    stats::PublisherPerformance cliRates;
+    const auto reportQueues = [&](bool terminal = false) {
         const auto video = videoFrames.stats();
         const auto audio = audioFrames.stats();
         const auto packets = output.stats();
@@ -315,6 +437,47 @@ int runPublisher(const config::PublisherConfig& config,
                 + " last_error_code=" + std::to_string(stats.network.lastErrorCode)
                 + " last_error=" + stats.network.lastErrorMessage);
         }
+        auto performance = pipelineSnapshot().performance;
+        const auto now = Clock::now();
+        const double seconds = std::chrono::duration<double>(now - cliSampleAt).count();
+        const auto delta = [](std::uint64_t value, std::uint64_t previous) {
+            return value >= previous ? value - previous : std::uint64_t{0};
+        };
+        // 一秒日志使用自己的测量窗口；终态不把极短尾窗放大成速率尖峰。
+        if (!terminal && seconds >= 0.2) {
+            cliRates.captureFps = static_cast<double>(delta(performance.capturedVideoFrames,
+                cliPrevious.capturedVideoFrames)) / seconds;
+            cliRates.encodeFps = static_cast<double>(delta(performance.encodedVideoFrames,
+                cliPrevious.encodedVideoFrames)) / seconds;
+            cliRates.sendBitrate = static_cast<double>(delta(performance.sentBytes,
+                cliPrevious.sentBytes)) * 8 / seconds;
+            cliRates.sampled = true;
+            cliPrevious = performance;
+            cliSampleAt = now;
+        }
+        performance.sampled = cliRates.sampled;
+        performance.captureFps = terminal ? 0 : cliRates.captureFps;
+        performance.encodeFps = terminal ? 0 : cliRates.encodeFps;
+        performance.sendBitrate = terminal ? 0 : cliRates.sendBitrate;
+        logger.log(logging::Level::Info, "performance", "M16 publisher sampled=" + std::to_string(performance.sampled)
+            + " terminal=" + std::to_string(terminal)
+            + " capture_fps=" + std::to_string(performance.captureFps)
+            + " encode_fps=" + std::to_string(performance.encodeFps)
+            + " send_payload_bps=" + std::to_string(performance.sendBitrate)
+            + " captured_video=" + std::to_string(performance.capturedVideoFrames)
+            + " encoded_video=" + std::to_string(performance.encodedVideoFrames)
+            + " sent_payload_bytes=" + std::to_string(performance.sentBytes)
+            + " video_frame_drops=" + std::to_string(performance.droppedVideoFrames)
+            + " raw_video_drops=" + std::to_string(performance.rawVideoDrops)
+            + " preprocess_video_drops=" + std::to_string(performance.preprocessVideoDrops)
+            + " aborted_output_events=" + std::to_string(performance.abortedOutputEvents)
+            + " network_packet_drops=" + std::to_string(performance.droppedPackets));
+    };
+    const auto reportStats = [&](bool terminal = false) {
+        if (!callback) return;
+        auto snapshot = pipelineSnapshot();
+        snapshot.finished = terminal;
+        callback(snapshot);
     };
     const auto sendParameters = [&](capture::Kind kind, media::CodecParametersPtr parameters, AVRational timeBase) {
         OutputEvent event;
@@ -343,6 +506,7 @@ int runPublisher(const config::PublisherConfig& config,
     };
 
     logger.log(logging::Level::Info, "pipeline", "M14 bounded capture -> preprocessing/encoding -> mux/output pipeline started. Ctrl+C stops processing.");
+    if (stop.load(std::memory_order_relaxed)) return 0;
     try {
         // 本地两个封装上下文只在此线程创建、写入、写尾与销毁。
         // RTMP 则由已有的唯一发送线程执行 FLV 和网络 I/O。
@@ -404,11 +568,13 @@ int runPublisher(const config::PublisherConfig& config,
         launch([&] {
             std::unique_ptr<preprocess::VideoPreprocessor> video;
             std::unique_ptr<encoder::VideoEncoder> encoder;
+            PreviewConverter preview(previewCallback, logger);
             bool reported = false;
             std::uint64_t inputFrames = 0;
             const auto consume = [&](std::vector<media::FramePtr> frames) {
                 for (const auto& frame : frames) {
                     if (failed.load()) return;
+                    preview.publish(*frame);
                     if (!reported) {
                         logger.log(logging::Level::Info, "preprocess", "video output: " + describe(*frame, capture::Kind::Video)
                             + " pts=" + std::to_string(frame->pts) + " time_base="
@@ -422,7 +588,10 @@ int runPublisher(const config::PublisherConfig& config,
                             + " bitrate=" + std::to_string(config.video.bitrate)
                             + " gop=" + std::to_string(config.videoEncoder.gopSize));
                     }
-                    if (!sendPackets(capture::Kind::Video, encoder->encode(*frame))) return;
+                    auto packets = encoder->encode(*frame);
+                    // 只读取编码线程自己拥有的编码器；协调线程读取原子计数。
+                    encodedVideoFrames.store(encoder->stats().inputFrames, std::memory_order_relaxed);
+                    if (!sendPackets(capture::Kind::Video, std::move(packets))) return;
                 }
             };
             RawFrame raw;
@@ -436,11 +605,17 @@ int runPublisher(const config::PublisherConfig& config,
                 }
                 if (!video) video = std::make_unique<preprocess::VideoPreprocessor>(videoOptions(config), originUs);
                 ++inputFrames;
-                consume(video->process(*raw.captured.frame, raw.captured.timestampUs));
+                auto processed = video->process(*raw.captured.frame, raw.captured.timestampUs);
+                preprocessVideoDrops.store(video->stats().droppedFrames, std::memory_order_relaxed);
+                consume(std::move(processed));
                 raw = RawFrame{};
             }
             if (!failed.load()) {
-                if (video) consume(video->flush());
+                if (video) {
+                    auto processed = video->flush();
+                    preprocessVideoDrops.store(video->stats().droppedFrames, std::memory_order_relaxed);
+                    consume(std::move(processed));
+                }
                 if (encoder) sendPackets(capture::Kind::Video, encoder->flush());
                 finishTrack(capture::Kind::Video);
             }
@@ -555,6 +730,10 @@ int runPublisher(const config::PublisherConfig& config,
                     if (config.capture.source == "file" || kinds[i] == capture::Kind::Video) videoFrames.close();
                     if (config.capture.source == "file" || kinds[i] == capture::Kind::Audio) audioFrames.close();
                 };
+                if (cancelling.load() || stop.load(std::memory_order_relaxed)) {
+                    closeQueues();
+                    return;
+                }
                 try {
                     // dshow COM、解复用、输入解码和释放均留在所属采集线程。
                     if (config.capture.source == "file") input.openFile(config);
@@ -571,7 +750,11 @@ int runPublisher(const config::PublisherConfig& config,
                     logger.log(logging::Level::Info, "capture", "Opened source: " + input.sourceDescription());
                     while (!cancelling.load()) {
                         auto captured = input.readFrame();
-                        if (!captured || cancelling.load()) break;
+                        if (!captured) break;
+                        if (captured->kind == capture::Kind::Video) {
+                            capturedVideoFrames.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (cancelling.load()) break;
                         auto& count = captured->kind == capture::Kind::Video ? videoCount : audioCount;
                         if (count++ == 0) logger.log(logging::Level::Info, "capture",
                             std::string(capture::kindName(captured->kind)) + " input: " + describe(*captured->frame, captured->kind));
@@ -606,10 +789,15 @@ int runPublisher(const config::PublisherConfig& config,
         }
         const auto expected = workers.size();
         auto nextReport = Clock::now() + std::chrono::seconds(1);
+        auto nextStats = Clock::now();
         while (done.load() != expected) {
             if (streaming) streaming->checkError();
             if (failed.load()) stopAll(true);
-            else if (stopRequested.load() && !cancelling.load()) stopAll(false);
+            else if (stop.load(std::memory_order_relaxed) && !cancelling.load()) stopAll(false);
+            if (Clock::now() >= nextStats) {
+                reportStats();
+                nextStats = Clock::now() + std::chrono::milliseconds(250);
+            }
             if (Clock::now() >= nextReport) {
                 reportQueues();
                 nextReport = Clock::now() + std::chrono::seconds(1);
@@ -623,10 +811,18 @@ int runPublisher(const config::PublisherConfig& config,
     } catch (...) {
         stopAll(true);
         joinAll();
+        // 保留原始媒体/线程错误，不能让末次观察回调覆盖它。
+        try { reportStats(true); } catch (...) {}
+        try { reportQueues(true); } catch (...) {}
         throw;
     }
-    if (failure) std::rethrow_exception(failure);
-    reportQueues();
+    if (failure) {
+        try { reportStats(true); } catch (...) {}
+        try { reportQueues(true); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+    reportStats(true);
+    reportQueues(true);
     return 0;
 }
 } // namespace lsl::pipeline

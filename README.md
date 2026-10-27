@@ -3,7 +3,8 @@
 C++17 + FFmpeg + SDL3 音视频直播学习工程，详细模块见上级目录的 `方案.md`。
 当前已实现 M01 基础框架、M02 音视频输入、M03/M04 音视频预处理、M05/M06 视频/音频编码、
 M07 FLV/RTMP 推流、M09 网络拉流及解封装、M10 视频解码、M11 音频解码播放、M12 SDL3 视频显示、
-M13 音画同步、M14 多线程有界流水线与 M15 网络可靠性/状态管理。主播端可以枚举设备、查看能力、
+M13 音画同步、M14 多线程有界流水线、M15 网络可靠性/状态管理，及 M16 Qt Widgets 控制与性能统计。
+主播端可以枚举设备、查看能力、
 默认采集 Windows 桌面画面，摄像头可选；音频可选择麦克风或系统声音，也支持按时间戳读取、循环本地文件。
 视频经过格式转换、缩放、帧率控制及可选画面处理；音频经过重采样、声道转换和固定帧长缓存。
 视频继续编码为 H.264，默认自动保存到 `output/video.mp4`；目录不存在时自动创建。
@@ -26,7 +27,11 @@ M08 SRS 部署仍按原阶段单独安排。
 ## 直接使用 CMake 构建
 
 依赖 CMake ≥ 3.24、支持 C++17 的编译器，以及含 **libavdevice** 的 FFmpeg ≥ 6 开发 SDK。
-SDL3 与 nlohmann/json 已放在 `external/`，不需要单独安装。Windows 安装 Visual Studio
+SDL3、nlohmann/json 已放在 `external/`。主播控制窗口另需 Qt 6.5+ Widgets SDK，
+本机已配置 `external/qt/6.8.3/msvc2022_64`，CMake 会自动查找；其他机器可指定
+`-DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64"`。仅构建 CLI 时同时指定
+`-DLSL_BUILD_PUBLISHER_GUI=OFF -DLSL_BUILD_PLAYER_GUI=OFF`，即可不依赖 Qt。
+Windows 安装 Visual Studio
 的“使用 C++ 的桌面开发”组件后，在 PowerShell 中执行：
 
 ```powershell
@@ -63,6 +68,20 @@ cmake --build build/cmake --parallel
 配置时加 `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON` 后重新构建即可；当前 `build/cmake` 已设置此选项。
 
 ## 使用主播端
+
+M16.1 图形主播控制窗口（详细说明见 [主播控制](docs/publisher-control.md)）：
+
+```powershell
+.\build\cmake\bin\Release\publisher_gui.exe --config config\publisher-stream.json
+```
+
+打开窗口后选择桌面/摄像头、麦克风/系统声音及 RTMP 地址，点击“开始直播”；
+深色工作台提供左侧导航、中间真实视频预览与统计卡片、右侧采集/推流设置，以及底部事件日志。
+可先开启不连接服务器的视频预览，再开始直播；窗口展示实际状态、直播时长、视频编码 FPS
+和推流 payload 码率，支持停止后再次启动。
+进入窗口不会自动采集或连接。GUI 专用于设备直播，不生成本地 MP4/M4A；
+编码、超时和重连参数继承 JSON/命令行配置。原有 `publisher` 命令行入口继续可用。
+GUI 默认参与 CMake 构建；仅需命令行程序时可配置 `-DLSL_BUILD_PUBLISHER_GUI=OFF`。
 
 以下命令在工程根目录执行，采用 Visual Studio 生成器的产物路径：
 
@@ -146,6 +165,17 @@ SRS 在另一台机器时，将推流与播放 URL 中的 `127.0.0.1` 换成服�
 
 ## M09–M13 拉流、解码与同步播放
 
+M16.2 的 Qt Widgets 观众控制窗口可直接启动：
+
+```powershell
+.\build\cmake\bin\Release\player_gui.exe --config config\player.json
+```
+
+在窗口中填写 RTMP/RTMPS 或 HTTP/HTTPS-FLV 地址，点击“连接直播”。支持停止后重新连接、
+静音、音量、暂停/继续、全屏切换和实际播放状态。视频嵌入 Qt 窗口，沿用现有音画同步与重连逻辑。
+进入窗口不会自动连接网络或打开音频；操作和线程边界见 [观众控制](docs/player-control.md)。
+`LSL_BUILD_PLAYER_GUI` 默认开启，原有 `player` SDL 命令行播放器继续可用。
+
 先准备正在推流的 SRS。以下是从工程根目录构建和启动的方法；启动命令本次未执行：
 
 ```powershell
@@ -187,6 +217,11 @@ PCM 环默认容量时长为 100 ms；开流不额外等待视频帧率统计，
 接口和网络缓冲见 [M09 说明](docs/network-demuxing.md)，播放路径与边界见 [M10/M12 说明](docs/video-playback.md)。
 
 ## M14 队列与并发控制
+
+M16.3 已在两端加入性能统计：主播端右侧显示采集/编码 FPS、发送吞吐与队列；观众端在
+播放控制下方显示解码 FPS、接收吞吐、同步误差及端到端估计，点击“详情”展开队列和丢弃计数。
+端到端使用设备采集时间戳随 H.264 SEI 传输，并在实际绘制后采样，跨机依赖系统时钟同步；
+无时间戳的流显示不可测。完整口径见 [性能统计](docs/performance-statistics.md)。
 
 `src/common/queue/BoundedBlockingQueue.hpp` 提供有界阻塞队列，支持移动独占帧/包、超时交接、
 关闭后排空、故障中止及积压峰值统计。主播端默认限制原始视频 8 帧、原始音频 32 块、

@@ -17,7 +17,7 @@ struct VideoRenderStats {
     std::uint64_t renderedFrames = 0;
     std::uint64_t textureUploads = 0;
     std::uint64_t droppedFrames = 0;
-    std::uint64_t renderTimeUs = 0; // 上传、绘制与提交耗时，包含垂直同步等待。
+    std::uint64_t renderTimeUs = 0; // 后端 render 调用耗时；SDL 后端包含上传、绘制及垂直同步等待。
     std::uint64_t textureRebuilds = 0;
 };
 
@@ -27,7 +27,8 @@ struct AudioControls {
     int volumeDelta = 0;
 };
 
-// 窗口事件与视频显示由主线程调用；同步/流水线只依赖此接口。
+// 由一个协调线程独占。窗口后端必须在应用主线程调用；无窗口的帧交接后端可在后台协调线程使用。
+// 同步/流水线只依赖此接口，后端不能跨线程直接更新 UI 控件。
 class IVideoRenderer {
 public:
     virtual ~IVideoRenderer() = default;

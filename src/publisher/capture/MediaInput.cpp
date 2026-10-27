@@ -1,6 +1,7 @@
 #include "publisher/capture/MediaInput.hpp"
 #include "publisher/capture/DeviceManager.hpp"
 #include "publisher/capture/SystemAudioInput.hpp"
+#include "common/stats/CaptureTimestamp.hpp"
 
 extern "C" {
 #include <libavcodec/codec_desc.h>
@@ -212,6 +213,8 @@ struct MediaInput::Impl {
         const auto timeBase = stream->time_base;
         const auto capturedUs = av_gettime_relative();
         frame->time_base = timeBase;
+        // 设备采集解码输出的应用时刻，不是摄像头曝光时间；文件保持原媒体时间语义。
+        if (!file && decoder.kind == Kind::Video) static_cast<void>(stats::stampCaptureTime(*frame));
         std::int64_t timestampUs = capturedUs;
         if (file) {
             auto pts = frame->best_effort_timestamp;

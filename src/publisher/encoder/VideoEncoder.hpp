@@ -18,6 +18,7 @@ struct VideoEncoderOptions {
     std::string preset = "veryfast"; // libx264 的编码速度预设；libopenh264 使用自身默认策略。
     bool lowLatency = true;
     bool globalHeader = false;     // 写 MP4 等容器时由输出格式的 AVFMT_GLOBALHEADER 决定。
+    bool captureTelemetry = false; // 设备采集的时间戳 UDU SEI；仅 libx264 支持，文件转推流关闭。
     // 用首个预处理帧的描述初始化编码器，使 H.264 VUI / 容器参数与实际像素一致。
     AVColorRange colorRange = AVCOL_RANGE_UNSPECIFIED;
     AVColorSpace colorSpace = AVCOL_SPC_UNSPECIFIED;

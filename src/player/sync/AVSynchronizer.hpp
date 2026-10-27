@@ -37,7 +37,7 @@ struct SyncInput {
     bool canResynchronize = true; // 任一解码线程已经结束时不能再要求它处理 Reset。
 };
 
-// 由 SDL 主线程独占；只决定帧的去留，不拥有帧、不休眠、不调用设备或网络。
+// 由播放协调线程独占；只决定帧的去留，不拥有帧、不休眠、不调用设备或网络。
 // 输入的两路时间戳已由解码器 av_rescale_q 到 AV_TIME_BASE 的微秒，不能分别归零。
 class AVSynchronizer {
 public:

@@ -120,6 +120,7 @@ struct VideoEncoder::Impl {
         if (x264) {
             setOption(codecOptions, "preset", options.preset.c_str());
             if (options.lowLatency) setOption(codecOptions, "tune", "zerolatency");
+            if (options.captureTelemetry) setOption(codecOptions, "udu_sei", "1");
         }
         auto* raw = codecOptions.release();
         const int result = avcodec_open2(context.get(), codec, &raw);

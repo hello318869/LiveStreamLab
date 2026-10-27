@@ -19,6 +19,19 @@ M14 的 `common/queue/BoundedBlockingQueue.hpp` 提供通用有界阻塞队列�
 M15 的 `common/utils/NetworkStatus.hpp` 提供两端共享网络状态、统计和退避工具；
 `RtmpPublisher` 与 `Demuxer` 仍各自独占实际会话，包含可取消 I/O、媒体进展检测及重试/重建。
 观众端断线时以空流快照撤销旧解码状态，再交付重新探测的新参数；说明见 [M15](network-reliability.md)。
+M16.1 的 `lsl_publisher_ui` 组合 Qt Widgets 与 `PublisherSession`，接入独立的
+`publisher_gui` 入口。会话在线程中运行主播流水线，Qt 主线程管理窗口、配置、停止请求和状态快照；
+不会让 UI 访问媒体队列或跨线程销毁 FFmpeg 对象。说明见 [主播控制](publisher-control.md)。
+视频处理线程以约 8 FPS 发布不超过 960x540 的 RGB24 不可变副本，会话只保留最新预览；
+Qt 主线程复制为 QImage 绘制。日志使用 Logger 的有界内存副本，界面通过游标轮询。
+M16.2 的 `lsl_player_ui` 接入独立 `player_gui`，由 `PlayerSession` 的后台协调线程复用
+`runPlayerPipeline` 的解码、音频和同步调度，使用无窗口的 RGB 交接实现 `IVideoRenderer`。
+Qt 主线程绘制最新 QImage；SDL 音频子系统在主线程创建/销毁，后台只操作已有音频输出接口。
+CLI 的 SDL 窗口仍留在主线程。控制与资源边界见 [观众控制](player-control.md)。
+M16.3 的 `common/stats` 定义性能快照和设备采集时间戳载荷。采集/编码/解码的所属线程更新计数，
+协调线程按单调时钟计算速率及队列快照，Qt 界面读取并展示。设备 libx264 路径以 UDU SEI
+携带采集 Unix 时间戳；Qt 绘制完成回报后形成采集到显示估计。定义、有效性和时钟边界见
+[性能统计](performance-statistics.md)。
 
 2026-10-25 按《方案.md》统一目录与命名空间，运行逻辑保持原样：
 
@@ -29,7 +42,8 @@ src/publisher/
 ├── encoder/       # lsl::encoder：AudioEncoder、VideoEncoder
 ├── muxer/         # lsl::muxer：AudioFileWriter、VideoFileWriter
 ├── rtmp/          # lsl::rtmp：RtmpPublisher
-└── pipeline/      # lsl::pipeline：PublisherPipeline，统一编排 runPublisher
+├── pipeline/      # lsl::pipeline：PublisherPipeline、PublisherSession
+└── ui/            # lsl::ui：Qt Widgets 主播控制，lsl_publisher_ui
 ```
 
 `RtmpPublisher` 保留 FLV 与网络会话的完整实现。上面的目录整理于 2026-10-25 完成，
@@ -91,7 +105,8 @@ src/player/
 ├── renderer/      # lsl::renderer：IVideoRenderer、SDLVideoRenderer
 ├── audio/         # lsl::audio：IAudioSink、SDLAudioSink、有界 SPSC 环形缓冲
 ├── sync/          # lsl::sync：AVSynchronizer、音频主时钟与外部时钟降级
-└── pipeline/      # lsl::player：runPlayer、VideoWorker、AudioPlayback、视频队列与调度
+├── pipeline/      # lsl::player：runPlayer/runPlayerPipeline、PlayerSession、AudioPlayback 与调度
+└── ui/            # lsl::ui：Qt Widgets 观众控制，lsl_player_ui
 
 player_main
   └─ runConfigApp：命令行 → JSON → 校验 → 日志 → 顶层异常边界

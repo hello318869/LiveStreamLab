@@ -199,7 +199,7 @@ std::string commandLineHelp(AppKind app) {
                 "  --audio-buffer-ms MS    PCM ring capacity (100..2000; default: 100)\n"
                 "  --volume N              Player audio volume (0..100; default: 100)\n"
                 "  --mute BOOL             Mute audio (default: false)\n"
-                "  --audio-paused BOOL     Start with audio paused (default: false)\n"
+                "  --audio-paused BOOL     Start with audio/video paused (default: false)\n"
                 "  --connect-timeout MS     Input connection/probe timeout (100..60000)\n"
                 "  --read-timeout MS        Input packet read timeout (100..60000)\n"
                 "  --reconnect-attempts N   Retry 0..100 times; 0 disables, -1 retries until stopped\n"
@@ -219,10 +219,11 @@ std::string commandLineHelp(AppKind app) {
                 "Use config/publisher-stream.json for RTMP output without separate local recordings.\n"
                 "Streaming a local file requires --realtime true.\n";
     } else {
-        help += "Player receives RTMP/RTMPS or HTTP/HTTPS-FLV, decodes and plays video/audio with SDL3 (M09-M12).\n"
-                "F / Alt+Enter / double click: fullscreen; Escape / close / Ctrl+C: stop.\n"
-                "Space: pause audio only; M: mute; Up/Down: volume +/-10%.\n"
-                "Video follows its own PTS clock; audio/video synchronization (M13) is not implemented.\n";
+        help += "Player receives RTMP/RTMPS or HTTP/HTTPS-FLV with audio/video synchronization (M09-M15).\n"
+                "CLI window: F / Alt+Enter / double click fullscreen; Escape / close / Ctrl+C stop.\n"
+                "CLI window: Space pauses audio/video; M mutes; Up/Down changes volume by 10%.\n"
+                "player_gui provides Qt Widgets viewer controls (M16.2); see docs/player-control.md.\n"
+                "In player_gui, Escape leaves fullscreen; use Stop or close the window to stop playback.\n";
     }
     return help;
 }

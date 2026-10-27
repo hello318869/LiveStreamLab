@@ -41,9 +41,10 @@ Logger::Logger(Options options) : options_(std::move(options)) {
 }
 
 bool Logger::log(Level level, std::string_view module, std::string_view message, int code) noexcept {
-    if (level < options_.level || !hasOutput()) return true;
+    if (level < options_.level) return true;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!hasOutput() && memoryLimit_ == 0) return true;
         const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         std::tm utc{};
 #ifdef _WIN32
@@ -65,10 +66,30 @@ bool Logger::log(Level level, std::string_view module, std::string_view message,
         const auto line = out.str();
         if (options_.console) std::cerr << line << std::flush;
         if (file_.is_open()) file_ << line << std::flush;
+        if (memoryLimit_ != 0) {
+            recent_.emplace_back(nextLine_++, line);
+            while (recent_.size() > memoryLimit_) recent_.pop_front();
+        }
         return (!options_.console || std::cerr.good()) && (!file_.is_open() || file_.good());
     } catch (...) {
         return false;
     }
+}
+
+void Logger::enableMemoryLog(std::size_t maxLines) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    memoryLimit_ = maxLines;
+    while (recent_.size() > memoryLimit_) recent_.pop_front();
+}
+
+std::vector<std::string> Logger::linesSince(std::uint64_t& cursor) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> lines;
+    for (const auto& entry : recent_) {
+        if (entry.first > cursor) lines.push_back(entry.second);
+    }
+    if (!recent_.empty()) cursor = recent_.back().first;
+    return lines;
 }
 
 } // namespace lsl::logging
