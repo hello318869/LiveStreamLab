@@ -37,7 +37,7 @@
 ```powershell
 cd D:\直播\LiveStreamLab
 cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF
-cmake --build build/cmake --config Release --target publisher --parallel
+cmake --build build/cmake --config Release --target livestreamlab --parallel
 ```
 
 本机完整构建的 SDL 预编译头遇到中文路径编码错误，已通过 CMake 缓存选项
@@ -47,13 +47,13 @@ cmake --build build/cmake --config Release --target publisher --parallel
 
 ```powershell
 # 沿用采集配置；视频自动写入 output/video.mp4，Ctrl+C 正常停止并写尾
-.\build\cmake\bin\Release\publisher.exe --config config\publisher.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
 
 # 本地文件经过 M02 解码、M03 预处理和 M05 重编码；EOF 后写尾退出
-.\build\cmake\bin\Release\publisher.exe --source file --input-file "D:\media\sample.mp4" --capture-audio false --video-file output/file-video.mp4
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --capture-audio false --video-file output/file-video.mp4
 
 # 调整目标码率、GOP、速度预设与低延迟策略
-.\build\cmake\bin\Release\publisher.exe --video-file output/video-02.mp4 --video-bitrate 3000000 --fps 30 --gop-size 60 --preset fast --low-latency true
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --video-file output/video-02.mp4 --video-bitrate 3000000 --fps 30 --gop-size 60 --preset fast --low-latency true
 ```
 
 JSON 中的 `output.video_file` 设为 `""`，或使用 `--set output.video_file=`，

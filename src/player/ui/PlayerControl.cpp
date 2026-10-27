@@ -8,6 +8,7 @@
 #include <QByteArray>
 #include <QCloseEvent>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QFont>
 #include <QFrame>
 #include <QGridLayout>
@@ -21,7 +22,6 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
-#include <QPalette>
 #include <QPlainTextEdit>
 #include <QPolygonF>
 #include <QPushButton>
@@ -283,7 +283,11 @@ public:
         auto* brandMark = new QLabel; brandMark->setPixmap(icon(Glyph::Studio).pixmap(30, 30)); header->addWidget(brandMark);
         header->addWidget(label(QStringLiteral("LOCAL LIVE"), "brand"));
         header->addWidget(label(QStringLiteral("观众播放器"), "fieldLabel")); header->addStretch();
-        status_ = label(QStringLiteral("●  未连接"), "status"); header->addWidget(status_); layout->addLayout(header);
+        status_ = label(QStringLiteral("●  未连接"), "status"); header->addWidget(status_);
+        auto* home = new QPushButton(QStringLiteral("返回首页"));
+        home->setObjectName(QStringLiteral("link")); home->setCursor(Qt::PointingHandCursor);
+        home->setToolTip(QStringLiteral("停止当前播放后返回功能选择"));
+        connect(home, &QPushButton::clicked, this, &QWidget::close); header->addWidget(home); layout->addLayout(header);
         auto* addressPanel = new QFrame; addressPanel->setObjectName(QStringLiteral("panel"));
         auto* addressRow = new QHBoxLayout(addressPanel); addressRow->setContentsMargins(12, 9, 12, 9); addressRow->setSpacing(9);
         addressRow->addWidget(label(QStringLiteral("直播流地址"), "fieldLabel"));
@@ -363,8 +367,12 @@ public:
         logger_.log(logging::Level::Info, "player_ui", "Qt Widgets player ready; input opens only on Connect"); poll();
     }
     ~PlayerWindow() override { timer_->stop(); session_.requestStop(); }
-    void showConfigured() { show(); if (initial_.video.fullscreen) toggleFullscreen(); }
 protected:
+    void changeEvent(QEvent* event) override {
+        QWidget::changeEvent(event);
+        if (event->type() == QEvent::WindowStateChange && fullscreen_)
+            fullscreen_->setText(isFullScreen() ? QStringLiteral("退出全屏") : QStringLiteral("全屏"));
+    }
     void closeEvent(QCloseEvent* event) override {
         closing_ = true; session_.requestStop();
         if (active(session_.snapshot().state)) {
@@ -565,18 +573,7 @@ private:
 };
 } // namespace
 
-int runPlayerControl(const config::PlayerConfig& config,
-                     const config::CommandLineOptions& options, logging::Logger& logger) {
-    static_cast<void>(options);
-    int argc = 1; char name[] = "player_gui"; char* argv[]{name, nullptr};
-    QApplication app(argc, argv); QApplication::setStyle(QStringLiteral("Fusion"));
-    QFont font(QStringLiteral("Microsoft YaHei UI")); font.setPointSizeF(9.5); QApplication::setFont(font);
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor(11, 17, 21)); palette.setColor(QPalette::WindowText, QColor(197, 209, 213));
-    palette.setColor(QPalette::Base, QColor(11, 21, 28)); palette.setColor(QPalette::Text, QColor(197, 209, 213));
-    palette.setColor(QPalette::Button, QColor(20, 33, 41)); palette.setColor(QPalette::ButtonText, QColor(197, 209, 213));
-    palette.setColor(QPalette::Highlight, QColor(43, 85, 73)); palette.setColor(QPalette::HighlightedText, QColor(224, 239, 233));
-    QApplication::setPalette(palette);
-    PlayerWindow window(config, logger); window.showConfigured(); return app.exec();
+QWidget* createPlayerControl(const config::PlayerConfig& config, logging::Logger& logger) {
+    return new PlayerWindow(config, logger);
 }
 } // namespace lsl::ui

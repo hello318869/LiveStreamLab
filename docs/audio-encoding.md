@@ -79,13 +79,13 @@ cmake --build build/cmake --config Release --parallel
 
 ```powershell
 # 沿用配置，分别自动保存视频 MP4 与 AAC 音频 M4A；Ctrl+C 正常结束
-.\build\cmake\bin\Release\publisher.exe --config config\publisher.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
 
 # 只处理本地文件的音轨，EOF 后写尾退出
-.\build\cmake\bin\Release\publisher.exe --source file --input-file "D:\media\sample.mp4" --capture-video false --audio-file output/file-audio.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --capture-video false --audio-file output/file-audio.m4a
 
 # 设置音频码率；已有文件需换一个输出名称
-.\build\cmake\bin\Release\publisher.exe --audio-bitrate 192000 --audio-file output/audio-02.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --audio-bitrate 192000 --audio-file output/audio-02.m4a
 ```
 
 JSON 中设置 `output.audio_file` 为 `""`，或使用 `--set output.audio_file=`，可只编码和统计。

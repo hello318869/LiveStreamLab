@@ -18,13 +18,13 @@
 #include <QLineEdit>
 #include <QPainter>
 #include <QPainterPath>
-#include <QPalette>
 #include <QPlainTextEdit>
 #include <QPolygonF>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSizePolicy>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStandardItemModel>
 #include <QStyle>
@@ -43,6 +43,7 @@
 namespace lsl::ui {
 namespace {
 using State = pipeline::PublisherSessionState;
+constexpr int audioDeviceRole = Qt::UserRole + 1;
 
 QString utf8(const std::string& value) {
     return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
@@ -363,7 +364,12 @@ private:
             button->setCursor(Qt::PointingHandCursor); button->setProperty("active", i == 0);
             navigation_.push_back(button); layout->addWidget(button);
         }
-        layout->addStretch(); sidebarStatus_ = label(QStringLiteral("●  本机控制台 · 待机"), "subtle");
+        layout->addStretch();
+        auto* home = new QPushButton(QStringLiteral("返回首页"));
+        home->setObjectName(QStringLiteral("navButton")); home->setCursor(Qt::PointingHandCursor);
+        home->setToolTip(QStringLiteral("停止当前采集或直播后返回功能选择"));
+        connect(home, &QPushButton::clicked, this, &QWidget::close); layout->addWidget(home);
+        layout->addSpacing(12); sidebarStatus_ = label(QStringLiteral("●  本机控制台 · 待机"), "subtle");
         layout->addWidget(sidebarStatus_); layout->addSpacing(6);
         layout->addWidget(label(QStringLiteral("设备采集  →  RTMP 推流"), "subtle"));
         return side;
@@ -436,12 +442,9 @@ private:
         videoDescription_ = label(QStringLiteral("完整虚拟桌面，包含鼠标光标"), "subtle");
         videoDescription_->setWordWrap(true); devices->addWidget(videoDescription_); devices->addSpacing(7);
         sectionLabel(devices, QStringLiteral("音频源")); audioSource_ = new QComboBox;
-        audioSource_->addItem(QStringLiteral("麦克风"), QStringLiteral("microphone"));
-        audioSource_->addItem(QStringLiteral("系统声音"), QStringLiteral("system"));
-        audioSource_->setCurrentIndex(initial_.capture.audioSource == "system" ? 1 : 0); devices->addWidget(audioSource_);
-        microphoneLabel_ = label(QStringLiteral("麦克风设备 / 设备 ID"), "fieldLabel"); devices->addWidget(microphoneLabel_);
-        microphone_ = new QComboBox; microphone_->setEditable(true); microphone_->setMinimumContentsLength(12);
-        microphone_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); devices->addWidget(microphone_);
+        // 类型和具体设备在同一列表选择，避免可编辑设备框遮挡下拉入口。
+        audioSource_->setMinimumContentsLength(12);
+        audioSource_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); devices->addWidget(audioSource_);
         audioDescription_ = label({}, "subtle"); audioDescription_->setWordWrap(true); devices->addWidget(audioDescription_);
         refresh_ = new QPushButton(icon(Glyph::Refresh), QStringLiteral("刷新设备列表"));
         refresh_->setObjectName(QStringLiteral("smallButton")); devices->addWidget(refresh_);
@@ -499,8 +502,7 @@ private:
         layout->addStretch(); settingsScroll_->setWidget(content); outerLayout->addWidget(settingsScroll_);
 #ifndef _WIN32
         if (auto* model = qobject_cast<QStandardItemModel*>(videoSource_->model())) model->item(0)->setEnabled(false);
-        if (auto* model = qobject_cast<QStandardItemModel*>(audioSource_->model())) model->item(1)->setEnabled(false);
-        videoSource_->setCurrentIndex(1); audioSource_->setCurrentIndex(0);
+        videoSource_->setCurrentIndex(1);
 #endif
         return outer;
     }
@@ -560,10 +562,48 @@ private:
     }
     void refreshDevices() {
         const auto camera = camera_->count() ? deviceValue(camera_) : initial_.videoDevice;
-        const auto microphone = microphone_->count() ? deviceValue(microphone_) : initial_.audioDevice;
+        const auto audioSource = audioSource_->count() ? audioSource_->currentData().toString() : utf8(initial_.capture.audioSource);
+        const auto audioDevice = audioSource == QStringLiteral("microphone")
+            ? (audioSource_->count() ? audioSource_->currentData(audioDeviceRole).toString() : utf8(initial_.audioDevice))
+            : QStringLiteral("default");
         QStringList errors; fillDevices(camera_, capture::Kind::Video, camera, errors);
-        fillDevices(microphone_, capture::Kind::Audio, microphone, errors);
+        fillAudioSources(audioSource, audioDevice, errors);
         deviceError_->setText(errors.join(QLatin1Char('\n'))); deviceError_->setVisible(!errors.empty());
+        updateSourceDetails();
+    }
+    void fillAudioSources(const QString& selectedSource, const QString& selectedDevice, QStringList& errors) {
+        const QSignalBlocker blocker(audioSource_);
+        audioSource_->clear();
+        const auto addSource = [this](const QString& text, const QString& source, const QString& device) {
+            audioSource_->addItem(text, source);
+            const int index = audioSource_->count() - 1;
+            audioSource_->setItemData(index, device, audioDeviceRole);
+            audioSource_->setItemData(index, text + QLatin1Char('\n') + device, Qt::ToolTipRole);
+        };
+        addSource(QStringLiteral("麦克风：默认设备"), QStringLiteral("microphone"), QStringLiteral("default"));
+#ifdef _WIN32
+        addSource(QStringLiteral("系统声音：默认播放设备"), QStringLiteral("system"), QStringLiteral("default"));
+#endif
+        try {
+            for (const auto& device : capture::listDevices(capture::Kind::Audio))
+                addSource(QStringLiteral("麦克风：%1").arg(utf8(device.description)), QStringLiteral("microphone"), utf8(device.id));
+        } catch (const std::exception& problem) {
+            const auto message = QStringLiteral("麦克风枚举失败：%1").arg(QString::fromUtf8(problem.what()));
+            errors.push_back(message); logger_.log(logging::Level::Warn, "publisher_ui", bytes(message));
+        }
+        int selectedIndex = -1;
+        for (int i = 0; i < audioSource_->count(); ++i) {
+            if (audioSource_->itemData(i).toString() == selectedSource &&
+                audioSource_->itemData(i, audioDeviceRole).toString() == selectedDevice) {
+                selectedIndex = i; break;
+            }
+        }
+        if (selectedIndex < 0 && selectedSource == QStringLiteral("microphone") && !selectedDevice.isEmpty()) {
+            // 保留配置指定或刷新前选中的设备，不静默切换到默认麦克风。
+            addSource(QStringLiteral("麦克风：配置设备（未枚举到）"), selectedSource, selectedDevice);
+            selectedIndex = audioSource_->count() - 1;
+        }
+        audioSource_->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
     }
     void updateSourceDetails() {
         const bool camera = videoSource_->currentData().toString() == QStringLiteral("camera");
@@ -571,9 +611,12 @@ private:
         videoDescription_->setText(camera ? QStringLiteral("可选择设备或直接输入名称 / ID")
             : QStringLiteral("完整虚拟桌面，包含鼠标光标"));
         const bool microphone = audioSource_->currentData().toString() == QStringLiteral("microphone");
-        microphoneLabel_->setVisible(microphone); microphone_->setVisible(microphone);
-        audioDescription_->setText(microphone ? QStringLiteral("采集所选输入设备") : QStringLiteral("Windows 默认播放设备回采，不与麦克风混音"));
-        footerSources_->setText(videoSource_->currentText() + QStringLiteral("  ·  ") + audioSource_->currentText());
+        audioDescription_->setText(microphone ? QStringLiteral("直接在上方选择麦克风设备，可刷新设备列表")
+            : QStringLiteral("Windows 默认播放设备回采，不与麦克风混音"));
+        audioSource_->setToolTip(audioSource_->currentData(Qt::ToolTipRole).toString());
+        footerSources_->setText(videoSource_->currentText() + QStringLiteral("  ·  ")
+            + (microphone ? QStringLiteral("麦克风") : QStringLiteral("系统声音")));
+        footerSources_->setToolTip(audioSource_->currentText());
     }
     void updateOutputSummary() {
         const QSize size = resolution_->currentData().toSize(); preview_->setOutputSize(size);
@@ -587,7 +630,7 @@ private:
         config.capture.audioSource = bytes(audioSource_->currentData().toString());
         config.capture.video = true; config.capture.audio = true; config.capture.loop = false; config.capture.realtime = true;
         config.videoDevice = config.capture.videoSource == "camera" ? deviceValue(camera_) : "default";
-        config.audioDevice = config.capture.audioSource == "microphone" ? deviceValue(microphone_) : "default";
+        config.audioDevice = config.capture.audioSource == "microphone" ? bytes(audioSource_->currentData(audioDeviceRole).toString()) : "default";
         config.outputUrl = bytes(url_->text()); config.streaming.enabled = true; config.videoFile.clear(); config.audioFile.clear();
         const QSize size = resolution_->currentData().toSize(); config.video.width = size.width(); config.video.height = size.height();
         config.video.fps = targetFps_->value();
@@ -709,12 +752,12 @@ private:
     MetricCard *bitrate_ = nullptr, *fps_ = nullptr, *duration_ = nullptr, *connection_ = nullptr;
     QPushButton *start_ = nullptr, *stop_ = nullptr, *previewButton_ = nullptr, *refresh_ = nullptr,
         *copyAddress_ = nullptr, *clearLogs_ = nullptr;
-    QComboBox *videoSource_ = nullptr, *audioSource_ = nullptr, *camera_ = nullptr, *microphone_ = nullptr, *resolution_ = nullptr;
+    QComboBox *videoSource_ = nullptr, *audioSource_ = nullptr, *camera_ = nullptr, *resolution_ = nullptr;
     QSpinBox *targetFps_ = nullptr, *targetBitrate_ = nullptr;
     QCheckBox* lowLatency_ = nullptr;
     QLineEdit *url_ = nullptr, *addressDisplay_ = nullptr;
     QPlainTextEdit* log_ = nullptr;
-    QLabel *cameraLabel_ = nullptr, *microphoneLabel_ = nullptr, *videoDescription_ = nullptr, *audioDescription_ = nullptr,
+    QLabel *cameraLabel_ = nullptr, *videoDescription_ = nullptr, *audioDescription_ = nullptr,
         *deviceError_ = nullptr, *banner_ = nullptr, *footerState_ = nullptr, *footerSources_ = nullptr,
         *footerOutput_ = nullptr, *sidebarStatus_ = nullptr;
     QLabel *statsSample_ = nullptr, *captureRate_ = nullptr, *encodeRate_ = nullptr, *sendRate_ = nullptr,
@@ -724,19 +767,7 @@ private:
 };
 } // namespace
 
-int runPublisherControl(const config::PublisherConfig& config,
-                        const config::CommandLineOptions& options, logging::Logger& logger) {
-    static_cast<void>(options);
-    int argc = 1; char name[] = "publisher_gui"; char* argv[]{name, nullptr};
-    QApplication app(argc, argv);
-    QApplication::setStyle(QStringLiteral("Fusion"));
-    QFont font(QStringLiteral("Microsoft YaHei UI")); font.setPointSizeF(9.5); QApplication::setFont(font);
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor(11, 17, 21)); palette.setColor(QPalette::WindowText, QColor(197, 209, 213));
-    palette.setColor(QPalette::Base, QColor(11, 21, 28)); palette.setColor(QPalette::AlternateBase, QColor(20, 33, 41));
-    palette.setColor(QPalette::Text, QColor(197, 209, 213)); palette.setColor(QPalette::Button, QColor(20, 33, 41));
-    palette.setColor(QPalette::ButtonText, QColor(197, 209, 213)); palette.setColor(QPalette::Highlight, QColor(43, 85, 73));
-    palette.setColor(QPalette::HighlightedText, QColor(224, 239, 233)); QApplication::setPalette(palette);
-    PublisherWindow window(config, logger); window.show(); return app.exec();
+QWidget* createPublisherControl(const config::PublisherConfig& config, logging::Logger& logger) {
+    return new PublisherWindow(config, logger);
 }
 } // namespace lsl::ui

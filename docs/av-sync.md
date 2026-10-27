@@ -104,7 +104,8 @@ M09 在重连、接收积压超限和明显时间戳跳变时递增 `serial`。�
 `--set sync.tolerance_ms=30 --set sync.drop_threshold_ms=100`。
 `input.discontinuity_threshold_ms` 仍控制 M09 包时间戳换代，两者分别作用于网络包与播放调度。
 
-在工程目录直接使用 CMake，无额外构建脚本。本次成功的配置与构建命令为：
+在工程目录直接使用 CMake，无额外构建脚本。以下保留 M13 阶段独立入口的历史构建命令，
+当前统一应用的构建方式见 [README](../README.md)：
 
 ```powershell
 cd D:\直播\LiveStreamLab
@@ -116,8 +117,8 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 以下是使用命令，本次未启动：
 
 ```powershell
-.\build\cmake\bin\Release\player.exe --config config\player.json
-.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream --set sync.tolerance_ms=30
-.\build\cmake\bin\Release\player.exe --play-audio false
-.\build\cmake\bin\Release\player.exe --audio-paused true
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --url rtmp://127.0.0.1/live/livestream --set sync.tolerance_ms=30
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --play-audio false
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-paused true
 ```

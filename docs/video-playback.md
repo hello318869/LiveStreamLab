@@ -12,7 +12,8 @@ M13 已用音频主时钟替代原独立视频时钟，见 [音画同步](av-syn
 
 ## 构建与使用
 
-在工程根目录使用 CMake，无额外构建脚本。以下是本次成功的 Windows 构建命令：
+在工程根目录使用 CMake，无额外构建脚本。以下保留 M10/M12 阶段独立入口的历史构建命令，
+当前统一应用的构建方式见 [README](../README.md)：
 
 ```powershell
 cd D:\直播\LiveStreamLab
@@ -22,25 +23,25 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 
 首次并行构建在 MSBuild 的 `Checking File Globs` 后未继续推进，已中断；上述串行、
 禁用节点复用的命令成功。`/nodeReuse:false` 是 Windows MSBuild 参数；其他生成器可使用
-`cmake --build build/cmake --config Release --target player --parallel`。
+`cmake --build build/cmake --config Release --target livestreamlab --parallel` 构建当前统一应用。
 
 先准备正在推流的 SRS，再执行下面的启动命令；本次未执行：
 
 ```powershell
 # 默认 HTTP-FLV 输入
-.\build\cmake\bin\Release\player.exe --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
 
 # 同一路 RTMP 输入；SRS 在其他机器时替换 127.0.0.1
-.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --url rtmp://127.0.0.1/live/livestream
 
 # 初始窗口 960x540，保留垂直同步
-.\build\cmake\bin\Release\player.exe --width 960 --height 540 --vsync true
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --width 960 --height 540 --vsync true
 
 # 直接全屏启动
-.\build\cmake\bin\Release\player.exe --fullscreen true
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --fullscreen true
 
 # 禁用重连；正常 EOF 时排空包队列与解码尾帧后退出
-.\build\cmake\bin\Release\player.exe --reconnect-attempts 0
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --reconnect-attempts 0
 ```
 
 F、Alt+Enter 或鼠标左键双击切换全屏；Esc、关闭窗口或 Ctrl+C 停止。

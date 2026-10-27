@@ -52,10 +52,10 @@ cmake --build build/cmake --config Release --target publisher player --parallel 
 检查是否仍设置了 `audio.buffer_ms=500` 或 `pipeline.video_queue_capacity=8`。
 
 ```powershell
-.\build\cmake\bin\Release\player.exe --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
 
 # 沿用其他配置时显式覆盖，--url 可按实际 RTMP / HTTP-FLV 地址填写
-.\build\cmake\bin\Release\player.exe --audio-buffer-ms 100 --video-queue-capacity 3
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-buffer-ms 100 --video-queue-capacity 3
 ```
 
 以上启动命令本轮未执行。PCM 环至少容纳 4096 个每声道样本；SDL 缓存和设备延迟另计。

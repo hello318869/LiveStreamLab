@@ -1,7 +1,24 @@
 # 配置管理
 
 配置为 UTF-8 JSON，允许只提供部分字段。加载顺序：默认值 → 文件 → 命令行 → 校验最终值。
-不传 `--config` 使用默认值；相对路径以启动工作目录为准。示例见 `config/*.json`。
+显式指定的相对路径以启动工作目录为准。示例见 `config/*.json`。
+
+## 统一入口与默认配置
+
+当前只生成 `livestreamlab` 应用，不带参数启动 GUI 首页，选择“我要开播”或“我要观看”。
+`--mode publisher|player` 可直接进入相应控制窗口，模式参数与媒体参数可按任意顺序提供。
+控制台采集、录制、推流和 SDL 播放通过 `--mode publisher|player --cli` 使用。
+`LSL_BUILD_GUI=OFF` 时必须指定模式，自动使用 CLI。
+
+GUI 不带 `--config` 时，从可执行文件旁 `config/` 加载 `publisher-stream.json` 或 `player.json`，
+这两个文件由 CMake 部署；显式 `--config` 优先。点击返回首页或关闭功能窗口，
+会先停止会话并回收资源，再允许进入另一模式；关闭首页退出软件。
+
+CLI 不传 `--config` 时使用内置默认值，开播模式默认本地录制，推流需显式开启或加载推流配置。
+`--check-config`、`--print-config`、`--list-devices`、`--list-options` 直接查询并退出，
+也沿用 CLI 的配置规则，不自动加载 GUI 默认 JSON；要查看 GUI 配置文件须显式传 `--config`。
+无模式的 `--help` 显示统一入口帮助，`--mode publisher|player --help` 显示该模式全部参数。
+以下字段表中的默认值均指内置默认值，文件和命令行仍可覆盖。
 
 ## 字段
 
@@ -121,6 +138,7 @@ URL 检查协议、主机/流路径是否为空及空白字符；端口、IPv6�
 
 ## 命令行
 
+以下媒体参数均需配合 `livestreamlab --mode publisher|player`；需要直接运行媒体流水线时增加 `--cli`。
 `--config PATH` 指定文件，`--set FIELD=VALUE` 覆盖任意叶字段；
 `--check-config` 检查并退出，`--print-config` 输出完整 JSON 并退出，`--help` 查看参数。
 两种动作同时指定时优先打印 JSON。带值参数支持 `--name value` 和 `--name=value`。
@@ -178,20 +196,20 @@ Esc、关闭窗口或 Ctrl+C 停止。
 布尔值只接受 `true` / `false`，整数使用完整十进制文本。
 
 ```powershell
-.\build\cmake\bin\Release\publisher.exe --config config\publisher.json --fps 30 --set audio.channels=1 --print-config
-.\build\cmake\bin\Release\player.exe --audio-device "中文扬声器" --check-config
-.\build\cmake\bin\Release\player.exe --width 960 --height 540 --vsync true --fullscreen false
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json --fps 30 --set audio.channels=1 --print-config
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-device "中文扬声器" --check-config
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --width 960 --height 540 --vsync true --fullscreen false
 ```
 
 选择音源时可从工程根目录运行以下命令；音频默认保存到 `output/audio.m4a`，已有文件需换名：
 
 ```powershell
 # 麦克风；指定名称来自 --list-devices，可省略 --audio-device 使用默认选择
-.\build\cmake\bin\Release\publisher.exe --capture-video false --audio-source microphone --audio-device "麦克风设备名" --audio-file output/microphone.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --capture-video false --audio-source microphone --audio-device "麦克风设备名" --audio-file output/microphone.m4a
 # 电脑系统声音；使用 Windows 默认输出设备
-.\build\cmake\bin\Release\publisher.exe --capture-video false --audio-source system --audio-file output/system.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --capture-video false --audio-source system --audio-file output/system.m4a
 # 输入麦克风电平偏低时，可手动增加 20 dB（采样幅度乘 10）
-.\build\cmake\bin\Release\publisher.exe --capture-video false --audio-source microphone --audio-gain-db 20 --audio-file output/microphone-gain20.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --capture-video false --audio-source microphone --audio-gain-db 20 --audio-file output/microphone-gain20.m4a
 ```
 
 `--audio-gain-db` 支持整数 -60–30，正值放大，负值衰减。增益作用于麦克风、系统回采和

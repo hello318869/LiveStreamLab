@@ -27,6 +27,9 @@ std::vector<std::string> commandLineArguments(int argc, char* argv[]);
 using PublisherAction = std::function<int(const PublisherConfig&, const CommandLineOptions&, logging::Logger&)>;
 using PlayerAction = std::function<int(const PlayerConfig&, const CommandLineOptions&, logging::Logger&)>;
 // 共用配置、日志初始化与顶层异常处理；两端通过各自 action 接入媒体模块。
+// args 不包含程序名和统一入口已经处理的 --mode / --cli。
+int runConfigApp(AppKind app, const std::vector<std::string>& args, const PublisherAction& action = {},
+                 const PlayerAction& playerAction = {});
 int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action = {},
                  const PlayerAction& playerAction = {});
 

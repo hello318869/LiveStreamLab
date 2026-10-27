@@ -32,10 +32,10 @@
 
 ```powershell
 # Windows 默认完整桌面与麦克风
-.\build\cmake\bin\Release\publisher.exe --config config\publisher.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
 
 # 可选摄像头
-.\build\cmake\bin\Release\publisher.exe --video-source camera --video-device "default"
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --video-source camera --video-device "default"
 ```
 
 上述命令会沿用 M05/M06 本地录制设置，默认保存 `output/video.mp4` 与 `output/audio.m4a`，

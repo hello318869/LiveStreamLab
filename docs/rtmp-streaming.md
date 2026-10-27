@@ -16,22 +16,22 @@ RTMP/RTMPS 网络写出。实现位于 `src/publisher/rtmp/RtmpPublisher.hpp/.cp
 
 ```powershell
 # 默认 Windows 桌面、麦克风 → H.264/AAC → SRS
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --url rtmp://127.0.0.1/live/livestream
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --url rtmp://127.0.0.1/live/livestream
 
 # 可选摄像头取代桌面；设备 id 来自 --list-devices
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --video-source camera --video-device "default"
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --video-source camera --video-device "default"
 
 # 文件解码、预处理、重新编码后实时推流；不能使用 --realtime false
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --source file --input-file "D:\media\sample.mp4" --loop true
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --source file --input-file "D:\media\sample.mp4" --loop true
 
 # Windows 桌面画面 + 默认输出设备的系统声音，取代麦克风
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --audio-source system
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --audio-source system
 
 # 单音频推流；单视频则使用 --capture-audio false
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --capture-video false
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --capture-video false
 
 # 同时保存两条独立本地轨道；已有文件拒绝覆盖
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --video-file output/live-01.mp4 --audio-file output/live-01.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --video-file output/live-01.mp4 --audio-file output/live-01.m4a
 
 # 外部播放器接收；URL 与主播端相同
 ffplay rtmp://127.0.0.1/live/livestream

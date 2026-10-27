@@ -88,13 +88,13 @@ auto finalAudio = audio.flush();
 
 ```powershell
 # 文件的实际格式/尺寸/采样率在解码后由 M03/M04 转为目标参数
-.\build\cmake\bin\Release\publisher.exe --source file --input-file "D:\media\sample.mp4" --width 1280 --height 720 --fps 25 --sample-rate 48000 --channels 2
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --width 1280 --height 720 --fps 25 --sample-rate 48000 --channels 2
 
 # 居中裁剪、旋转、镜像及文字叠加
-.\build\cmake\bin\Release\publisher.exe --source file --input-file "D:\media\sample.mp4" --resize-mode crop --rotation 90 --mirror true --watermark "LiveStreamLab" --timestamp-overlay true
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --resize-mode crop --rotation 90 --mirror true --watermark "LiveStreamLab" --timestamp-overlay true
 
 # PCM 格式和帧长偏好（M06 会按 AAC 实际支持值协商）；--set 可以覆盖任意 JSON 叶字段
-.\build\cmake\bin\Release\publisher.exe --source file --input-file "D:\media\sample.mp4" --audio-sample-format s16 --audio-frame-size 1024 --set preprocess.audio.discontinuity_threshold_ms=100
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --audio-sample-format s16 --audio-frame-size 1024 --set preprocess.audio.discontinuity_threshold_ms=100
 ```
 
 设备模式仍用 `video.*` 和 `audio.*` 请求驱动支持的采集参数；不支持的设备组合需要先用

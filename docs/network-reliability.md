@@ -69,10 +69,10 @@ FFmpeg 的 `AVIOInterruptCB` 检查主动停止、当前操作截止时间和媒
 
 ```powershell
 # 主播端持续重试，退避最长 30 秒
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --reconnect-attempts -1 --reconnect-max-delay 30000
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --reconnect-attempts -1 --reconnect-max-delay 30000
 
 # 观众端持续重试；较长 GOP 可适当增大媒体等待时间
-.\build\cmake\bin\Release\player.exe --config config\player.json --reconnect-attempts -1 --inactivity-timeout 30000
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json --reconnect-attempts -1 --inactivity-timeout 30000
 ```
 
 ## 断开后的媒体清理

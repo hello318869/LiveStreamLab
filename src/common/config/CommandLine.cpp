@@ -10,6 +10,16 @@
 #endif
 
 namespace lsl::config {
+namespace {
+
+void reportFallback(const error::AppError& e) {
+    logging::Logger fallback;
+    if (!fallback.log(logging::Level::Error, e.module, e.what(), e.code)) {
+        std::cerr << e.what() << '\n';
+    }
+}
+
+} // namespace
 
 CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>& args) {
     std::map<std::string, std::string> fields = {
@@ -130,7 +140,10 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
 
 std::string commandLineHelp(AppKind app) {
     const bool publisher = app == AppKind::Publisher;
-    std::string help = std::string("Usage: ") + (publisher ? "publisher" : "player") + " [options]\n\n"
+    std::string help = std::string("Usage: livestreamlab --mode ") + (publisher ? "publisher" : "player") +
+        " [--cli] [options]\n\n"
+        "  --mode publisher|player  Open the publishing or viewing controls\n"
+        "  --cli                    Run the selected media pipeline without Qt controls\n"
         "  --help, -h               Show this help\n"
         "  --config PATH            Load a UTF-8 JSON file (otherwise use defaults)\n"
         "  --set FIELD=VALUE        Override a JSON leaf, e.g. audio.channels=1\n"
@@ -211,9 +224,11 @@ std::string commandLineHelp(AppKind app) {
                 "  --max-queue-bytes N      Total queued media bytes (1048576..268435456)\n";
     }
     help += "\nPrecedence: defaults < JSON file < command line; last override wins.\n"
-            "Options accept --name value and --name=value.\n";
+            "Options accept --name value and --name=value.\n"
+            "Without --mode, livestreamlab opens the publishing/viewing selection window.\n"
+            "The selected mode opens Qt controls by default; add --cli for command-line operation.\n";
     if (publisher) {
-        help += "Publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M07).\n"
+        help += "With --cli, publisher captures, preprocesses and encodes H.264/AAC until EOF or Ctrl+C (M02-M07).\n"
                 "M05 writes video-only MP4; M06 writes audio-only M4A; --stream true enables M07 RTMP output.\n"
                 "Use --set output.video_file= or --set output.audio_file= to disable local output.\n"
                 "Use config/publisher-stream.json for RTMP output without separate local recordings.\n"
@@ -222,8 +237,8 @@ std::string commandLineHelp(AppKind app) {
         help += "Player receives RTMP/RTMPS or HTTP/HTTPS-FLV with audio/video synchronization (M09-M15).\n"
                 "CLI window: F / Alt+Enter / double click fullscreen; Escape / close / Ctrl+C stop.\n"
                 "CLI window: Space pauses audio/video; M mutes; Up/Down changes volume by 10%.\n"
-                "player_gui provides Qt Widgets viewer controls (M16.2); see docs/player-control.md.\n"
-                "In player_gui, Escape leaves fullscreen; use Stop or close the window to stop playback.\n";
+                "The default viewer provides Qt Widgets controls (M16.2); see docs/player-control.md.\n"
+                "In Qt controls, Escape leaves fullscreen; use Stop or close the window to stop playback.\n";
     }
     return help;
 }
@@ -262,17 +277,27 @@ std::vector<std::string> commandLineArguments(int argc, char* argv[]) {
 
 int runConfigApp(AppKind app, int argc, char* argv[], const PublisherAction& action,
                  const PlayerAction& playerAction) {
+    try {
+        return runConfigApp(app, commandLineArguments(argc, argv), action, playerAction);
+    } catch (const error::AppError& e) {
+        reportFallback(e);
+        return e.module == "config" ? 2 : 1;
+    } catch (const std::exception& e) {
+        reportFallback(error::AppError("application", error::Unexpected, e.what()));
+        return 1;
+    }
+}
+
+int runConfigApp(AppKind app, const std::vector<std::string>& args, const PublisherAction& action,
+                 const PlayerAction& playerAction) {
     std::unique_ptr<logging::Logger> logger;
     const auto report = [&](const error::AppError& e) {
         if (logger && logger->hasOutput() &&
             logger->log(logging::Level::Error, e.module, e.what(), e.code)) return;
-        logging::Logger fallback;
-        if (!fallback.log(logging::Level::Error, e.module, e.what(), e.code)) {
-            std::cerr << e.what() << '\n';
-        }
+        reportFallback(e);
     };
     try {
-        const auto options = parseCommandLine(app, commandLineArguments(argc, argv));
+        const auto options = parseCommandLine(app, args);
         if (options.help) {
             std::cout << commandLineHelp(app);
             return 0;

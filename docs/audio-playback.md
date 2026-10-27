@@ -13,7 +13,8 @@ M13 已接入音频主时钟与视频调度，见 [音画同步](av-sync.md)。S
 
 ## 构建和使用
 
-在工程目录直接使用 CMake，不增加构建脚本。以下为本次成功的构建命令：
+在工程目录直接使用 CMake，不增加构建脚本。以下保留 M11 阶段独立入口的历史构建命令，
+当前统一应用的构建方式见 [README](../README.md)：
 
 ```powershell
 cd D:\直播\LiveStreamLab
@@ -22,32 +23,32 @@ cmake --build build/cmake --config Release --target player --parallel 1 -- /node
 ```
 
 `/nodeReuse:false` 是 Windows MSBuild 参数，其他生成器可使用
-`cmake --build build/cmake --config Release --target player --parallel`。
+`cmake --build build/cmake --config Release --target livestreamlab --parallel` 构建当前统一应用。
 
 先准备正在推流的 SRS，以下启动命令本次均未执行：
 
 ```powershell
 # 默认 HTTP-FLV，同时输出视频和声音
-.\build\cmake\bin\Release\player.exe --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
 
 # 同一路 RTMP
-.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --url rtmp://127.0.0.1/live/livestream
 
 # 调整声音：50% 音量，输出 48 kHz 立体声
-.\build\cmake\bin\Release\player.exe --volume 50 --sample-rate 48000 --channels 2
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --volume 50 --sample-rate 48000 --channels 2
 
 # 静音启动，或以音画暂停状态启动
-.\build\cmake\bin\Release\player.exe --mute true
-.\build\cmake\bin\Release\player.exe --audio-paused true
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --mute true
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-paused true
 
 # 仅播放视频；音频包仍及时消费并释放
-.\build\cmake\bin\Release\player.exe --play-audio false
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --play-audio false
 
 # 更改 PCM 环形缓冲的容量时长，单位毫秒
-.\build\cmake\bin\Release\player.exe --audio-buffer-ms 300
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-buffer-ms 300
 
 # 使用系统默认输出设备，或指定 SDL 枚举到的输出设备名
-.\build\cmake\bin\Release\player.exe --audio-device default
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --audio-device default
 ```
 
 | 操作 | 行为 |

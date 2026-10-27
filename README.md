@@ -1,12 +1,13 @@
 # LiveStreamLab
 
 C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理、编码、推流与本地录制，
-观众端负责拉流、解码、音画同步播放，两端各带一套 Qt Widgets 控制界面。
+观众端负责拉流、解码、音画同步播放。统一软件 `livestreamlab.exe` 在首页选择“我要开播”或“我要观看”，
+通过同一进程中的 Qt Widgets 界面使用两种功能。
 模块划分与验收标准见上级目录 `方案.md`，实现细节见 [docs/](docs/architecture.md)。
 
 ## 功能
 
-### 主播端 `publisher`
+### 开播模式 `publisher`
 
 - **视频源**：Windows 桌面（gdigrab，含鼠标）、摄像头、本地媒体文件（可循环、按时间戳节奏读取）
 - **音频源**：麦克风、Windows 系统声音（WASAPI 回采）、文件音轨
@@ -16,7 +17,7 @@ C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理�
 - **并发**：采集、音视频处理编码、本地封装、推流各自线程，用有界队列交接；
   实时视频队列满时丢旧帧，音频和文件转换走背压
 
-### 观众端 `player`
+### 观看模式 `player`
 
 - **输入**：RTMP/RTMPS、HTTP/HTTPS-FLV
 - **视频**：FFmpeg 软解 → SDL3 窗口或 Qt 控件显示，等比缩放、可全屏
@@ -38,61 +39,71 @@ SDL3 与 nlohmann/json 已放在 `external/`；Qt 界面另需 Qt 6.5+ Widgets�
 ```powershell
 cd D:\直播\LiveStreamLab
 cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF
-cmake --build build/cmake --config Release --parallel
+cmake --build build/cmake --config Release --target livestreamlab --parallel
 ```
 
 - FFmpeg 自动在 `external/ffmpeg`、上级/盘根 `ffmpeg/ffmpeg-*` 查找，也可 `-DFFmpeg_ROOT="D:/ffmpeg/ffmpeg-9.0.1-full_build-shared"`
-- 只构建命令行程序、不装 Qt：追加 `-DLSL_BUILD_PUBLISHER_GUI=OFF -DLSL_BUILD_PLAYER_GUI=OFF`
+- 默认 `LSL_BUILD_GUI=ON`；只需命令行功能、不装 Qt：追加 `-DLSL_BUILD_GUI=OFF`，仍生成同一 `livestreamlab` 程序
 - 程序产物在 `build/cmake/bin/Release/`（单配置生成器为 `build/cmake/bin/`）
 - 中文路径下若 SDL 预编译头报 C4828，配置时加 `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`
-- 测试默认关闭，需要时改用 `-DLSL_BUILD_TESTS=ON`
+- 测试默认关闭；仅在明确要求测试时开启并执行
 
 ## 启动
 
-以下命令都在 `LiveStreamLab` 目录下执行。推流/拉流前先在 `127.0.0.1` 运行 SRS（RTMP 1935、HTTP 8080）。
+构建后双击 `build/cmake/bin/Release/livestreamlab.exe`，或从工程目录执行：
 
 ```powershell
-# 1. 主播端：桌面 + 系统声音，推流到 SRS
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --url rtmp://127.0.0.1/live/livestream
-
-# 2. 观众端：默认 HTTP-FLV 拉流，SDL3 窗口播放
-.\build\cmake\bin\Release\player.exe --config config\player.json
-
-# 或用外部播放器验证同一路流
-ffplay rtmp://127.0.0.1/live/livestream
+.\build\cmake\bin\Release\livestreamlab.exe
 ```
 
-图形界面（选中设备、预览画面、开始/停止直播、查看统计）：
+首页选择“我要开播”进入采集设备、预览和直播控制，选择“我要观看”进入地址、播放和音量控制。
+进入功能窗口不会自动开播或拉流。点击“返回首页”或关闭功能窗口，会先停止当前会话并释放资源，
+再回到首页选择另一功能；关闭首页退出软件。
+
+CMake 将默认配置复制到程序旁的 `config/`。GUI 按可执行文件位置加载 `publisher-stream.json` 或
+`player.json`，双击启动不依赖当前工作目录。显式 `--config` 覆盖默认配置，媒体参数须配合 `--mode`：
 
 ```powershell
-.\build\cmake\bin\Release\publisher_gui.exe --config config\publisher-stream.json
-.\build\cmake\bin\Release\player_gui.exe --config config\player.json
+# 直接进入开播 / 观看界面
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --url rtmp://127.0.0.1/live/livestream
 ```
 
-常用命令行开关：
+推流、拉流前需运行 SRS（默认 RTMP 1935、HTTP 8080）。需要原有控制台工作方式时加 `--cli`：
 
 ```powershell
+# 桌面 + 系统声音推流
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json
+
 # 本地录制（默认桌面 + 系统声音），Ctrl+C 有序停止
-.\build\cmake\bin\Release\publisher.exe --config config\publisher.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
 
-# 改用摄像头 / 仅摄像头
-.\build\cmake\bin\Release\publisher.exe --video-source camera --video-device "default"
-.\build\cmake\bin\Release\publisher.exe --video-source camera --capture-audio false --width 640 --height 480 --fps 30
+# 摄像头输入
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --video-source camera --video-device "default"
 
 # 从本地文件推流，可循环
-.\build\cmake\bin\Release\publisher.exe --config config\publisher-stream.json --source file --input-file "D:\media\sample.mp4" --loop true
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher-stream.json --source file --input-file "D:\media\sample.mp4" --loop true
 
 # 枚举设备、查询设备能力
-.\build\cmake\bin\Release\publisher.exe --list-devices
-.\build\cmake\bin\Release\publisher.exe --list-options video --video-device "default"
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --list-devices
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --list-options video --video-device "default"
 
-# 观众端：RTMP 输入、调整超时与重连、窗口大小与音量
-.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream
-.\build\cmake\bin\Release\player.exe --read-timeout 5000 --reconnect-attempts 5 --max-buffer-ms 2000
-.\build\cmake\bin\Release\player.exe --width 960 --height 540 --fullscreen false --volume 50
+# 控制台观看，使用 SDL3 播放窗口
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json --volume 50
+
+# 统一入口帮助 / 观看参数帮助 / 配置查询
+.\build\cmake\bin\Release\livestreamlab.exe --help
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --help
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --print-config
 ```
 
-快捷键：播放窗口里 `F` / `Alt+Enter` / 双击切换全屏，`Esc` 退出；`Space` 暂停/继续，`M` 静音，`↑`/`↓` 调音量。
+`--help`、`--check-config`、`--print-config` 和设备查询直接输出结果，不进入 GUI。
+这些查询沿用 CLI 的配置规则；要检查某个 GUI 配置文件，请同时显式指定 `--config`。
+CLI 使用内置默认配置；开播模式默认仍为本地录制，需要推流时显式指定 `publisher-stream.json`。
+`LSL_BUILD_GUI=OFF` 时必须指定 `--mode`，该模式自动使用 CLI，也可保留 `--cli`。
+
+CLI 播放窗口中 `F` / `Alt+Enter` / 双击切换全屏，`Esc` 停止；`Space` 暂停/继续，
+`M` 静音，`↑`/`↓` 调音量。GUI 的 `Esc` 仅退出全屏，停止播放使用停止按钮。
 
 ## 配置与产物
 
@@ -105,6 +116,11 @@ ffplay rtmp://127.0.0.1/live/livestream
 
 录制产物写入 `output/`，目录不存在会自动创建；文件名已存在时拒绝覆盖。
 字段含义与全部命令行参数见 [配置说明](docs/configuration.md)。
+旧文档中的 `publisher`、`player`、`publisher_gui`、`player_gui` 程序名对应早期独立入口；
+当前统一使用 `livestreamlab --mode publisher|player`，控制台场景再加 `--cli`。
+
+2026-10-27：统一 GUI 程序已通过 CMake 的 Windows Release 编译和链接，运行依赖与默认配置已部署。
+本次按要求未启动程序、未运行测试或真实推拉流；显示与切换效果仍待后续运行验收。
 
 ## 文档
 

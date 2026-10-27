@@ -21,11 +21,10 @@ if(WIN32)
     set_tests_properties(integration/desktop_capture PROPERTIES TIMEOUT 20)
 endif()
 
-if(TARGET publisher AND TARGET player)
+if(TARGET livestreamlab)
     add_test(NAME integration/cli
         COMMAND ${CMAKE_COMMAND}
-            "-DPUBLISHER=$<TARGET_FILE:publisher>"
-            "-DPLAYER=$<TARGET_FILE:player>"
+            "-DLIVESTREAMLAB=$<TARGET_FILE:livestreamlab>"
             "-DSOURCE_DIR=${PROJECT_SOURCE_DIR}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/integration/cli.cmake")
     set_tests_properties(integration/cli PROPERTIES TIMEOUT 60)

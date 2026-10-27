@@ -15,9 +15,8 @@ if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
 
-option(LSL_BUILD_APPS "Build publisher and player" ON)
-option(LSL_BUILD_PUBLISHER_GUI "Build the M16.1 Qt Widgets publisher controls" ON)
-option(LSL_BUILD_PLAYER_GUI "Build the M16.2 Qt Widgets viewer controls" ON)
+option(LSL_BUILD_APPS "Build the unified LiveStreamLab application" ON)
+option(LSL_BUILD_GUI "Include Qt Widgets publishing and viewing controls" ON)
 option(LSL_BUILD_TESTS "Build tests" OFF)
 option(LSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -149,16 +148,12 @@ target_link_libraries(lsl_player_pipeline PUBLIC lsl_common
 lsl_set_warnings(lsl_player_pipeline)
 
 if(LSL_BUILD_APPS)
-    foreach(app publisher player)
-        add_executable(${app} src/apps/${app}_main.cpp)
-        target_link_libraries(${app} PRIVATE lsl_common)
-        lsl_set_warnings(${app})
-        lsl_copy_runtime(${app})
-    endforeach()
-    target_link_libraries(publisher PRIVATE lsl_publisher_pipeline)
-    target_link_libraries(player PRIVATE lsl_player_pipeline SDL3::SDL3)
+    add_executable(livestreamlab src/apps/livestreamlab_main.cpp)
+    target_link_libraries(livestreamlab PRIVATE lsl_common lsl_publisher_pipeline lsl_player_pipeline)
+    lsl_set_warnings(livestreamlab)
+    lsl_copy_runtime(livestreamlab)
 
-    if(LSL_BUILD_PUBLISHER_GUI OR LSL_BUILD_PLAYER_GUI)
+    if(LSL_BUILD_GUI)
         # 优先使用用户指定的 Qt；也支持工作区内安装的 Windows MSVC SDK。
         if(WIN32 AND NOT Qt6_DIR AND NOT Qt6_ROOT)
             file(GLOB lsl_qt_sdks "${CMAKE_CURRENT_SOURCE_DIR}/external/qt/*/msvc*_64")
@@ -175,51 +170,43 @@ if(LSL_BUILD_APPS)
             find_program(LSL_WINDEPLOYQT_EXECUTABLE windeployqt
                 HINTS "${Qt6_DIR}/../../../bin" REQUIRED)
         endif()
-    endif()
-
-    if(LSL_BUILD_PUBLISHER_GUI)
         add_library(lsl_publisher_ui STATIC src/publisher/ui/PublisherControl.cpp)
         target_link_libraries(lsl_publisher_ui PUBLIC lsl_common
             PRIVATE lsl_publisher_pipeline lsl_capture Qt6::Widgets)
         lsl_set_warnings(lsl_publisher_ui)
 
-        add_executable(publisher_gui src/apps/publisher_gui_main.cpp)
-        target_link_libraries(publisher_gui PRIVATE lsl_publisher_ui lsl_publisher_pipeline)
-        lsl_set_warnings(publisher_gui)
-        lsl_copy_runtime(publisher_gui)
-    endif()
-
-    if(LSL_BUILD_PLAYER_GUI)
         add_library(lsl_player_ui STATIC src/player/ui/PlayerControl.cpp)
         target_link_libraries(lsl_player_ui PUBLIC lsl_common
             PRIVATE lsl_player_pipeline Qt6::Widgets SDL3::SDL3)
         lsl_set_warnings(lsl_player_ui)
 
-        add_executable(player_gui src/apps/player_gui_main.cpp)
-        target_link_libraries(player_gui PRIVATE lsl_player_ui lsl_player_pipeline)
-        lsl_set_warnings(player_gui)
-        lsl_copy_runtime(player_gui)
+        add_library(lsl_application_ui STATIC src/apps/ui/ApplicationControl.cpp)
+        target_link_libraries(lsl_application_ui PUBLIC lsl_common
+            PRIVATE lsl_publisher_ui lsl_player_ui Qt6::Widgets)
+        lsl_set_warnings(lsl_application_ui)
+        target_link_libraries(livestreamlab PRIVATE lsl_application_ui)
+        target_compile_definitions(livestreamlab PRIVATE LSL_WITH_GUI)
     endif()
+
+    # 默认配置随应用部署，双击启动不依赖工作目录。
+    add_custom_command(TARGET livestreamlab POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/config" "$<TARGET_FILE_DIR:livestreamlab>/config"
+        VERBATIM)
 
     if(WIN32)
         # 部署只分析/复制依赖，不启动目标程序；保持构建全部由 CMake 管理。
-        foreach(qt_app publisher_gui player_gui)
-            if(TARGET ${qt_app})
-                add_custom_command(TARGET ${qt_app} POST_BUILD
-                    COMMAND "${LSL_WINDEPLOYQT_EXECUTABLE}"
-                        "$<IF:$<CONFIG:Debug>,--debug,--release>"
-                        --no-translations --no-system-d3d-compiler --no-compiler-runtime
-                        --dir "$<TARGET_FILE_DIR:${qt_app}>" "$<TARGET_FILE:${qt_app}>"
-                    VERBATIM)
-            endif()
-        endforeach()
-        foreach(sdl_app player player_gui)
-            if(TARGET ${sdl_app})
-                add_custom_command(TARGET ${sdl_app} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "$<TARGET_FILE:SDL3::SDL3>" "$<TARGET_FILE_DIR:${sdl_app}>" VERBATIM)
-            endif()
-        endforeach()
+        if(LSL_BUILD_GUI)
+            add_custom_command(TARGET livestreamlab POST_BUILD
+                COMMAND "${LSL_WINDEPLOYQT_EXECUTABLE}"
+                    "$<IF:$<CONFIG:Debug>,--debug,--release>"
+                    --no-translations --no-system-d3d-compiler --no-compiler-runtime
+                    --dir "$<TARGET_FILE_DIR:livestreamlab>" "$<TARGET_FILE:livestreamlab>"
+                VERBATIM)
+        endif()
+        add_custom_command(TARGET livestreamlab POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:SDL3::SDL3>" "$<TARGET_FILE_DIR:livestreamlab>" VERBATIM)
     endif()
 endif()
 

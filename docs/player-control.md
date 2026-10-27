@@ -1,26 +1,29 @@
 # M16.2 观众控制
 
-独立入口 `player_gui` 使用 Qt Widgets，沿用主播控制的深色风格。视频嵌入同一窗口，
-复用现有网络解复用、视频/音频解码、SDL3 音频和 M13 音画同步，原有 `player` CLI 保留。
+统一程序 `livestreamlab` 的“我要观看”使用 Qt Widgets，沿用主播控制的深色风格。视频嵌入同一窗口，
+复用现有网络解复用、视频/音频解码、SDL3 音频和 M13 音画同步，控制台方式通过
+`livestreamlab --mode player --cli` 使用。
 
 ## 构建与启动
 
 在工程根目录直接使用 CMake，不新增构建脚本：
 
 ```powershell
-cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF -DLSL_BUILD_PLAYER_GUI=ON -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
-cmake --build build/cmake --config Release --target player_gui --parallel
-.\build\cmake\bin\Release\player_gui.exe --config config\player.json
+cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF -DLSL_BUILD_GUI=ON -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+cmake --build build/cmake --config Release --target livestreamlab --parallel
+.\build\cmake\bin\Release\livestreamlab.exe --mode player
 ```
 
 需要 Qt 6.5+ Widgets SDK，本机复用已安装的 `external/qt/6.8.3/msvc2022_64`。
 其他位置通过 `CMAKE_PREFIX_PATH` 或 `Qt6_DIR` 指定。Windows 构建后，CMake 复制 FFmpeg、
 SDL3 DLL，并用 `windeployqt` 部署 Qt DLL 与 `platforms/qwindows.dll`，不执行播放器。
 单配置生成器的程序位于 `build/cmake/bin/`。如只构建 CLI，设置
-`-DLSL_BUILD_PUBLISHER_GUI=OFF -DLSL_BUILD_PLAYER_GUI=OFF` 可完全跳过 Qt 查找。
+`-DLSL_BUILD_GUI=OFF` 可完全跳过 Qt 查找，仍使用 `livestreamlab --mode player`。
+不带参数启动 GUI 程序时先显示功能首页。GUI 默认读取程序旁 `config/player.json`，
+CMake 构建时复制配置；显式 `--config` 优先，其相对路径按当前工作目录解释。
 
 `--config`、`--url`、初始音量/静音/暂停、网络超时、重连、缓存和同步参数继续使用现有配置规则。
-`--help`、`--print-config`、`--check-config` 保持原有查询行为，不进入播放窗口。
+这些模式参数需配合 `--mode player`；`--help`、`--print-config`、`--check-config` 保持查询行为，不进入播放窗口。
 
 ## 窗口操作
 
@@ -30,7 +33,8 @@ SDL3 DLL，并用 `windeployqt` 部署 Qt DLL 与 `platforms/qwindows.dll`，不
 4. 暂停/继续沿用现有音视频联合暂停能力。直播继续在服务器端运行，恢复时仍受现有缓存/换代策略约束。
 5. 使用全屏按钮、F、Alt+Enter 或双击视频画面切换全屏。Esc 退出全屏，恢复之前窗口状态。
    在地址或日志输入控件中操作时，普通字母快捷键不会吞掉输入文字。
-6. 点击停止后等待后台回收完成，再修改地址并重新连接。关闭窗口也先请求停止，等待清理后退出。
+6. 点击停止后等待后台回收完成，再修改地址并重新连接。点击“返回首页”或关闭窗口也先请求停止，
+   等待清理后回到首页，可切换开播功能；关闭首页退出软件。
 
 音频关闭或音轨不存在时不打开实际音频设备。只有音频的流可播放声音，视频区域显示相应状态；
 无可用新代视频帧时清除旧连接画面。终态保留错误信息供查看，不把失败伪装成正常停止。
@@ -63,6 +67,10 @@ Qt 定时器同时在主线程排空 SDL 音频/设备事件，以执行默认�
 端到端估计；真实屏幕刷新率仍不由后台提交数推断，详见[性能统计](performance-statistics.md)。
 
 ## 验证范围
+
+2026-10-27：统一 GUI 程序 `livestreamlab` 已通过 CMake 的 Windows Release 编译和链接，
+运行依赖与默认配置已部署。本次未启动 GUI、未运行测试或真实拉流；
+显示与模式切换仍待运行验收。下列记录属于整合前的独立入口构建。
 
 2026-10-27：通过 CMake 配置及 Windows Release 的 `player_gui`、`player`、`publisher_gui`
 编译和链接；Qt Core/Gui/Widgets DLL、Windows 平台插件、SDL3 和 FFmpeg DLL 已部署至程序目录，

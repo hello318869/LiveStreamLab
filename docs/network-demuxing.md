@@ -22,22 +22,22 @@ M09 阶段已通过 Windows Release 的 `player` 编译、链接；当时测试�
 ```powershell
 cd D:\直播\LiveStreamLab
 cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
-cmake --build build/cmake --config Release --target player --parallel
+cmake --build build/cmake --config Release --target livestreamlab --parallel
 
 # SRS 已有对应直播流时，接收 HTTP-FLV 并显示视频
-.\build\cmake\bin\Release\player.exe --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
 
 # 改为同一路 RTMP
-.\build\cmake\bin\Release\player.exe --url rtmp://127.0.0.1/live/livestream
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --url rtmp://127.0.0.1/live/livestream
 
 # 调整连接/读取超时及重连预算
-.\build\cmake\bin\Release\player.exe --connect-timeout 5000 --read-timeout 5000 --reconnect-attempts 5 --reconnect-delay 1000
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --connect-timeout 5000 --read-timeout 5000 --reconnect-attempts 5 --reconnect-delay 1000
 
 # 持续重连：等待 1/2/4/8/16/30 秒，之后保持 30 秒；Ctrl+C 可中断等待
-.\build\cmake\bin\Release\player.exe --reconnect-attempts -1 --reconnect-delay 1000 --reconnect-max-delay 30000 --inactivity-timeout 15000
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --reconnect-attempts -1 --reconnect-delay 1000 --reconnect-max-delay 30000 --inactivity-timeout 15000
 
 # 调整接收缓冲，每轨 256 包、两轨合计 32 MiB、最多 2 秒
-.\build\cmake\bin\Release\player.exe --packet-queue-capacity 256 --max-buffer-ms 2000 --max-queue-bytes 33554432
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --packet-queue-capacity 256 --max-buffer-ms 2000 --max-queue-bytes 33554432
 ```
 
 2026-10-25 M09 阶段本机实际成功的构建命令如下；当时 CMake 缓存中 `LSL_BUILD_TESTS=OFF`、

@@ -25,13 +25,13 @@ Ctrl+C 正常停止并写完 M4A 尾部。音源二选一，当前不做同时�
 
 ```powershell
 # 麦克风；default 跟随 Windows 默认录音设备
-.\build\cmake\bin\Release\publisher.exe --capture-video false --audio-source microphone --audio-gain-db 20 --audio-file output/microphone.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --capture-video false --audio-source microphone --audio-gain-db 20 --audio-file output/microphone.m4a
 
 # 可先枚举，再通过 --audio-device 指定麦克风名称或唯一 ID
-.\build\cmake\bin\Release\publisher.exe --list-devices
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --list-devices
 
 # 电脑正在播放的音乐、视频、游戏声音：WASAPI 默认播放端点回采
-.\build\cmake\bin\Release\publisher.exe --capture-video false --audio-source system --audio-file output/system.m4a
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --capture-video false --audio-source system --audio-file output/system.m4a
 ```
 
 JSON 对应 `capture.audio_source` 为 `microphone` / `system`，`preprocess.audio.gain_db` 为

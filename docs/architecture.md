@@ -1,5 +1,22 @@
 # 当前架构
 
+## 统一应用入口
+
+`src/apps/livestreamlab_main.cpp` 是唯一应用入口，CMake 生成 `livestreamlab`。
+默认由 `src/apps/ui/ApplicationControl.*` 创建唯一 `QApplication` 和功能首页；
+“我要开播”与“我要观看”分别创建原有主播、观众控制窗口，复用各自的 Session 和媒体流水线。
+`publisher/` 与 `player/` 继续表示业务模块，不再分别生成可执行应用。
+
+功能窗口通过“返回首页”或关闭事件请求停止，在工作线程回收后销毁窗口，再显示首页。
+日志对象存活至会话和控件销毁之后；切换模式前完成旧会话清理。关闭首页退出应用。
+`--mode publisher|player` 可直接进入相应界面；配合 `--cli` 时经 `runConfigApp` 调用原有控制台流水线。
+配置、帮助与设备查询仍直接返回结果。`LSL_BUILD_GUI=OFF` 时同一入口按 `--mode` 运行 CLI。
+默认 GUI 配置从可执行文件旁 `config/` 加载，由 CMake 部署，显式 `--config` 优先。
+
+以下描述中的独立入口名称属于整合前的历史记录；当前调用关系以本节为准。
+
+## 媒体模块
+
 M01 提供配置、日志、错误处理，以及 FFmpeg/SDL3 的 RAII 所有权封装。
 M02 的 `lsl_capture` 提供设备枚举、能力查询、设备/本地文件输入与解码。
 M03/M04 的 `lsl_preprocess` 提供视频预处理与音频重采样/FIFO，独立链接 `lsl_common`。
@@ -13,18 +30,18 @@ M10 的 `lsl_video_decoder` 提供 FFmpeg 视频软件解码和显示格式适�
 M12 的 `lsl_video_renderer` 提供 `IVideoRenderer` 接口及 SDL3 实现，链接 `lsl_common` 和 `SDL3::SDL3`。
 M11 的 `lsl_audio_decoder` / `lsl_audio_sink` 提供音频解码、固定格式 PCM、SDL3 输出及估计播放时钟。
 M13 的 `lsl_sync` 提供 `AVSynchronizer`，按音频进度调度视频，并在无可用音频时降级为外部时钟。
-`lsl_player_pipeline` 组合网络输入、解码工作线程、帧交接和主线程显示，并接入 `player` 入口。
+`lsl_player_pipeline` 组合网络输入、解码工作线程、帧交接和主线程显示，并接入统一入口的观看模式。
 M14 的 `common/queue/BoundedBlockingQueue.hpp` 提供通用有界阻塞队列，由两端流水线直接复用；
 媒体专用包装继续负责 `serial`、字节数、时间跨度和关键帧恢复等规则。
 M15 的 `common/utils/NetworkStatus.hpp` 提供两端共享网络状态、统计和退避工具；
 `RtmpPublisher` 与 `Demuxer` 仍各自独占实际会话，包含可取消 I/O、媒体进展检测及重试/重建。
 观众端断线时以空流快照撤销旧解码状态，再交付重新探测的新参数；说明见 [M15](network-reliability.md)。
-M16.1 的 `lsl_publisher_ui` 组合 Qt Widgets 与 `PublisherSession`，接入独立的
-`publisher_gui` 入口。会话在线程中运行主播流水线，Qt 主线程管理窗口、配置、停止请求和状态快照；
+M16.1 的 `lsl_publisher_ui` 组合 Qt Widgets 与 `PublisherSession`，由统一首页创建主播控制窗口。
+会话在线程中运行主播流水线，Qt 主线程管理窗口、配置、停止请求和状态快照；
 不会让 UI 访问媒体队列或跨线程销毁 FFmpeg 对象。说明见 [主播控制](publisher-control.md)。
 视频处理线程以约 8 FPS 发布不超过 960x540 的 RGB24 不可变副本，会话只保留最新预览；
 Qt 主线程复制为 QImage 绘制。日志使用 Logger 的有界内存副本，界面通过游标轮询。
-M16.2 的 `lsl_player_ui` 接入独立 `player_gui`，由 `PlayerSession` 的后台协调线程复用
+M16.2 的 `lsl_player_ui` 由统一首页创建观众控制窗口，`PlayerSession` 的后台协调线程复用
 `runPlayerPipeline` 的解码、音频和同步调度，使用无窗口的 RGB 交接实现 `IVideoRenderer`。
 Qt 主线程绘制最新 QImage；SDL 音频子系统在主线程创建/销毁，后台只操作已有音频输出接口。
 CLI 的 SDL 窗口仍留在主线程。控制与资源边界见 [观众控制](player-control.md)。
@@ -48,12 +65,12 @@ src/publisher/
 
 `RtmpPublisher` 保留 FLV 与网络会话的完整实现。上面的目录整理于 2026-10-25 完成，
 当时只调整归属；下列线程和队列描述对应 2026-10-26 的 M14 实现。
-`publisher` 入口链接 `lsl_publisher_pipeline`，后者组合采集、预处理、编码、本地封装与推流模块。
+统一入口的开播模式链接 `lsl_publisher_pipeline`，后者组合采集、预处理、编码、本地封装与推流模块。
 2026-10-25 目录调整后曾通过 Windows Release 的 CMake 完整编译，当时未运行测试、采集或推流；
 该历史记录不作为 M14 运行验收结果。
 
 ```text
-publisher_main
+livestreamlab_main --mode publisher --cli
   └─ runConfigApp：命令行 → JSON → 校验 → 日志 → 顶层异常边界
        └─ pipeline/PublisherPipeline：runPublisher
             ├─ 枚举 / 能力查询后退出
@@ -108,7 +125,7 @@ src/player/
 ├── pipeline/      # lsl::player：runPlayer/runPlayerPipeline、PlayerSession、AudioPlayback 与调度
 └── ui/            # lsl::ui：Qt Widgets 观众控制，lsl_player_ui
 
-player_main
+livestreamlab_main --mode player --cli
   └─ runConfigApp：命令行 → JSON → 校验 → 日志 → 顶层异常边界
        └─ pipeline/PlayerPipeline：runPlayer
             ├─ Demuxer 网络线程独占 AVFormatContext
