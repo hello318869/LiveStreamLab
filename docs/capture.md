@@ -1,120 +1,70 @@
-# M02 音视频输入
+# 音视频输入（M02）
 
-## 输入路径
+采集实现位于 `src/publisher/capture/`，由 `PublisherPipeline` 组合。构建见 [README](../README.md)，以下命令从工程根目录运行。
 
-`publisher_main → runConfigApp → runPublisher → MediaInput`。
-`lsl_capture` 独立于入口程序，通过 CMake 链接已有 `lsl_common` 与 FFmpeg。
-采集模块只保留设备管理和媒体输入；完整主播流程由 `lsl_publisher_pipeline` 组合，
-入口实现位于 `src/publisher/pipeline/PublisherPipeline.cpp`，函数为 `lsl::pipeline::runPublisher`。
+## 输入选择
 
-- Windows 桌面：设备模式默认 `capture.video_source=desktop`，通过 FFmpeg `gdigrab` 读取
-  完整虚拟桌面及鼠标。采集帧率使用 `video.fps`，随后由 M03 缩放到 `video.width` / `video.height`；
-  目标输出宽高不传给桌面后端作为裁剪尺寸。
-- Windows 摄像头与音频：`--video-source camera` 才打开摄像头。
-  DirectShow COM 按类别枚举摄像头与麦克风，唯一 ID 和友好名称均可配置。
-  分别枚举避免缺少麦克风时影响摄像头列表；媒体采集仍通过 FFmpeg libavdevice 完成。
-  `--list-options video|audio` 使用 FFmpeg 的 DirectShow `list_options`，能力信息直接输出到 stderr。
-  麦克风 `default` 解析 Windows 默认录音端点，并按端点 GUID 匹配 DirectShow 设备。
-  `--audio-source system` 改用默认播放设备的 WASAPI loopback；不混入麦克风、不修改系统音量。
-  系统回采输出统一为 48 kHz、双声道 float，支持正常空闲等待和主动停止。
-- Linux：V4L2 枚举摄像头，ALSA 枚举麦克风。视频能力通过 V4L2 ioctl 输出像素格式、
-  分辨率与帧间隔；ALSA 在打开时协商采样率/声道，首帧日志报告实际 PCM 格式。
-  本次桌面后端仅支持 Windows，Linux 设备输入须显式设置 `--video-source camera`。
-- 文件：libavformat 自动识别本地文件，分别为选中的音视频轨创建解码上下文。
-  MP4 中的压缩视频/音频与设备提供的 MJPEG、PCM 等统一解码为 AVFrame。
+| 来源 | 行为与边界 |
+|---|---|
+| Windows 桌面 | `capture.source=devices`、`video_source=desktop`；gdigrab 读取完整虚拟桌面和鼠标，按 `video.fps` 采集，再缩放到目标尺寸，不按目标宽高裁剪桌面 |
+| 摄像头 | `video_source=camera`；Windows 使用 DirectShow，Linux 使用 V4L2；`devices.video` 可填设备 ID，Windows 也接受友好名称 |
+| 麦克风 | `audio_source=microphone`；Windows `default` 按默认录音端点 GUID 匹配 DirectShow 设备，Linux 使用 ALSA |
+| Windows 系统声音 | `audio_source=system`；WASAPI 回采默认播放端点，统一输出 48 kHz 双声道 float；与麦克风二选一，不混音、不修改系统音量，无声时允许正常等待 |
+| 本地文件 | `source=file`、`capture.file` 指定路径；自动识别容器，为允许且存在的音视频轨解码，文件模式忽略设备来源字段 |
 
-设备能力接口依赖驱动与 FFmpeg 构建启用的后端。FFmpeg 不支持枚举或缺少对应后端时会报告错误。
-设备能力查询使用 FFmpeg 默认 stderr 日志，不受应用 `logging.file` 的重定向控制。
-`--list-devices` / `--list-options video` 查询的仍是摄像头，不会启动桌面采集。
-`--video-device` 与 `--video-format` 只用于 `camera`；文件输入不受 `capture.video_source` 影响。
-
-在工程根目录执行以下命令，默认音频仍是麦克风；可通过 `--audio-source system` 改为系统声音：
+无配置时音源默认 `microphone`；仓库 `publisher.json` 和 `publisher-stream.json` 均选择 `system`。
+桌面与系统回采仅支持 Windows；Linux 设备视频须选择 `camera`。
+`--video-device` / `--video-format` 仅影响摄像头。
 
 ```powershell
-# Windows 默认完整桌面与麦克风
-.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
+# 按仓库配置录制桌面与系统声音；输出文件已存在时需换名
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config/publisher.json
 
-# 可选摄像头
-.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --video-source camera --video-device "default"
+# 摄像头与默认麦克风
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --video-source camera --video-device default --audio-source microphone
+
+# 设备枚举与摄像头能力；查询不会启动桌面采集
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --list-devices
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --list-options video --video-device default
 ```
 
-上述命令会沿用 M05/M06 本地录制设置，默认保存 `output/video.mp4` 与 `output/audio.m4a`，
-已有同名文件会拒绝覆盖。要再次录制，需指定新路径或先移走旧文件。
+Windows 分别枚举摄像头、麦克风；DirectShow 能力查询输出至 stderr，不受 `logging.file` 重定向。
+Linux 视频能力查询使用 V4L2 ioctl，ALSA 在打开时协商参数。枚举/能力支持取决于驱动和 FFmpeg 后端；
+实际输入格式见首帧日志。文件实时推流示例见 [RTMP 推流](rtmp-streaming.md)。
 
-## C++ 接口与所有权
+## 接口与时间轴
 
 ```cpp
 lsl::capture::MediaInput input;
 input.openFile(config); // 或 openDevice(Kind::Video/Audio, config)
 while (auto captured = input.readFrame()) {
-    // captured->frame 为独占 AVFrame，可将整个 CapturedFrame 移动给下游。
+    // 将独占的 CapturedFrame 移动给下游。
 }
 input.close();
 ```
 
-`readFrame()` 返回 `optional<CapturedFrame>`；文件 EOF、主动停止返回空值，其他错误抛出
-AppError/FFmpegError。返回的帧由调用方独占，不会被下一次读取覆盖，输入关闭后仍可继续持有。
-复用帧或包时使用 `referenceFrame/referencePacket`，内部调用 `av_frame_ref/av_packet_ref`。
-引用共享底层缓冲，修改前先调用 FFmpeg 的 make_writable 接口。
+`readFrame()` 返回 `optional<CapturedFrame>`：EOF/停止为空，其他错误抛 `AppError/FFmpegError`。
+帧不会被下一次读取覆盖，关闭输入后仍有效；引用副本共享底层缓冲，修改像素/样本前需 make_writable。
+`CapturedFrame` 包含帧、媒体种类、原始时间基、`timestampUs` 和 `capturedAtUs`：
 
-当前入口在 `pipeline/PublisherPipeline.cpp` 的采集线程将独占帧交给音视频各自的有界原始帧队列，
-M03/M04 预处理与 M05/M06 编码分别在视频、音频处理线程完成；本地保存由唯一输出线程执行。
-参见 [预处理接口与时间轴](preprocessing.md)、[视频编码与文件输出](video-encoding.md)
-和 [AAC 音频编码](audio-encoding.md)。
-M14 的队列容量、背压、线程与收尾顺序见 [多线程流水线](threading.md)。
+- 设备使用共同单调时钟；系统回采时间先校准到该时钟域。`capturedAtUs` 是应用收到解码帧的时刻，不是传感器曝光时刻。
+- 文件以容器/轨道起点为共同原点，保留音视频偏移；优先 `best_effort_timestamp`，缺失时按样本数/帧率补齐。
+- 文件默认按时间戳节奏交付；`--realtime false` 可离线处理，但推流要求实时模式。
+- EOF 先排空解码器；`--loop true` seek 回起点并刷新解码器，时间轴接续上一轮。不支持 seek 或没有解码帧时不能循环。
 
-## 时间戳与文件节奏
+预处理如何使用时间轴见 [音视频预处理](preprocessing.md)。
 
-`CapturedFrame` 包含原始 `AVFrame`、媒体种类、时间基、`timestampUs` 与 `capturedAtUs`。
+## 生命周期与故障恢复
 
-- AVFrame 的 PTS 保留原始媒体时间；`timeBase` 用于换算原始 PTS。
-- 设备帧的 `timestampUs` 使用 `av_gettime_relative()`，桌面、摄像头与麦克风共用单调时钟域。
-  `capturedAtUs` 记录解码输出时刻；这是应用收到帧的时间，不能当作传感器曝光时刻。
-- 文件帧以容器起点/轨道起点为共同原点，保留音视频起始偏移。
-  `best_effort_timestamp` 优先于 PTS；缺失时间戳时按音频样本数或视频帧率补齐。
-- 默认按照文件时间戳等待后再交付，`capture.realtime=false` 可取消等待。
-- EOF 后先向所有解码器送空包并收完延迟帧，再退出或 seek 回起点。
-  循环会 flush 解码器；每次循环在上一轮最后一帧结束时间后继续，保持输出时间轴连续。
-  不可 seek 的文件和没有解码帧的循环会报告错误。
+设备各有采集线程；文件共用一个解复用线程后按轨分流。输入的 open/read/close 必须在同一线程执行，
+只有 `requestStop()` 可跨线程调用；不得在另一个线程读取期间直接 close。重复 close 安全，close 后可重新 open。
 
-这里的节奏控制用于提供文件直播源，不代表已完成 M13 音画播放同步。
+正常停止先请求输入停止并关闭原始队列，下游排空预处理和编码，再写本地文件尾部并回收线程；
+异常会中止队列并停采集/网络。线程、队列与完整收尾顺序见 [多线程流水线](threading.md)。
+非阻塞读包与中断回调支持停止/超时，但故障驱动的内部初始化调用可能不响应中断。
 
-## 启停与线程边界
-
-一个设备对应一个采集线程；文件的音视频轨共用一个解复用/输入解码线程，再按轨分发到有界队列。
-每个输入的 open/read/close 在同一线程执行，防止 DirectShow COM 与上下文跨线程释放。
-已在所属线程 close 的空输入对象可在主线程析构；仍持有媒体资源的对象须在所属线程析构。
-只有 `requestStop()` 可由其他线程调用：它设置原子停止标志并唤醒文件节奏等待。
-
-禁止在读取时从另一个线程直接 close。停止顺序为：requestStop → 读取返回 →
-采集线程 close 输入及原始帧队列 → 处理线程排空预处理/编码 → 输出线程完成本地文件尾部 → join。
-Ctrl+C 同时关闭原始队列，唤醒被背压阻塞的生产者；此前已入队的媒体仍由下游排空。
-重复 close 安全；已打开的输入再次 open 会报错，close 后允许重新打开。
-工作线程发生错误后立即停止其他输入、中止交接队列并中断 RTMP；
-所有线程退出后由原有顶层异常处理记录错误并返回 1。
-
-DirectShow 读包采用 `AVFMT_FLAG_NONBLOCK`，无数据时短暂等待并检查停止/超时；
-文件 I/O 配置 `AVIOInterruptCB`。Linux V4L2/ALSA 同样使用非阻塞请求。
-驱动在设备初始化等内部调用中可能不响应 FFmpeg 中断，不能据此保证任意故障驱动都能限时退出。
-
-Windows 桌面 `gdigrab` 读包遇到 `EIO` 时，在同一个采集线程释放并重建 GDI 输入和 BMP 解码器，
-每次重试间隔最多 100 ms，沿用本次读包的 `capture.timeout_ms` 总预算（默认 5000 ms）。
-恢复不会清除停止标志或重置公共媒体时钟；音频线程继续运行。日志会记录
-`Desktop capture temporarily unavailable` 和 `Desktop capture recovered`。
-持续故障超过预算仍报告采集超时并停止；首次打开失败、其他输入类型及其他错误仍直接报错。
-`requestStop()` 也会唤醒恢复等待。故障注入与运行记录见 [M14/M15 修复验证](m14-m15-fixes.md)。
-
-实现依据：[FFmpeg gdigrab 桌面设备说明](https://ffmpeg.org/ffmpeg-devices.html#gdigrab)、
-[gdigrab 读包实现](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/gdigrab.c)、
-[FFmpeg DirectShow 设备与读包实现](https://ffmpeg.org/doxygen/trunk/dshow_8c_source.html)、
-[FFmpeg V4L2 后端](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/v4l2.c)、
-[FFmpeg ALSA 后端](https://github.com/FFmpeg/FFmpeg/blob/master/libavdevice/alsa_dec.c)。
-
-## 本次完成边界
-
-历史接入已补齐 M01 媒体引用接口及 M02 采集实现、入口和配置，并接入后续预处理、编码与输出。
-此前 publisher 的 Windows Release 编译记录不作为本次修改的验证结果。
-2026-10-25 的变更新增默认 Windows 桌面采集与可选摄像头；当时按项目要求未构建、未运行测试，
-也未做真实桌面采集。当前 M14 的构建记录见 [多线程流水线](threading.md)，
-2026-10-26 已在真实桌面及系统音频流水线验证临时采集故障恢复、超时和停止；
-具体运行范围及尚未覆盖的场景见 [M14/M15 修复验证](m14-m15-fixes.md)。
+桌面读包遇到 `EIO` 时，在原采集线程释放并重建 gdigrab 和 BMP 解码器，间隔最多 100 ms，
+共用本次 `capture.timeout_ms`（默认 5000 ms）预算。恢复不重置公共媒体时钟，音频继续运行；
+停止请求可唤醒等待。持续失败超时退出；首次打开失败、其他来源/错误直接报告。
+恢复日志为 `Desktop capture temporarily unavailable` / `Desktop capture recovered`；
+已覆盖与未覆盖场景见 [采集恢复记录](m14-m15-fixes.md)。

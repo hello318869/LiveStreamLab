@@ -1,0 +1,378 @@
+--- a/trunk/src/app/srs_app_http_hooks.cpp
++++ b/trunk/src/app/srs_app_http_hooks.cpp
+@@ -34,6 +34,16 @@
+ // the timeout for hls notify, in srs_utime_t.
+ #define SRS_HLS_NOTIFY_TIMEOUT (10 * SRS_UTIME_SECONDS)
+ 
++// Hook URLs may carry a shared secret, and request/response bodies may contain
++// publish credentials. Preserve the error code and stage without propagating
++// a lower-level error chain that could contain those untrusted payloads.
++static srs_error_t srs_http_hook_redacted_error(srs_error_t err, const char *stage)
++{
++    int code = srs_error_code(err);
++    srs_freep(err);
++    return srs_error_new(code, "http hook: %s; sensitive details redacted", stage);
++}
++
+ // Global HTTP hooks instance
+ ISrsHttpHooks *_srs_hooks = NULL;
+ 
+@@ -86,11 +96,11 @@
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+         return srs_error_wrap(err, "http: on_connect failed, client_id=%s, url=%s, request=%s, response=%s, code=%d",
+-                              cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code);
++                              cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code);
+     }
+ 
+     srs_trace("http: on_connect ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -122,12 +132,12 @@
+         int ret = srs_error_code(err);
+         srs_freep(err);
+         srs_warn("http: ignore on_close failed, client_id=%s, url=%s, request=%s, response=%s, code=%d, ret=%d",
+-                 cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code, ret);
++                 cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code, ret);
+         return;
+     }
+ 
+     srs_trace("http: on_close ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return;
+ }
+@@ -164,11 +174,11 @@
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+         return srs_error_wrap(err, "http: on_publish failed, client_id=%s, url=%s, request=%s, response=%s, code=%d",
+-                              cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code);
++                              cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code);
+     }
+ 
+     srs_trace("http: on_publish ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -207,12 +217,12 @@
+         int ret = srs_error_code(err);
+         srs_freep(err);
+         srs_warn("http: ignore on_unpublish failed, client_id=%s, url=%s, request=%s, response=%s, status=%d, ret=%d",
+-                 cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code, ret);
++                 cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code, ret);
+         return;
+     }
+ 
+     srs_trace("http: on_unpublish ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return;
+ }
+@@ -251,11 +261,11 @@
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+         return srs_error_wrap(err, "http: on_play failed, client_id=%s, url=%s, request=%s, response=%s, status=%d",
+-                              cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code);
++                              cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code);
+     }
+ 
+     srs_trace("http: on_play ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -295,12 +305,12 @@
+         int ret = srs_error_code(err);
+         srs_freep(err);
+         srs_warn("http: ignore on_stop failed, client_id=%s, url=%s, request=%s, response=%s, code=%d, ret=%d",
+-                 cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code, ret);
++                 cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code, ret);
+         return;
+     }
+ 
+     srs_trace("http: on_stop ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return;
+ }
+@@ -341,11 +351,11 @@
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+         return srs_error_wrap(err, "http post on_dvr uri failed, client_id=%s, url=%s, request=%s, response=%s, code=%d",
+-                              cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code);
++                              cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code);
+     }
+ 
+     srs_trace("http hook on_dvr success. client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -397,11 +407,11 @@
+ 
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+-        return srs_error_wrap(err, "http: post %s with %s, status=%d, res=%s", url.c_str(), data.c_str(), status_code, res.c_str());
++        return srs_error_wrap(err, "http: post %s with %s, status=%d, res=%s", "[redacted]", "[redacted]", status_code, "[redacted]");
+     }
+ 
+     srs_trace("http: on_hls ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -430,12 +440,12 @@
+ 
+     SrsHttpUri uri;
+     if ((err = uri.initialize(url)) != srs_success) {
+-        return srs_error_wrap(err, "http: init url=%s", url.c_str());
++        return srs_error_wrap(err, "http: init url=%s", "[redacted]");
+     }
+ 
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = http->initialize(uri.get_schema(), uri.get_host(), uri.get_port(), SRS_HLS_NOTIFY_TIMEOUT)) != srs_success) {
+-        return srs_error_wrap(err, "http: init client for %s", url.c_str());
++        return srs_error_wrap(err, "http: init client for %s", "[redacted]");
+     }
+ 
+     std::string path = uri.get_query();
+@@ -450,7 +460,7 @@
+ 
+     ISrsHttpMessage *msg_raw = NULL;
+     if ((err = http->get(path.c_str(), "", &msg_raw)) != srs_success) {
+-        return srs_error_wrap(err, "http: get %s", url.c_str());
++        return srs_error_wrap(err, "http: get %s", "[redacted]");
+     }
+     SrsUniquePtr<ISrsHttpMessage> msg(msg_raw);
+ 
+@@ -469,7 +479,7 @@
+ 
+     int spenttime = (int)(srsu2ms(srs_time_now_realtime()) - starttime);
+     srs_trace("http hook on_hls_notify success. client_id=%s, url=%s, code=%d, spent=%dms, read=%dB, err=%s",
+-              cid.c_str(), url.c_str(), msg->status_code(), spenttime, nb_read, srs_error_desc(err).c_str());
++              cid.c_str(), "[redacted]", msg->status_code(), spenttime, nb_read, srs_error_desc(err).c_str());
+ 
+     // ignore any error for on_hls_notify.
+     srs_freep(err);
+@@ -485,19 +495,19 @@
+ 
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, "", status_code, res)) != srs_success) {
+-        return srs_error_wrap(err, "http: post %s, status=%d, res=%s", url.c_str(), status_code, res.c_str());
++        return srs_error_wrap(err, "http: post %s, status=%d, res=%s", "[redacted]", status_code, "[redacted]");
+     }
+ 
+     SrsJsonObject *robj_raw = NULL;
+     if (true) {
+         SrsJsonAny *jr = NULL;
+         if ((jr = SrsJsonAny::loads(res)) == NULL) {
+-            return srs_error_new(ERROR_OCLUSTER_DISCOVER, "load json from %s", res.c_str());
++            return srs_error_new(ERROR_OCLUSTER_DISCOVER, "load json from %s", "[redacted]");
+         }
+ 
+         if (!jr->is_object()) {
+             srs_freep(jr);
+-            return srs_error_new(ERROR_OCLUSTER_DISCOVER, "response %s", res.c_str());
++            return srs_error_new(ERROR_OCLUSTER_DISCOVER, "response %s", "[redacted]");
+         }
+ 
+         robj_raw = jr->to_object();
+@@ -506,26 +516,26 @@
+ 
+     SrsJsonAny *prop = NULL;
+     if ((prop = robj->ensure_property_object("data")) == NULL) {
+-        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", res.c_str());
++        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", "[redacted]");
+     }
+ 
+     SrsJsonObject *p = prop->to_object();
+     if ((prop = p->ensure_property_object("origin")) == NULL) {
+-        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", res.c_str());
++        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", "[redacted]");
+     }
+     p = prop->to_object();
+ 
+     if ((prop = p->ensure_property_string("ip")) == NULL) {
+-        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", res.c_str());
++        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", "[redacted]");
+     }
+     host = prop->to_str();
+ 
+     if ((prop = p->ensure_property_integer("port")) == NULL) {
+-        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", res.c_str());
++        return srs_error_new(ERROR_OCLUSTER_DISCOVER, "parse data %s", "[redacted]");
+     }
+     port = (int)prop->to_integer();
+ 
+-    srs_trace("http: cluster redirect %s:%d ok, url=%s, response=%s", host.c_str(), port, url.c_str(), res.c_str());
++    srs_trace("http: cluster redirect %s:%d ok, url=%s, response=%s", host.c_str(), port, "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -557,30 +567,30 @@
+     SrsUniquePtr<ISrsHttpClient> http(factory_->create_http_client());
+     if ((err = do_post(http.get(), url, data, status_code, res)) != srs_success) {
+         return srs_error_wrap(err, "http: on_forward_backend failed, client_id=%s, url=%s, request=%s, response=%s, code=%d",
+-                              cid.c_str(), url.c_str(), data.c_str(), res.c_str(), status_code);
++                              cid.c_str(), "[redacted]", "[redacted]", "[redacted]", status_code);
+     }
+ 
+     // parse string res to json.
+     SrsUniquePtr<SrsJsonAny> info(SrsJsonAny::loads(res));
+     if (!info.get()) {
+-        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "load json from %s", res.c_str());
++        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "load json from %s", "[redacted]");
+     }
+ 
+     // response error code in string.
+     if (!info->is_object()) {
+-        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "response %s", res.c_str());
++        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "response %s", "[redacted]");
+     }
+ 
+     SrsJsonAny *prop = NULL;
+     // response standard object, format in json: {}
+     SrsJsonObject *res_info = info->to_object();
+     if ((prop = res_info->ensure_property_object("data")) == NULL) {
+-        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "parse data %s", res.c_str());
++        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "parse data %s", "[redacted]");
+     }
+ 
+     SrsJsonObject *p = prop->to_object();
+     if ((prop = p->ensure_property_array("urls")) == NULL) {
+-        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "parse urls %s", res.c_str());
++        return srs_error_new(ERROR_SYSTEM_FORWARD_LOOP, "parse urls %s", "[redacted]");
+     }
+ 
+     SrsJsonArray *urls = prop->to_array();
+@@ -593,7 +603,7 @@
+     }
+ 
+     srs_trace("http: on_forward_backend ok, client_id=%s, url=%s, request=%s, response=%s",
+-              cid.c_str(), url.c_str(), data.c_str(), res.c_str());
++              cid.c_str(), "[redacted]", "[redacted]", "[redacted]");
+ 
+     return err;
+ }
+@@ -601,14 +611,15 @@
+ srs_error_t SrsHttpHooks::do_post(ISrsHttpClient *hc, std::string url, std::string req, int &code, string &res)
+ {
+     srs_error_t err = srs_success;
++    code = 0; // No HTTP status has been received on early transport failures.
+ 
+     SrsHttpUri uri;
+     if ((err = uri.initialize(url)) != srs_success) {
+-        return srs_error_wrap(err, "http: post failed. url=%s", url.c_str());
++        return srs_http_hook_redacted_error(err, "initialize URL");
+     }
+ 
+     if ((err = hc->initialize(uri.get_schema(), uri.get_host(), uri.get_port())) != srs_success) {
+-        return srs_error_wrap(err, "http: init client");
++        return srs_http_hook_redacted_error(err, "initialize client");
+     }
+ 
+     string path = uri.get_path();
+@@ -618,13 +629,13 @@
+ 
+     ISrsHttpMessage *msg_raw = NULL;
+     if ((err = hc->post(path, req, &msg_raw)) != srs_success) {
+-        return srs_error_wrap(err, "http: client post");
++        return srs_http_hook_redacted_error(err, "POST request");
+     }
+     SrsUniquePtr<ISrsHttpMessage> msg(msg_raw);
+ 
+     code = msg->status_code();
+     if ((err = msg->body_read_all(res)) != srs_success) {
+-        return srs_error_wrap(err, "http: body read");
++        return srs_http_hook_redacted_error(err, "read response");
+     }
+ 
+     // ensure the http status is ok.
+@@ -640,7 +651,7 @@
+     // parse string res to json.
+     SrsUniquePtr<SrsJsonAny> info(SrsJsonAny::loads(res));
+     if (!info.get()) {
+-        return srs_error_new(ERROR_HTTP_DATA_INVALID, "http: not json %s", res.c_str());
++        return srs_error_new(ERROR_HTTP_DATA_INVALID, "http: not json %s", "[redacted]");
+     }
+ 
+     // response error code in string.
+@@ -648,19 +659,19 @@
+         if (res == SRS_HTTP_RESPONSE_OK) {
+             return err;
+         }
+-        return srs_error_new(ERROR_HTTP_DATA_INVALID, "http: response number code %s", res.c_str());
++        return srs_error_new(ERROR_HTTP_DATA_INVALID, "http: response number code %s", "[redacted]");
+     }
+ 
+     // response standard object, format in json: {"code": 0, "data": ""}
+     SrsJsonObject *res_info = info->to_object();
+     SrsJsonAny *res_code = NULL;
+     if ((res_code = res_info->ensure_property_integer("code")) == NULL) {
+-        return srs_error_new(ERROR_RESPONSE_CODE, "http: response object no code %s", res.c_str());
++        return srs_error_new(ERROR_RESPONSE_CODE, "http: response object no code %s", "[redacted]");
+     }
+ 
+     if ((res_code->to_integer()) != ERROR_SUCCESS) {
+-        return srs_error_new(ERROR_RESPONSE_CODE, "http: response object code %" PRId64 " %s", res_code->to_integer(), res.c_str());
+-    }
+-
+-    return err;
+-}
++        return srs_error_new(ERROR_RESPONSE_CODE, "http: response object code %" PRId64 " %s", res_code->to_integer(), "[redacted]");
++    }
++
++    return err;
++}
+--- a/trunk/src/app/srs_app_rtmp_conn.cpp
++++ b/trunk/src/app/srs_app_rtmp_conn.cpp
+@@ -349,9 +349,9 @@
+     req->ip_ = ip_;
+ 
+     srs_trace("connect app, tcUrl=%s, pageUrl=%s, swfUrl=%s, schema=%s, vhost=%s, port=%d, app=%s, args=%s",
+-              req->tcUrl_.c_str(), req->pageUrl_.c_str(), req->swfUrl_.c_str(),
++              "[redacted]", "[redacted]", "[redacted]",
+               req->schema_.c_str(), req->vhost_.c_str(), req->port_,
+-              req->app_.c_str(), (req->args_ ? "(obj)" : "null"));
++              req->app_.c_str(), "[redacted]");
+ 
+     // show client identity
+     if (req->args_) {
+@@ -515,13 +515,13 @@
+     if (req->stream_.empty()) {
+         string app = req->app_, param = req->param_;
+         srs_net_url_guess_stream(req->app_, req->param_, req->stream_);
+-        srs_trace("Guessing by app=%s, param=%s to app=%s, param=%s, stream=%s", app.c_str(), param.c_str(), req->app_.c_str(), req->param_.c_str(), req->stream_.c_str());
++        srs_trace("Guessing by app=%s, param=%s to app=%s, param=%s, stream=%s", app.c_str(), "[redacted]", req->app_.c_str(), "[redacted]", req->stream_.c_str());
+     }
+     // LCOV_EXCL_STOP
+ 
+     req->strip();
+     srs_trace("client identified, type=%s, vhost=%s, app=%s, stream=%s, param=%s, duration=%dms",
+-              srs_client_type_string(info_->type_).c_str(), req->vhost_.c_str(), req->app_.c_str(), req->stream_.c_str(), req->param_.c_str(), srsu2msi(req->duration_));
++              srs_client_type_string(info_->type_).c_str(), req->vhost_.c_str(), req->app_.c_str(), req->stream_.c_str(), "[redacted]", srsu2msi(req->duration_));
+ 
+     // discovery vhost, resolve the vhost from config
+     SrsConfDirective *parsed_vhost = config_->get_vhost(req->vhost_);
+@@ -540,8 +540,8 @@
+     }
+ 
+     srs_trace("connected stream, tcUrl=%s, pageUrl=%s, swfUrl=%s, schema=%s, vhost=%s, port=%d, app=%s, stream=%s, param=%s, args=%s",
+-              req->tcUrl_.c_str(), req->pageUrl_.c_str(), req->swfUrl_.c_str(), req->schema_.c_str(), req->vhost_.c_str(), req->port_,
+-              req->app_.c_str(), req->stream_.c_str(), req->param_.c_str(), (req->args_ ? "(obj)" : "null"));
++              "[redacted]", "[redacted]", "[redacted]", req->schema_.c_str(), req->vhost_.c_str(), req->port_,
++              req->app_.c_str(), req->stream_.c_str(), "[redacted]", "[redacted]");
+ 
+     // do token traverse before serve it.
+     // @see https://github.com/ossrs/srs/pull/239

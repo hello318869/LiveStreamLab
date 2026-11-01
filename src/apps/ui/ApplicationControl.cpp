@@ -1,4 +1,7 @@
 #include "apps/ui/ApplicationControl.hpp"
+#include "apps/platform/ApiClient.hpp"
+#include "apps/ui/LobbyControl.hpp"
+#include "common/logger/Redaction.hpp"
 
 #include "player/ui/PlayerControl.hpp"
 #include "publisher/ui/PublisherControl.hpp"
@@ -6,7 +9,9 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QEvent>
 #include <QFont>
+#include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -14,15 +19,30 @@
 #include <QPalette>
 #include <QPointer>
 #include <QPushButton>
+#include <QSessionManager>
 #include <QVBoxLayout>
 
 #include <memory>
+#include <functional>
 
 namespace lsl::ui {
 namespace {
 QString utf8(const std::string& value) {
     return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
 }
+
+class CoordinatedApplication final : public QApplication {
+public:
+    using QApplication::QApplication;
+    std::function<bool()> permitQuit;
+protected:
+    bool event(QEvent* event) override {
+        if (event->type() == QEvent::Quit && permitQuit && !permitQuit()) {
+            event->ignore(); return true;
+        }
+        return QApplication::event(event);
+    }
+};
 
 class ApplicationHome final : public QWidget {
 public:
@@ -60,8 +80,8 @@ QPushButton:pressed { background: #2b5546; }
             QStringLiteral("分享桌面或摄像头画面\n选择麦克风或系统声音，开始直播"),
             QStringLiteral("进入开播控制台  →"), config::AppKind::Publisher));
         cards->addWidget(makeCard(QStringLiteral("我要观看"),
-            QStringLiteral("输入直播流地址，连接直播\n支持暂停、音量调节与全屏观看"),
-            QStringLiteral("进入观看播放器  →"), config::AppKind::Player));
+            QStringLiteral("浏览直播大厅，选择正在开播的主播\n支持暂停、音量调节与全屏观看"),
+            QStringLiteral("进入直播大厅  →"), config::AppKind::Player));
         layout->addLayout(cards, 1); layout->addSpacing(10);
         auto* hint = new QLabel(QStringLiteral("随时返回首页切换功能，当前会话会先停止并释放资源。"));
         hint->setObjectName(QStringLiteral("subtitle")); layout->addWidget(hint);
@@ -75,9 +95,15 @@ QPushButton:pressed { background: #2b5546; }
         }
     }
 
-    void openMode(config::AppKind mode) {
-        if (active_) return;
-        auto options = config::parseCommandLine(mode, initialMode_ == mode ? arguments_ : std::vector<std::string>{});
+    void openMode(config::AppKind mode, bool platformMode = false) {
+        if (active_ || quitting_) return;
+        if (platformMode && !platformApi_) {
+            const auto localConfig = QCoreApplication::applicationDirPath() + QStringLiteral("/config/platform.local.json");
+            platformApi_ = std::make_unique<platform::ApiClient>(platform::loadPlatformConfig(
+                QFile::exists(localConfig) ? localConfig : QCoreApplication::applicationDirPath() + QStringLiteral("/config/platform.json")));
+        }
+        auto options = config::parseCommandLine(mode,
+            !platformMode && initialMode_ == mode ? arguments_ : std::vector<std::string>{});
         if (!options.configFile) {
             const auto directory = QCoreApplication::applicationDirPath().toUtf8();
             options.configFile = std::filesystem::u8path(directory.constData()) / "config" /
@@ -98,20 +124,34 @@ QPushButton:pressed { background: #2b5546; }
         if (!logger->log(logging::Level::Info, "config", "Configuration OK")) {
             throw error::AppError("logger", error::Io, "cannot write startup log");
         }
-        auto* control = publisher ? createPublisherControl(*publisher, *logger) : createPlayerControl(*player, *logger);
+        QWidget* control = nullptr;
+        if (platformMode) {
+            control = publisher ? createPlatformPublisherControl(*publisher, *logger, *platformApi_)
+                                : createLobbyControl(*platformApi_, *player, *logger);
+        } else {
+            control = publisher ? createPublisherControl(*publisher, *logger) : createPlayerControl(*player, *logger);
+        }
         roleLogger_ = std::move(logger);
         active_ = control;
         control->setAttribute(Qt::WA_DeleteOnClose);
         connect(control, &QObject::destroyed, this, [this] {
-            active_.clear(); roleLogger_.reset(); show(); raise(); activateWindow();
+            active_.clear(); roleLogger_.reset();
+            if (quitting_) QCoreApplication::quit();
+            else { show(); raise(); activateWindow(); }
         });
         hide(); control->show();
-        if (player && player->video.fullscreen) control->showFullScreen();
+        if (player && !platformMode && player->video.fullscreen) control->showFullScreen();
+    }
+
+    bool prepareQuit() {
+        quitting_ = true;
+        if (active_) { active_->close(); return false; }
+        return true;
     }
 
 protected:
     void closeEvent(QCloseEvent* event) override {
-        if (active_) { active_->close(); event->ignore(); return; }
+        if (!prepareQuit()) { event->ignore(); return; }
         event->accept(); QCoreApplication::quit();
     }
 
@@ -126,9 +166,9 @@ private:
         auto* button = new QPushButton(buttonText); button->setCursor(Qt::PointingHandCursor);
         layout->addWidget(button);
         connect(button, &QPushButton::clicked, this, [this, mode] {
-            try { openMode(mode); }
+            try { openMode(mode, true); }
             catch (const std::exception& error) {
-                QMessageBox::critical(this, QStringLiteral("无法打开工作空间"), utf8(error.what()));
+                QMessageBox::critical(this, QStringLiteral("无法打开工作空间"), utf8(logging::redactSecrets(error.what())));
             }
         });
         return card;
@@ -137,7 +177,9 @@ private:
     std::optional<config::AppKind> initialMode_;
     std::vector<std::string> arguments_;
     std::unique_ptr<logging::Logger> roleLogger_;
+    std::unique_ptr<platform::ApiClient> platformApi_;
     QPointer<QWidget> active_;
+    bool quitting_ = false;
 };
 
 void applyTheme() {
@@ -155,13 +197,22 @@ void applyTheme() {
 int runApplicationControl(std::optional<config::AppKind> initialMode,
                           const std::vector<std::string>& arguments) {
     int argc = 1; char name[] = "livestreamlab"; char* argv[]{name, nullptr};
-    QApplication app(argc, argv);
+    CoordinatedApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("LiveStreamLab"));
     QApplication::setQuitOnLastWindowClosed(false);
     applyTheme();
     ApplicationHome home(initialMode, arguments);
+    app.permitQuit = [&home] { return home.prepareQuit(); };
+#ifndef QT_NO_SESSIONMANAGER
+    QObject::connect(&app, &QGuiApplication::commitDataRequest, &home, [&home](QSessionManager& manager) {
+        // OS shutdown may still terminate the process before HTTP completes.
+        // Request normal cleanup without a nested loop or cancelling OS shutdown.
+        manager.setRestartHint(QSessionManager::RestartNever);
+        home.prepareQuit();
+    }, Qt::DirectConnection);
+#endif
     if (initialMode) home.openMode(*initialMode);
     else home.show();
-    return app.exec();
+    const int result = app.exec(); app.permitQuit = {}; return result;
 }
 } // namespace lsl::ui

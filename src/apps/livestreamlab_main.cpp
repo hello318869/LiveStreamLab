@@ -1,4 +1,5 @@
 #include "common/config/CommandLine.hpp"
+#include "common/logger/Redaction.hpp"
 #include "player/pipeline/PlayerPipeline.hpp"
 #include "publisher/pipeline/PublisherPipeline.hpp"
 
@@ -70,6 +71,7 @@ bool queryOnly(const lsl::config::CommandLineOptions& options) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    lsl::logging::installFFmpegLogRedaction();
     try {
         const auto launch = parseLaunchOptions(lsl::config::commandLineArguments(argc, argv));
         if (!launch.mode) {

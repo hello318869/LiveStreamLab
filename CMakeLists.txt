@@ -19,6 +19,17 @@ option(LSL_BUILD_APPS "Build the unified LiveStreamLab application" ON)
 option(LSL_BUILD_GUI "Include Qt Widgets publishing and viewing controls" ON)
 option(LSL_BUILD_TESTS "Build tests" OFF)
 option(LSL_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+option(LSL_BUILD_CONTROL_SERVER "Build the Linux/WSL platform backend" OFF)
+option(LSL_BUILD_MEDIA "Build media libraries and the client application" ON)
+if(LSL_BUILD_TESTS)
+    enable_testing()
+endif()
+if(LSL_BUILD_CONTROL_SERVER)
+    add_subdirectory(src/control_server)
+endif()
+if(NOT LSL_BUILD_MEDIA)
+    return()
+endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(LiveStreamLabModules)
 find_package(Threads REQUIRED)
@@ -62,6 +73,7 @@ add_library(lsl_common STATIC
     src/common/config/Config.cpp
     src/common/config/CommandLine.cpp
     src/common/logger/Logger.cpp
+    src/common/logger/Redaction.cpp
     src/common/error/Error.cpp)
 target_include_directories(lsl_common PUBLIC src)
 target_include_directories(lsl_common SYSTEM PRIVATE external/json/include)
@@ -165,33 +177,47 @@ if(LSL_BUILD_APPS)
                 endif()
             endforeach()
         endif()
-        find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+        find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Network)
         if(WIN32)
             find_program(LSL_WINDEPLOYQT_EXECUTABLE windeployqt
                 HINTS "${Qt6_DIR}/../../../bin" REQUIRED)
         endif()
+        add_library(lsl_platform STATIC src/apps/platform/ApiClient.cpp)
+        target_include_directories(lsl_platform PUBLIC src)
+        target_link_libraries(lsl_platform PUBLIC Qt6::Network)
+        lsl_set_warnings(lsl_platform)
+
         add_library(lsl_publisher_ui STATIC src/publisher/ui/PublisherControl.cpp)
         target_link_libraries(lsl_publisher_ui PUBLIC lsl_common
-            PRIVATE lsl_publisher_pipeline lsl_capture Qt6::Widgets)
+            PRIVATE lsl_publisher_pipeline lsl_capture lsl_platform Qt6::Widgets)
         lsl_set_warnings(lsl_publisher_ui)
 
         add_library(lsl_player_ui STATIC src/player/ui/PlayerControl.cpp)
         target_link_libraries(lsl_player_ui PUBLIC lsl_common
-            PRIVATE lsl_player_pipeline Qt6::Widgets SDL3::SDL3)
+            PRIVATE lsl_player_pipeline lsl_platform Qt6::Widgets SDL3::SDL3)
         lsl_set_warnings(lsl_player_ui)
 
-        add_library(lsl_application_ui STATIC src/apps/ui/ApplicationControl.cpp)
+        add_library(lsl_application_ui STATIC
+            src/apps/ui/ApplicationControl.cpp
+            src/apps/ui/LobbyControl.cpp)
         target_link_libraries(lsl_application_ui PUBLIC lsl_common
-            PRIVATE lsl_publisher_ui lsl_player_ui Qt6::Widgets)
+            PRIVATE lsl_publisher_ui lsl_player_ui lsl_platform Qt6::Widgets)
         lsl_set_warnings(lsl_application_ui)
         target_link_libraries(livestreamlab PRIVATE lsl_application_ui)
         target_compile_definitions(livestreamlab PRIVATE LSL_WITH_GUI)
     endif()
 
-    # 默认配置随应用部署，双击启动不依赖工作目录。
+    # Only ship client defaults. Keep local deployment overrides and server files
+    # out of the client package; platform.local.json is never overwritten.
     add_custom_command(TARGET livestreamlab POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/config" "$<TARGET_FILE_DIR:livestreamlab>/config"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:livestreamlab>/config"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/publisher.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/publisher-stream.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/publisher-file.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/player.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/platform.json"
+            "$<TARGET_FILE_DIR:livestreamlab>/config"
         VERBATIM)
 
     if(WIN32)
@@ -211,6 +237,5 @@ if(LSL_BUILD_APPS)
 endif()
 
 if(LSL_BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()

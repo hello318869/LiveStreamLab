@@ -1,0 +1,33 @@
+[Unit]
+Description=LiveStreamLab control API
+Wants=network-online.target
+After=network-online.target mysql.service livestreamlab-srs.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=livestreamlab
+Group=livestreamlab
+# Drogon creates its default uploads/tmp tree below the working directory.
+StateDirectory=livestreamlab-control
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/livestreamlab-control
+EnvironmentFile=/etc/livestreamlab/control-server.env
+ExecStart=/opt/livestreamlab/bin/control_server --config /etc/livestreamlab/server.json
+Restart=on-failure
+RestartSec=3
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

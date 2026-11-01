@@ -1,141 +1,55 @@
-# M10 视频解码与 M12 SDL3 显示
+# 视频解码与显示
 
-观众端现已接通 M09 拉流 → M10 视频解码 → M12 SDL3 窗口显示。
-输入使用 RTMP/RTMPS 或 HTTP/HTTPS-FLV，视频按输入流的实际编码参数解码，按视频 PTS 控制显示节奏。
-M11 音频解码与声音输出已接入独立线程及 SDL3 音频流回调，见 [音频播放](audio-playback.md)。
-M13 已用音频主时钟替代原独立视频时钟，见 [音画同步](av-sync.md)；
-没有可用音频时降级到外部时钟，只有音频的输入保留黑色窗口并输出声音。
+视频按输入流实际参数解码，经[音画同步](av-sync.md)调度后显示。GUI 用 Qt，CLI 用 SDL3 窗口，共用解码、帧队列及 `PlayerPipeline`。构建见 [README](../README.md)，线程和详细流程见[线程模型](threading.md)、[函数调用顺序](function-call-order.md)。
 
-2026-10-25 M10/M12 阶段已通过 CMake 配置与 Windows Release 的 `player` 编译、链接，
-生成 `build/cmake/bin/Release/player.exe`。本次未启动程序、未运行测试、未连接 SRS；
-真实解码、显示效果、窗口操作和断线恢复仍需实际运行验收。
-
-## 构建与使用
-
-在工程根目录使用 CMake，无额外构建脚本。以下保留 M10/M12 阶段独立入口的历史构建命令，
-当前统一应用的构建方式见 [README](../README.md)：
+## 使用
 
 ```powershell
-cd D:\直播\LiveStreamLab
-cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
-cmake --build build/cmake --config Release --target player --parallel 1 -- /nodeReuse:false
-```
-
-首次并行构建在 MSBuild 的 `Checking File Globs` 后未继续推进，已中断；上述串行、
-禁用节点复用的命令成功。`/nodeReuse:false` 是 Windows MSBuild 参数；其他生成器可使用
-`cmake --build build/cmake --config Release --target livestreamlab --parallel` 构建当前统一应用。
-
-先准备正在推流的 SRS，再执行下面的启动命令；本次未执行：
-
-```powershell
-# 默认 HTTP-FLV 输入
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
-
-# 同一路 RTMP 输入；SRS 在其他机器时替换 127.0.0.1
-.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --url rtmp://127.0.0.1/live/livestream
-
-# 初始窗口 960x540，保留垂直同步
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --width 960 --height 540 --vsync true
-
-# 直接全屏启动
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --fullscreen true
-
-# 禁用重连；正常 EOF 时排空包队列与解码尾帧后退出
-.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --reconnect-attempts 0
 ```
 
-F、Alt+Enter 或鼠标左键双击切换全屏；Esc、关闭窗口或 Ctrl+C 停止。
-窗口可自由缩放，视频结合像素宽高比等比显示并留黑。
-`video.width` / `video.height` 仅设置初始窗口大小，不改变解码分辨率；
-`video.vsync` 默认 `true`，`video.fullscreen` 默认 `false`。完整配置见 [配置说明](configuration.md)。
+CLI 的 F/Alt+Enter/双击切全屏，Space 暂停，M/↑/↓ 调声音，Esc/关窗/Ctrl+C 停止。GUI 见[观众控制](player-control.md)。`video.width/height` 仅设置 CLI 初始窗口，不改解码分辨率；默认 1280×720、`vsync=true`、`fullscreen=false`。输入地址与重连见[拉流说明](network-demuxing.md)，全部配置见[配置说明](configuration.md)。
 
-## 模块和线程
+## 解码与帧交接
 
-| 位置 | 职责 |
+`src/player/decoder/VideoDecoder.*` 的主要接口：
+
+- `reset(track, serial)`：按快照的 codec 参数和包时间基重建软件解码器，丢弃旧连接延迟帧，等待关键帧。
+- `decode(packet, serial)`：send/receive；EAGAIN 先取输出再重送原包，支持一包多帧及延迟输出。
+- `flush()`：仅正常 EOF 发送空包排出尾帧。损坏包/帧则刷新解码器并等下一关键帧，严重资源/API 错误向上报告。
+
+解码使用 `FF_THREAD_SLICE` 帧内并行，B 帧正常重排。显示时间优先 `best_effort_timestamp`，其次帧 PTS，不用包 DTS 覆盖；时长依次取帧时长、解码器帧率、上帧时长，初值 40 ms。`DecodedVideoFrame` 独占帧结构，带 serial、微秒 PTS 和时长，底层缓冲由引用计数保活。
+
+裁剪后 YUV420P/NV12 可直通，其余支持的软件格式经 libswscale 转 YUV420P，保留时间、色彩范围和像素宽高比，跟随实际尺寸/格式变化。
+
+| 层次 | 限制与处理 |
 |---|---|
-| `src/player/decoder/VideoDecoder.*` | 解码器初始化、视频包解码、显示格式适配、解码统计 |
-| `src/player/renderer/IVideoRenderer.hpp` | 事件、显示、清屏和渲染统计接口 |
-| `src/player/renderer/SDLVideoRenderer.*` | SDL3 视频子系统、窗口、纹理和渲染后端 |
-| `src/player/sync/AVSynchronizer.*` | 音频主时钟、视频等待/丢帧、外部时钟降级与同步统计 |
-| `src/player/pipeline/PlayerPipeline.*` | 网络/解码生命周期、原始帧队列、同步调用和日志 |
+| 单次解码批次 | 最多 32 帧、128 MiB，超限保留较新输出 |
+| `VideoFrameQueue` | 默认 3 帧、64 MiB；`pipeline.video_queue_capacity` 调帧数，满时背压解码线程 |
+| 协调循环 | 非阻塞取帧，队列外最多保留一帧待显示 |
+
+等待检查停止与 serial，换代会中断旧帧入队。字节数按 FFmpeg 缓冲保守统计，解码参考帧、临时帧和显示资源另占内存；各层上限不是总内存或延迟保证。**不按解码后的墙钟年龄或队列 PTS 跨度删除提前帧**，避免首帧不断追逐未来画面。迟到判断依据播放时钟：超过 `min(sync.drop_threshold_ms, pipeline.max_video_age_ms)`（默认 100 ms）且有后续帧时可丢弃，不破坏参考链。
+
+## 两种显示后端
+
+CLI 的 `src/player/renderer/SDLVideoRenderer.*` 在应用主线程创建和释放视频资源：
 
 ```text
-网络线程：AVFormatContext → av_read_frame → 视频/音频 PacketBuffer
-解码线程：视频包 → VideoDecoder → DecodedVideoFrame → VideoFrameQueue
-音频线程：音频包 → AudioDecoder → swresample / F32 → SPSC 环 → SDL3 音频回调
-主线程：  SDL 窗口事件 → 取待显示帧 → AVSynchronizer/音频时钟 → IVideoRenderer → SDL3
+render → 检查平面/pitch → ensureTexture → 必要时转正 pitch
+       → SDL_UpdateYUVTexture / SDL_UpdateNVTexture
+       → RenderClear → RenderTexture → RenderPresent
 ```
 
-网络线程独占输入上下文，解码线程独占视频解码上下文。所有 SDL 视频操作和资源释放都在主线程执行。
-`DecodedVideoFrame` 独占 `AVFrame` 结构，携带 `serial`、微秒媒体 PTS 和帧时长，
-像素缓冲通过 FFmpeg 引用计数保活。每层在换代时撤销旧资源与输出，不借用输入上下文中的 `AVStream`。
+优先硬件后端，失败尝试 software；vsync 不支持时警告并尝试关闭。纹理跟随尺寸、格式和色彩空间重建，支持独立 pitch、负 pitch 及奇数色度尺寸。结合 SAR 等比留黑，窗口缩放/全屏时可重绘旧纹理。BT2020 NCL 依据帧元数据区分 SDR/PQ/HLG；不提供 HDR 色调映射或高位深保真，BT2020 CL 与 SDL 无法表示的色度位置报不支持。
 
-## 解码与显示
+GUI 的 `PlayerSession::MailboxRenderer` 在后台同步决定 Render 后转 RGB24，按 SAR 修正并限制在 1920×1080，只替换最新不可变帧。Qt 主线程取副本转 QImage 绘制，不创建 SDL 视频窗口；实际绘制完成后才回报端到端延迟样本。
 
-`VideoDecoder::reset(track, serial)` 根据快照中的 `AVCodecParameters` 查找软件解码器，
-导入流参数和包时间基后打开 `AVCodecContext`。`decode(packet, serial)` 使用 send/receive API：
-send 返回 EAGAIN 时先接收输出，再重试同一个尚未接受的包；receive 持续读取，覆盖一包多帧和延迟输出。
-`flush()` 通过空包排空正常 EOF 的尾帧。
+## 恢复、结束与指标
 
-解码线程只启用帧内并行（`FF_THREAD_SLICE`），避免帧级并行额外保留后续帧；
-输入自身的 B 帧仍正常重排，未强制跳过合法参考关系。
+重连、积压超限或时间戳跳变会换 serial；清包、解码器、帧队列、待显示帧和旧画面，重建时钟。即使 Reset 尚未被消费，旧代次输出也被拒绝。无流快照时只清状态并等待；纯音频输入交给[音频模块](audio-playback.md)，不产生视频帧。
 
-帧时间戳优先采用 `best_effort_timestamp`，其次采用帧 PTS，不以包 DTS 覆盖显示时间。
-帧时长依次使用解码帧时长、解码器帧率、上一帧时长；初始缺省为 40 ms。
-YUV420P/NV12 软件帧可直接交接，其他支持的软件格式通过 libswscale 转为 YUV420P，
-保留时间信息、色彩范围和像素宽高比。帧尺寸和像素格式变化按实际输出处理。
-损坏包或损坏帧触发解码器刷新，等待下一关键帧恢复；严重初始化、资源或 API 错误向顶层报告。
+默认 EOF 重连；仅禁用重连时正常 EOF 才排空尾帧。停止/故障/换代丢弃旧内容；所有工作线程收到停止后 join，随后回收输出资源。
 
-SDL3 优先尝试硬件渲染后端，失败后尝试 software；垂直同步不受支持时记录警告并尝试关闭。
-YUV420P 使用 `SDL_UpdateYUVTexture`，NV12 使用 `SDL_UpdateNVTexture`；
-各平面保留独立 pitch，负 pitch 先复制到正向临时帧，支持奇数尺寸的色度平面。
-尺寸、像素格式或色彩空间变化会重建纹理；显示通过逻辑分辨率与 letterbox 保持比例。
-窗口缩放、重新显示或全屏切换时，即使没有新视频帧，也会重绘已有纹理。
-
-BT2020 NCL 按帧内的色域、传递函数和色度位置设置 SDL 元数据，避免把 SDR、PQ 与 HLG 混用。
-HDR 显示仍取决于 SDL 后端和设备；本轮未实现 HDR 色调映射或高位深保真，
-BT2020 CL 与 SDL 无法表示的色度位置会明确报告不支持。
-
-## 缓冲、时序和停止
-
-网络包缓冲继续沿用 [M09](network-demuxing.md) 的包数、字节数、媒体跨度和墙钟年龄限制。
-视频解码后的交接另外限制为：
-
-- 单次解码返回批次最多保留 32 帧、128 MiB，超限丢弃较旧的输出。
-- `VideoFrameQueue` 默认最多 3 帧、64 MiB，满时背压视频解码线程，主线程取帧保持非阻塞。
-  帧数由 `pipeline.video_queue_capacity` 配置；字节上限保持 64 MiB。等待期间检查停止及网络代次，
-  换代时退出旧帧入队等待，允许解码线程继续处理 Reset。
-- 主线程在队列外另持有最多一帧等待显示。
-
-字节统计按所持有的 FFmpeg 缓冲计算，帧队列对共享缓冲采用保守计数。
-这些是各层交接限额，不是整个播放器的内存或端到端延迟保证；解码参考帧、转换临时帧与 SDL 纹理另占资源。
-丢弃已解码帧不会破坏解码器的参考帧链。
-
-`AVSynchronizer` 将视频 PTS 与同代次音频估计播放位置比较，默认提前超过 40 ms 等待，
-迟到超过 `min(sync.drop_threshold_ms, pipeline.max_video_age_ms)`（默认 100 ms）
-且仍有后续帧时丢弃当前帧。小幅抖动由容差吸收；缺失 PTS 用帧时长补时，
-但不把补时值记为真实音画误差。初始音频、欠载恢复或有效音频时钟停滞超过等待上限后，
-使用单调外部时钟降级，音频恢复时再跟随音频进度。首次对齐时保留提前候选帧，等待音频到达它的 PTS；
-已经对齐后，提前候选帧等待过久且有后续帧时才更新候选，
-无帧期间也观察同步暂停。时间戳异常与代次恢复的处理见 [M13](av-sync.md)。
-
-拉流探测或网络突发可能让视频提前解码，而音频仍按播放节奏消费缓存。
-若按“解码后 200 ms”或队列 PTS 跨度丢帧，再反复替换等待中的首帧，会持续追逐更超前的画面，
-出现视频解码数增长但显示数为零、声音正常的黑屏。帧队列背压及按播放时钟判断迟到用于避免这条路径。
-
-重连、包缓冲超限或网络时间戳跳变递增 `serial`；解码线程重开解码器并清空帧队列，
-主线程丢弃旧待显示帧、清屏并重置时钟。网络线程已换代而 Reset 尚未被解码线程取到时，
-旧代次的包和解码输出同样会被丢弃。
-首次连接失败而尚无流参数快照时，Reset 只清理状态并继续等待 M09 重连，
-实际探测到输入仅包含音频时，由 M11 输出声音，视频线程保持无帧状态。
-
-默认把网络 EOF 作为断流重连；仅 `--reconnect-attempts 0` 下的正常 EOF 排空解码尾帧后退出。
-网络失败先检查并传播错误；停止或换代不会把旧连接的延迟帧刷到窗口。
-用户退出时先向网络、音视频工作线程全部发出停止，中断网络 I/O、中止帧交接并唤醒音频背压等待，
-再统一 join 工作线程，最后在主线程释放 SDL 音频与视频资源。
-通用队列正常 EOF 关闭后可排空，主动停止中止后丢弃；完整线程及缓冲约定见 [M14 多线程流水线](threading.md)。
-
-每秒日志包含解码/显示 FPS、累计帧数、平均解码与显示耗时、纹理上传次数、帧队列字节数、
-帧/压缩包/PCM 环最大积压、
-各层丢帧/丢包、解码错误、网络缓冲与重连次数。显示耗时包含垂直同步等待；
-解码耗时包含 send/receive 和像素适配。编译成功及这些统计接口的存在不代表已取得真实播放性能数据。
+每秒日志报告解码/显示 FPS、耗时、纹理上传、各层积压/峰值、丢帧/丢包与错误。解码耗时含像素适配，CLI 显示耗时含 vsync 等待；GUI 后台提交数不等于屏幕刷新率。统一指标见[性能统计](performance-statistics.md)。

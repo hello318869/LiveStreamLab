@@ -1,0 +1,6 @@
+{
+  "api_base": "http://127.0.0.1:8090",
+  "request_timeout_ms": 8000,
+  "lobby_refresh_ms": 5000,
+  "room_refresh_ms": 5000
+}

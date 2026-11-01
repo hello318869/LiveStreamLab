@@ -1,0 +1,39 @@
+{
+  "http": {
+    "address": "127.0.0.1",
+    "port": 8090,
+    "threads": 2,
+    "max_body_bytes": 16384
+  },
+  "database": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 3306,
+    "name": "livestreamlab_platform",
+    "user": "lsl_control",
+    "password_env": "LSL_DB_PASSWORD",
+    "connections": 4,
+    "timeout_seconds": 5
+  },
+  "addresses": {
+    "api_public_base": "http://127.0.0.1:8090",
+    "rtmp_public_base": "rtmp://127.0.0.1:1935",
+    "playback_public_base": "http://127.0.0.1:8080",
+    "srs_api_internal_base": "http://127.0.0.1:1985",
+    "srs_app": "live",
+    "srs_vhost": "__defaultVhost__"
+  },
+  "srs": {
+    "expected_version": "8.0.58",
+    "hook_secret_env": "LSL_SRS_HOOK_SECRET",
+    "trusted_sources": ["127.0.0.1", "::1"],
+    "request_timeout_seconds": 2,
+    "reconcile_seconds": 3
+  },
+  "lifecycle": {
+    "prepare_seconds": 120,
+    "reconnect_seconds": 20,
+    "no_media_seconds": 15,
+    "auth_ttl_seconds": 86400
+  }
+}

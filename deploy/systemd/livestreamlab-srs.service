@@ -1,0 +1,34 @@
+[Unit]
+Description=LiveStreamLab pinned SRS 8.0.58 with credential-redaction patch
+Wants=network-online.target
+After=network-online.target mysql.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=livestreamlab
+Group=livestreamlab
+# The installed SRS tree is read-only; relative runtime paths live here.
+StateDirectory=livestreamlab-srs
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/livestreamlab-srs
+ExecStartPre=/usr/bin/mkdir -p /var/lib/livestreamlab-srs/objs/nginx/html
+ExecStart=/opt/livestreamlab/srs/trunk/objs/srs -c /etc/livestreamlab/srs-platform.local.conf
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=10000
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# getifaddrs uses a netlink socket to enumerate the interfaces SRS requires.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -34,7 +34,7 @@ C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理�
 ## 构建
 
 需要 CMake ≥ 3.24、支持 C++17 的编译器，以及含 **libavdevice** 的 FFmpeg ≥ 6 开发 SDK。
-SDL3 与 nlohmann/json 已放在 `external/`；Qt 界面另需 Qt 6.5+ Widgets（本机 `external/qt/6.8.3/msvc2022_64` 会被自动找到）。
+SDL3 与 nlohmann/json 已放在 `external/`；Qt 界面另需 Qt 6.5+ Widgets、Network（本机 `external/qt/6.8.3/msvc2022_64` 会被自动找到）。
 
 ```powershell
 cd D:\直播\LiveStreamLab
@@ -48,6 +48,17 @@ cmake --build build/cmake --config Release --target livestreamlab --parallel
 - 中文路径下若 SDL 预编译头报 C4828，配置时加 `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`
 - 测试默认关闭；仅在明确要求测试时开启并执行
 
+### 网络控制服务与平台客户端（N01—N06）
+
+Linux/WSL 后端可使用 `src/control_server/CMakeLists.txt` 或项目顶层 CMake 构建，生成 `control_server`，
+不依赖客户端的 Qt、FFmpeg 或 SDL3。已提供注册/登录/退出、认证、个人房间、直播申请/停止、
+大厅与播放查询、SRS 回调鉴权和周期状态对账。N04/N05 客户端已接入直播大厅、
+登录注册、个人房间设置及平台开播/下播；N06 补齐恢复意图、有限重试、退出回收和部署模板。
+操作与边界见 [平台客户端](docs/platform-client.md)、[恢复行为](docs/platform-recovery.md)。
+顶层只编译后端时设置 `LSL_BUILD_CONTROL_SERVER=ON`、`LSL_BUILD_MEDIA=OFF`。
+固定依赖、CMake 命令与验证边界见 [后端构建与配置](docs/platform-deployment.md)，
+接口见 [HTTP 契约](docs/platform-api.md)。
+
 ## 启动
 
 构建后双击 `build/cmake/bin/Release/livestreamlab.exe`，或从工程目录执行：
@@ -56,15 +67,20 @@ cmake --build build/cmake --config Release --target livestreamlab --parallel
 .\build\cmake\bin\Release\livestreamlab.exe
 ```
 
-首页选择“我要开播”进入采集设备、预览和直播控制，选择“我要观看”进入地址、播放和音量控制。
-进入功能窗口不会自动开播或拉流。点击“返回首页”或关闭功能窗口，会先停止当前会话并释放资源，
-再回到首页选择另一功能；关闭首页退出软件。
+首页选择“我要观看”进入公开直播大厅，选择主播后自动播放，返回时先停止媒体再回到大厅。
+选择“我要开播”先登录或注册，再设置房间标题、分类和采集参数；点击开始后向后端申请独立直播会话。
+本地预览不申请开播，推流地址由后端提供。返回首页或关闭功能窗口先停止当前媒体并释放资源；关闭首页退出软件。
+
+平台入口优先读取程序旁 `config/platform.local.json`，否则读取 `platform.json`，默认 `http://127.0.0.1:8090`。
+本机覆盖文件不会被重新构建覆盖；修改地址后重启客户端。
+业务后端、数据库迁移和 SRS 平台鉴权需先按 [部署说明](docs/platform-deployment.md) 配置运行。
+客户端代码已接入不代表这些服务已部署；本轮没有启动、重启或修改运行中的服务。
 
 CMake 将默认配置复制到程序旁的 `config/`。GUI 按可执行文件位置加载 `publisher-stream.json` 或
 `player.json`，双击启动不依赖当前工作目录。显式 `--config` 覆盖默认配置，媒体参数须配合 `--mode`：
 
 ```powershell
-# 直接进入开播 / 观看界面
+# 直接进入原有地址工具界面（不经过平台登录或大厅）
 .\build\cmake\bin\Release\livestreamlab.exe --mode publisher
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --url rtmp://127.0.0.1/live/livestream
 ```
@@ -113,6 +129,8 @@ CLI 播放窗口中 `F` / `Alt+Enter` / 双击切换全屏，`Esc` 停止；`Spa
 | `config/publisher-stream.json` | 推流：关闭本地文件，开启 `output.streaming` |
 | `config/publisher-file.json` | 本地文件循环推流 |
 | `config/player.json` | 观众端：HTTP-FLV 地址、超时重连、同步阈值、队列与日志 |
+| `config/platform.json` | 平台 API 地址、HTTP 超时、大厅及当前房间状态刷新间隔 |
+| 程序旁 `config/platform.local.json` | 各设备自己的平台入口覆盖文件，不纳入 Git、不被构建覆盖 |
 
 录制产物写入 `output/`，目录不存在会自动创建；文件名已存在时拒绝覆盖。
 字段含义与全部命令行参数见 [配置说明](docs/configuration.md)。
@@ -129,3 +147,4 @@ CLI 播放窗口中 `F` / `Alt+Enter` / 双击切换全屏，`Esc` 停止；`Spa
 - 观众端：[拉流解封装](docs/network-demuxing.md)、[视频播放](docs/video-playback.md)、[音频播放](docs/audio-playback.md)、[音画同步](docs/av-sync.md)
 - 工程：[多线程与队列](docs/threading.md)、[网络可靠性](docs/network-reliability.md)、[性能统计](docs/performance-statistics.md)、[延迟优化](docs/latency.md)
 - 界面：[主播控制](docs/publisher-control.md)、[观众控制](docs/player-control.md)
+- 平台：[客户端流程](docs/platform-client.md)、[HTTP 契约](docs/platform-api.md)、[部署配置](docs/platform-deployment.md)、[恢复行为](docs/platform-recovery.md)、[部署模板](deploy/README.md)

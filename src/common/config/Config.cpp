@@ -1,4 +1,5 @@
 #include "common/config/Config.hpp"
+#include "common/logger/Redaction.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -507,12 +508,16 @@ PlayerConfig loadPlayerConfig(const std::optional<std::filesystem::path>& file, 
 
 std::string toJson(const PublisherConfig& c) {
     validate(c);
-    return document(c).dump(2);
+    auto data = document(c);
+    data["output"]["url"] = logging::redactUrlCredentials(c.outputUrl);
+    return data.dump(2);
 }
 
 std::string toJson(const PlayerConfig& c) {
     validate(c);
-    return document(c).dump(2);
+    auto data = document(c);
+    data["input"]["url"] = logging::redactUrlCredentials(c.inputUrl);
+    return data.dump(2);
 }
 
 } // namespace lsl::config

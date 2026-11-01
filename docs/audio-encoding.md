@@ -1,100 +1,55 @@
-# M06 AAC 音频编码与自动保存
+# AAC 编码与音频文件（M06）
 
-主播端将输入音频解码为 PCM，经 M04 重采样和 FIFO 组帧后送入 AAC-LC 编码器。
-默认自动保存为 `output/audio.m4a`，目录不存在时创建，已有文件拒绝覆盖。
-相对路径以启动工作目录为准；从 `D:\直播\LiveStreamLab` 启动时，输出位于
-`D:\直播\LiveStreamLab\output\audio.m4a`。
+`src/publisher/encoder/AudioEncoder` 将预处理 PCM 编码为 AAC-LC；
+`src/publisher/muxer/AudioFileWriter` 保存独立 M4A。CLI 默认 `output/audio.m4a`，
+GUI 禁用本地文件；合并 H.264/AAC 推流见 [RTMP 推流](rtmp-streaming.md)，构建见 [README](../README.md)。
 
-当前视频保存为 `output/video.mp4`，音频保存为独立 M4A（内部编码为 AAC）。
-M07 已提供 H.264/AAC 合并封装与推流，设置 `output.streaming=true` / `--stream true` 后连接 `output.url`。
-默认仍仅保存本地文件；推流用法见 [M07](rtmp-streaming.md)。下文保留 M06 阶段的实现与验证记录。
+## 参数与协商
 
-当前 `encoder/AudioEncoder` 属于 `lsl_audio_encoder`，`muxer/AudioFileWriter` 属于 `lsl_muxer`，
-由 `pipeline/PublisherPipeline` 组合调用。命名空间分别为 `lsl::encoder` 与 `lsl::muxer`。
-
-## 编码参数与预处理协商
-
-| 字段 | 默认值 | 含义 |
+| JSON 字段 | 默认值 | 作用 |
 |---|---|---|
-| `audio.sample_rate` | 48000 | AAC 采样率，时间基为 `1/sample_rate` |
-| `audio.channels` | 2 | 单声道或双声道 |
-| `audio.bitrate` | 128000 | 目标码率，bit/s |
-| `output.audio_file` | `output/audio.m4a` | 本地音频文件路径；空字符串禁用写出 |
-| `capture.audio_source` | `microphone` | 设备模式选择麦克风或 Windows 系统声音 `system`；文件模式仍用文件音轨 |
-| `preprocess.audio.gain_db` | 0 | -60..30 dB 软件增益，0 保留原始电平，不修改 Windows 音量 |
-| `preprocess.audio.sample_format` | `fltp` | PCM 格式偏好；编码器不支持时改用其支持的格式 |
-| `preprocess.audio.frame_size` | 1024 | M04 独立使用时的帧长；主播端按 AAC 实际 `frame_size` 组帧 |
+| `audio.sample_rate` | 48000 | Hz，时间基 `1/sample_rate` |
+| `audio.channels` / `bitrate` | 2 / 128000 | 单/双声道；目标码率 bit/s |
+| `output.audio_file` | `output/audio.m4a` | 空字符串禁用本地写出 |
+| `preprocess.audio.sample_format` | `fltp` | PCM 格式偏好，以编码器实际接受的格式为准 |
+| `preprocess.audio.frame_size` | 1024 | 独立预处理帧长；编码链路按 AAC 实际 frame_size 组帧 |
+| `preprocess.audio.gain_db` | 0 | -60..30 dB 软件增益，不修改设备音量 |
 
-先打开 AAC 编码器，再用其实际采样格式、采样率、声道数和帧长创建音频预处理器。
-优先使用 FFmpeg 原生 `aac` 编码器，使用 AAC-LC 配置；不支持指定采样率或声道布局时报告错误。
-初始化日志打印实际参数，PCM 偏好被覆盖时另有提示。
+优先 FFmpeg 原生 `aac`，不支持请求的采样率/布局时报错。
+先打开编码器，再用实际格式、采样率、声道和帧长创建 `AudioPreprocessor`；日志报告协商参数。
+音源选择与配置默认值区别见 [输入](capture.md)，增益/时间跳变见 [预处理](preprocessing.md)。
 
-常规 PCM 帧含完整的 `frame_size` 个每声道样本。结束时先排空重采样器，再处理 FIFO 余数：
-
-- 编码器支持 `AV_CODEC_CAP_SMALL_LAST_FRAME`：输出一次实际余数长度的最终帧，之后只能刷新编码器。
-- 不支持短尾帧：由 M04 补静音到完整帧长，并计入 `paddedSamples`。
-- 采集停顿形成的中间片段始终补齐完整帧，允许随后继续编码；短帧只用于整段流的最后。
-
-M04 独立使用时，`AudioPreprocessOptions::padFinalFrame` 默认仍为 `true`。
-主播端根据编码器能力设置此值，无需手工指定新的配置。
-
-## 时间戳、延迟与所有权
+## 时间戳、尾帧与接口
 
 ```text
-MediaInput → CapturedFrame → AudioEncoder 参数协商
-  → AudioPreprocessor（重采样 → FIFO → PCM AVFrame）
-  → AudioEncoder → 独占 AAC AVPacket → AudioFileWriter → output/audio.m4a
+原始音频队列 → AudioPreprocessor → AudioEncoder::encode()
+  → 输出事件队列 → AudioFileWriter::write() / RtmpPublisher::submitAudio()
 ```
 
-PCM 的 PTS 按累计样本推进，保留与视频共用时间轴上的起始偏移；不把音频首帧单独归零。
-输入帧时间区间不能重叠或倒退，采集停顿造成的正向 PTS 跳变允许保留。
+PCM PTS 按累计每声道样本推进，保留与视频的共同起始偏移；编码输入区间不能倒退或重叠，
+允许正向时间跳变。AAC 有内部延迟，`encode()` 返回零到多个独占包；EAGAIN 时取包后重送同一帧。
 
-AAC 编码有内部延迟，一次输入可能产生零个或多个包。send 返回 EAGAIN 时先取出已有包，
-再重送同一帧；结束时发送空帧并 receive 至 EOF。`flush()` 幂等，无输入时不会生成音频包。
+正常结束先排空重采样器、FIFO：编码器支持 `AV_CODEC_CAP_SMALL_LAST_FRAME` 时输出一次短尾帧，
+随后只能 flush；否则补静音到完整帧。采集中间断点始终补完整帧。独立预处理默认
+`padFinalFrame=true`，主播端按编码器能力设置，相关统计见 [预处理](preprocessing.md)。
 
-输出包保留编码器产生的 PTS、DTS、duration 和 side data。首包因 priming 可能有负时间戳，
-不会擅自裁掉或移到零；`parameters()` 返回的独占参数保留 AudioSpecificConfig 和
-`initial_padding`。M4A 写出器复制编码参数，保留包 side data，按流时间基换算时间戳，
-由容器处理编码延迟。这些信息也供 M07 与视频合并输出。
+`flush()` 送空帧并 receive 至 EOF，幂等，无输入不产包。包保留 PTS/DTS/duration/side data；
+priming 可能产生负时间戳。`parameters()` 保留 AudioSpecificConfig、initial_padding；
+M4A 写出器按实际流时间基换算，由容器表示编码延迟，不单独把首包归零。
 
-M14 中采集线程通过有界原始音频队列交接独占帧，音频处理线程串行完成预处理与 AAC 编码，
-再通过有界输出事件队列交给唯一输出线程写入 M4A，并按配置提交 RTMP。
-音频原始队列与编码输出队列满时等待容量，不任意丢样本或本地录制编码包。
-包通过 `PacketPtr` 移动交接，两条输出路径使用独立包引用；线程与背压详见 [多线程流水线](threading.md)。
+正常排空尾包后 `finish()` 写尾、刷新并关闭 I/O，检查错误且幂等。
+相对路径基于启动目录，目录自动创建，已有文件拒绝覆盖，无音频帧不建空文件。
+异常或强杀不能保证文件完整。所有权/背压见 [多线程流水线](threading.md)。
 
-正常 EOF / Ctrl+C 的顺序：停止输入、关闭输入和原始音频队列 → 排空已入队 PCM 与预处理 →
-排空编码器 → 输出线程排空事件、写完文件尾部并关闭。
-`finish()` 幂等并检查写尾、刷新和关闭错误；异常文件不会报告为完整输出。
-关闭音频输入或源文件没有音频时，不创建空音频文件。
+## 使用
 
-## 构建与使用
+以下命令从工程根目录运行：
 
 ```powershell
-cd D:\直播\LiveStreamLab
-cmake -S . -B build/cmake -DLSL_BUILD_TESTS=OFF
-cmake --build build/cmake --config Release --parallel
+# 只将文件音轨重编码为 M4A
+.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:/media/sample.mp4" --capture-video false --audio-file output/file-audio.m4a
 ```
 
-以下为使用命令，本次未执行：
-
-```powershell
-# 沿用配置，分别自动保存视频 MP4 与 AAC 音频 M4A；Ctrl+C 正常结束
-.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --config config\publisher.json
-
-# 只处理本地文件的音轨，EOF 后写尾退出
-.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:\media\sample.mp4" --capture-video false --audio-file output/file-audio.m4a
-
-# 设置音频码率；已有文件需换一个输出名称
-.\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --audio-bitrate 192000 --audio-file output/audio-02.m4a
-```
-
-JSON 中设置 `output.audio_file` 为 `""`，或使用 `--set output.audio_file=`，可只编码和统计。
-统计日志包含 `encoded_audio_frames`、`encoded_audio_samples`、`aac_packets` 和 `aac_bytes`；
-样本数指每声道样本数，编码字节数不代表网络发送量。
-
-M06 当时的 Windows Release CMake 完整构建通过，包括当时的 `lsl_audio_encode`、`lsl_preprocess`、
-`lsl_capture`、`publisher` 和 `player` 的编译、链接。
-M06 初次接入时只进行了编译。在 2026-10-24 的后续音频诊断中，用户当时允许测试，
-已完成增益定向测试、已知音调文件回归，
-以及短时麦克风和 WASAPI 系统声音采集后的 AAC/M4A 解码检查。
-音源选择、弱输入处理和实测证据见 [音频诊断](audio-diagnosis.md)。
+系统声音用 `--audio-source system`，码率用 `--audio-bitrate`；`--set output.audio_file=` 禁用本地写出。
+日志 `encoded_audio_frames/samples`、`aac_packets/bytes`
+表示编码量；样本数按每声道计，字节数不是网络流量。弱输入诊断及已有实测证据见 [音频诊断](audio-diagnosis.md)。

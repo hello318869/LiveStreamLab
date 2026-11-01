@@ -3,12 +3,15 @@
 #include "publisher/capture/MediaInput.hpp"
 #include "publisher/pipeline/PublisherSession.hpp"
 #include "common/stats/PerformanceStats.hpp"
+#include "apps/platform/ApiClient.hpp"
+#include "common/logger/Redaction.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -16,6 +19,7 @@
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPlainTextEdit>
@@ -28,7 +32,11 @@
 #include <QSpinBox>
 #include <QStandardItemModel>
 #include <QStyle>
+#include <QStackedWidget>
 #include <QTimer>
+#include <QUuid>
+#include <QUrl>
+#include <QRegularExpression>
 #include <QVBoxLayout>
 #include <QVariant>
 
@@ -304,15 +312,18 @@ QLabel#errorBanner { background: #2a1d1f; color: #e5b6b0; border: 1px solid #583
 
 class PublisherWindow final : public QWidget {
 public:
-    PublisherWindow(config::PublisherConfig config, logging::Logger& logger)
-        : initial_(std::move(config)), logger_(logger), session_(logger) {
+    PublisherWindow(config::PublisherConfig config, logging::Logger& logger, platform::ApiClient* api = nullptr)
+        : initial_(std::move(config)), logger_(logger), session_(logger), api_(api) {
         logger_.enableMemoryLog(512);
         setObjectName(QStringLiteral("publisherWindow"));
         setWindowTitle(QStringLiteral("Local Live Studio · 主播控制"));
         setWindowIcon(icon(Glyph::Studio));
         resize(1280, 820); setMinimumSize(1120, 760);
         setStyleSheet(QString::fromLatin1(stylesheet));
-        auto* root = new QHBoxLayout(this);
+        auto* outer = new QVBoxLayout(this); outer->setContentsMargins(0, 0, 0, 0);
+        pages_ = new QStackedWidget; outer->addWidget(pages_);
+        auto* workspace = new QWidget; pages_->addWidget(workspace);
+        auto* root = new QHBoxLayout(workspace);
         root->setContentsMargins(0, 0, 0, 0); root->setSpacing(0);
         root->addWidget(buildSidebar());
         auto* main = new QWidget;
@@ -329,21 +340,551 @@ public:
         timer_->setInterval(100);
         connect(timer_, &QTimer::timeout, this, [this] { pollSafely(); });
         timer_->start(); poll();
+        if (api_) {
+            loginPage_ = buildLogin(); pages_->addWidget(loginPage_);
+            platformTimer_ = new QTimer(this); platformTimer_->setInterval(api_->config().roomRefreshMs);
+            connect(platformTimer_, &QTimer::timeout, this, [this] { refreshPlatformState(); });
+            platformTimer_->start();
+            if (api_->authenticated()) { restoreRecovery(); loadRoom(); }
+            else pages_->setCurrentWidget(loginPage_);
+        }
     }
     ~PublisherWindow() override {
         if (timer_) timer_->stop();
+        if (api_) api_->cancel(this);
         session_.requestStop();
         // session_ 成员先于 QWidget 基类析构，join 后才释放子控件与 QApplication。
     }
 protected:
     void closeEvent(QCloseEvent* event) override {
-        closing_ = true; pendingLive_.reset(); session_.requestStop();
-        if (active(session_.snapshot().state)) {
+        if (!closing_) {
+            closeClock_.start();
+            closing_ = true; pendingLive_.reset(); session_.requestStop();
+            if (api_) { cancelRequested_ = true; requestPlatformStop(); }
+        }
+        if (active(session_.snapshot().state) || (platformBusy() && !remoteCloseGraceExpired())) {
             event->ignore(); start_->setEnabled(false); stop_->setEnabled(false); previewButton_->setEnabled(false);
             banner_->setText(QStringLiteral("正在停止采集并释放资源，完成后自动关闭窗口。")); banner_->show();
         } else event->accept();
     }
 private:
+    bool platformBusy() const {
+        return authBusy_ || roomBusy_ || applying_ || stopBusy_ || recoveryBusy_ || logoutBusy_;
+    }
+    bool remoteCloseGraceExpired() const {
+        return closing_ && closeClock_.isValid() &&
+            closeClock_.elapsed() >= (api_ ? std::min(api_->config().requestTimeoutMs, 2000) : 0);
+    }
+    static bool terminal(const QString& status) {
+        return status == QStringLiteral("ENDED") || status == QStringLiteral("FAILED");
+    }
+    static bool validSessionId(const QString& id) {
+        static const QRegularExpression pattern(QStringLiteral("^[0-9a-f]{32}$"));
+        return pattern.match(id).hasMatch();
+    }
+    static bool validRoomId(const QString& id) {
+        static const QRegularExpression pattern(QStringLiteral("^[1-9][0-9]{0,19}$"));
+        return pattern.match(id).hasMatch();
+    }
+    static bool validRequestId(const QString& id) {
+        static const QRegularExpression pattern(QStringLiteral("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"));
+        return pattern.match(id).hasMatch();
+    }
+    static bool sameRecovery(const platform::PublishRecovery& a, const platform::PublishRecovery& b) {
+        return a.roomId == b.roomId && a.clientRequestId == b.clientRequestId &&
+            a.liveSessionId == b.liveSessionId && a.stopRequested == b.stopRequested;
+    }
+    void restoreRecovery() {
+        auto record = api_->publishRecovery();
+        if (!validRoomId(record.roomId) ||
+            (!validRequestId(record.clientRequestId) && !validSessionId(record.liveSessionId))) return;
+        // 新窗口/重新登录时没有存活的本地发布会话，恢复原有明确的回收责任。
+        record.stopRequested = true; api_->setPublishRecovery(record);
+        roomId_ = record.roomId;
+        if (validRequestId(record.clientRequestId)) requestId_ = record.clientRequestId;
+        uncertainApply_ = record.liveSessionId.isEmpty(); stopPostAttempts_ = 0;
+    }
+    void rememberAttempt() {
+        if (!api_->authenticated() || !validRoomId(roomId_) || !validRequestId(requestId_)) return;
+        api_->setPublishRecovery({roomId_, requestId_, ownedSessionId_, false});
+    }
+    void clearRecovery(const platform::PublishRecovery& record) {
+        if (sameRecovery(api_->publishRecovery(), record)) api_->clearPublishRecovery();
+    }
+    bool canVerifyCancelledRequest() const {
+        const auto record = api_->publishRecovery();
+        return roomLoaded_ && platformStatus_ == QStringLiteral("OFFLINE") && observedSessionId_.isEmpty() &&
+            record.stopRequested && record.liveSessionId.isEmpty() && record.roomId == roomId_ &&
+            validRequestId(record.clientRequestId);
+    }
+    void verifyCancelledRequest() {
+        const auto record = api_->publishRecovery();
+        if (!canVerifyCancelledRequest()) return;
+        // 用户明确核实旧申请；不存在时可能新建一个准备会话，取得响应后立即结束，绝不启动媒体。
+        requestId_ = record.clientRequestId; cancelRequested_ = true; uncertainApply_ = true;
+        pendingLive_.reset(); pendingPlatformConfig_.reset(); stopPostAttempts_ = 0;
+        applying_ = true; setPlatformState(QStringLiteral("正在核实并结束上次申请；如尚未创建，将创建准备记录后立即取消。"));
+        api_->request(this, "POST", QStringLiteral("/api/v1/me/room/live-sessions"),
+            {{QStringLiteral("client_request_id"), requestId_}}, true,
+            [this, requestId = requestId_](platform::ApiResult result) { finishApply(requestId, std::move(result)); });
+    }
+    void refreshPlatformState() {
+        if (closing_ || platformBusy() || needsLogin_ || logoutRequested_ || !api_->authenticated()) return;
+        if (!roomLoaded_) { loadRoom(); return; }
+        const auto record = api_->publishRecovery();
+        if (record.stopRequested || (!record.clientRequestId.isEmpty() && ownedSessionId_.isEmpty())) {
+            recoverOwnPreparation(); return;
+        }
+        queryPlatformSession();
+    }
+    static bool knownSessionStatus(const QString& status) {
+        return status == QStringLiteral("PREPARING") || status == QStringLiteral("LIVE") ||
+            status == QStringLiteral("RECONNECTING") || status == QStringLiteral("STOPPING") || terminal(status);
+    }
+    static bool matchesSession(const QJsonObject& payload, const QString& sessionId, const QString& roomId) {
+        return validSessionId(sessionId) && validRoomId(roomId) &&
+            payload.value(QStringLiteral("live_session_id")).toString() == sessionId &&
+            payload.value(QStringLiteral("room_id")).toString() == roomId &&
+            knownSessionStatus(payload.value(QStringLiteral("status")).toString());
+    }
+    bool validOwnRoom(const QJsonObject& payload, const QString& expectedRoomId = {}) const {
+        const QString id = payload.value(QStringLiteral("room_id")).toString();
+        const auto currentSession = payload.value(QStringLiteral("current_session_id"));
+        const QString session = currentSession.toString();
+        const QString status = payload.value(QStringLiteral("status")).toString();
+        return validRoomId(id) && (expectedRoomId.isEmpty() || id == expectedRoomId) &&
+            payload.value(QStringLiteral("owner")).toObject().value(QStringLiteral("id")).toString() ==
+                api_->user().value(QStringLiteral("id")).toString() &&
+            ((currentSession.isNull() && status == QStringLiteral("OFFLINE")) ||
+             (currentSession.isString() && validSessionId(session) && knownSessionStatus(status)));
+    }
+    static QString platformStatusText(const QString& status) {
+        if (status == QStringLiteral("PREPARING")) return QStringLiteral("等待服务器确认媒体就绪");
+        if (status == QStringLiteral("LIVE")) return QStringLiteral("正在直播 · 已由服务器确认");
+        if (status == QStringLiteral("RECONNECTING")) return QStringLiteral("直播连接恢复中");
+        if (status == QStringLiteral("STOPPING")) return QStringLiteral("正在下播，等待服务器确认");
+        if (status == QStringLiteral("ENDED")) return QStringLiteral("直播已结束");
+        if (status == QStringLiteral("FAILED")) return QStringLiteral("直播会话失败，可重新开播");
+        return QStringLiteral("尚未开播");
+    }
+    void setPlatformState(const QString& text) {
+        if (platformState_) platformState_->setText(text);
+    }
+    QWidget* buildLogin() {
+        auto* page = new QWidget; auto* outer = new QVBoxLayout(page);
+        outer->setContentsMargins(260, 50, 260, 50); outer->addStretch();
+        outer->addWidget(label(QStringLiteral("登录后开启直播"), "pageTitle"));
+        outer->addWidget(label(QStringLiteral("公开直播无需登录即可观看。登录状态仅保存在本次运行中。"), "fieldLabel"));
+        sectionLabel(outer, QStringLiteral("用户名 · 3–32 位小写字母、数字或下划线"));
+        username_ = new QLineEdit; username_->setMaxLength(32); outer->addWidget(username_);
+        sectionLabel(outer, QStringLiteral("昵称 · 注册时填写"));
+        nickname_ = new QLineEdit; nickname_->setMaxLength(64); outer->addWidget(nickname_);
+        sectionLabel(outer, QStringLiteral("密码 · UTF-8 编码 8–128 字节"));
+        password_ = new QLineEdit; password_->setEchoMode(QLineEdit::Password); password_->setMaxLength(128);
+        outer->addWidget(password_);
+        auto* row = new QHBoxLayout;
+        login_ = new QPushButton(QStringLiteral("登录")); register_ = new QPushButton(QStringLiteral("注册账号"));
+        row->addWidget(login_); row->addWidget(register_); outer->addLayout(row);
+        authState_ = label({}, "fieldLabel"); authState_->setWordWrap(true); outer->addWidget(authState_);
+        auto* home = new QPushButton(QStringLiteral("返回首页")); outer->addWidget(home);
+        connect(home, &QPushButton::clicked, this, &QWidget::close);
+        connect(login_, &QPushButton::clicked, this, [this] { authenticate(false); });
+        connect(register_, &QPushButton::clicked, this, [this] { authenticate(true); });
+        connect(password_, &QLineEdit::returnPressed, this, [this] { authenticate(false); });
+        outer->addStretch(); return page;
+    }
+    QWidget* buildRoomSettings() {
+        auto* card = panel("settingsCard"); auto* layout = new QVBoxLayout(card);
+        layout->addWidget(label(QStringLiteral("我的平台直播间"), "sectionTitle"));
+        account_ = label({}, "fieldLabel"); account_->setWordWrap(true); layout->addWidget(account_);
+        sectionLabel(layout, QStringLiteral("直播标题")); roomTitle_ = new QLineEdit;
+        roomTitle_->setMaxLength(240); layout->addWidget(roomTitle_);
+        sectionLabel(layout, QStringLiteral("分类")); category_ = new QComboBox;
+        const QStringList titles{QStringLiteral("综合"), QStringLiteral("游戏"), QStringLiteral("音乐"), QStringLiteral("教育"), QStringLiteral("科技")};
+        const QStringList values{QStringLiteral("general"), QStringLiteral("gaming"), QStringLiteral("music"), QStringLiteral("education"), QStringLiteral("technology")};
+        for (int i = 0; i < values.size(); ++i) category_->addItem(titles[i], values[i]);
+        layout->addWidget(category_);
+        auto* actions = new QHBoxLayout; saveRoom_ = new QPushButton(QStringLiteral("保存房间"));
+        refreshRoom_ = new QPushButton(QStringLiteral("刷新状态"));
+        actions->addWidget(saveRoom_); actions->addWidget(refreshRoom_); layout->addLayout(actions);
+        platformState_ = label(QStringLiteral("正在读取房间"), "fieldLabel"); platformState_->setWordWrap(true);
+        layout->addWidget(platformState_);
+        logout_ = new QPushButton(QStringLiteral("退出登录")); layout->addWidget(logout_);
+        connect(saveRoom_, &QPushButton::clicked, this, [this] { saveRoom({}); });
+        connect(refreshRoom_, &QPushButton::clicked, this, [this] {
+            if (observedSessionId_.isEmpty()) loadRoom(); else queryPlatformSession();
+        });
+        connect(logout_, &QPushButton::clicked, this, [this] { beginLogout(); });
+        return card;
+    }
+    void authenticate(bool registration) {
+        if (authBusy_ || closing_) return;
+        const QString username = username_->text();
+        const QString nickname = nickname_->text();
+        const QString password = password_->text(); password_->clear();
+        const auto passwordSize = password.toUtf8().size();
+        static const QRegularExpression namePattern(QStringLiteral("^[a-z0-9_]{3,32}$"));
+        if (!namePattern.match(username).hasMatch() || passwordSize < 8 || passwordSize > 128 ||
+            (registration && (nickname.trimmed().isEmpty() || nickname.toUcs4().size() > 32))) {
+            authState_->setText(QStringLiteral("请检查用户名、密码长度，以及注册昵称。密码已清空，请重新输入。")); return;
+        }
+        authBusy_ = true; login_->setEnabled(false); register_->setEnabled(false);
+        authState_->setText(registration ? QStringLiteral("正在注册…") : QStringLiteral("正在登录…"));
+        QJsonObject body{{QStringLiteral("username"), username}, {QStringLiteral("password"), password}};
+        if (registration) body.insert(QStringLiteral("nickname"), nickname);
+        api_->request(this, "POST", registration ? QStringLiteral("/api/v1/auth/register") : QStringLiteral("/api/v1/auth/login"),
+            body, false, [this, registration](platform::ApiResult result) {
+                authBusy_ = false; login_->setEnabled(true); register_->setEnabled(true);
+                if (closing_) return;
+                if (!result.ok()) { authState_->setText(result.message); return; }
+                if (registration) { authState_->setText(QStringLiteral("注册成功，请输入密码后登录。")); return; }
+                const auto token = result.data.value(QStringLiteral("access_token")).toString();
+                const auto user = result.data.value(QStringLiteral("user")).toObject();
+                if (token.isEmpty() || !validRoomId(user.value(QStringLiteral("id")).toString())) {
+                    authState_->setText(QStringLiteral("登录响应不完整，请重试。")); return;
+                }
+                try { api_->setAuthentication(token, user); }
+                catch (const std::exception&) { authState_->setText(QStringLiteral("登录响应无效，请重试。")); return; }
+                nickname_->clear(); uiError_.clear();
+                if (!closing_) { restoreRecovery(); pages_->setCurrentIndex(0); loadRoom(); }
+            });
+    }
+    bool authenticationLost(const platform::ApiResult& result) {
+        if (result.httpStatus != 401) return false;
+        api_->clearAuthentication(); cancelRequested_ = true; pendingLive_.reset();
+        session_.requestStop(); needsLogin_ = true;
+        uiError_ = QStringLiteral("登录已失效，本地媒体已停止，请重新登录。");
+        setPlatformState(uiError_); return true;
+    }
+    void loadRoom() {
+        if (roomBusy_ || closing_ || !api_->authenticated()) return;
+        roomBusy_ = true; setPlatformState(QStringLiteral("正在读取房间…"));
+        api_->request(this, "GET", QStringLiteral("/api/v1/me/room"), {}, true, [this](platform::ApiResult result) {
+            roomBusy_ = false;
+            if (authenticationLost(result) || closing_) return;
+            if (!result.ok()) { setPlatformState(result.message + QStringLiteral("，可点击刷新状态重试。")); return; }
+            if (!validOwnRoom(result.data, roomId_)) {
+                setPlatformState(QStringLiteral("房间响应不完整，请刷新重试。")); return;
+            }
+            roomId_ = result.data.value(QStringLiteral("room_id")).toString();
+            if (!validRoomId(roomId_)) { roomId_.clear(); setPlatformState(QStringLiteral("房间响应不完整，请刷新重试。")); return; }
+            roomTitle_->setText(result.data.value(QStringLiteral("title")).toString());
+            category_->setCurrentIndex(std::max(0, category_->findData(result.data.value(QStringLiteral("category")).toString())));
+            account_->setText(api_->user().value(QStringLiteral("nickname")).toString() + QStringLiteral(" · 房间 ") + roomId_);
+            observedSessionId_ = result.data.value(QStringLiteral("current_session_id")).toString();
+            if (!observedSessionId_.isEmpty() && !validSessionId(observedSessionId_)) {
+                observedSessionId_.clear(); roomId_.clear(); setPlatformState(QStringLiteral("房间响应不完整，请刷新重试。")); return;
+            }
+            platformStatus_ = result.data.value(QStringLiteral("status")).toString();
+            roomLoaded_ = true;
+            setPlatformState(platformStatusText(platformStatus_));
+            if (result.meta.value(QStringLiteral("media_service_status")).toString() != QStringLiteral("AVAILABLE"))
+                setPlatformState(QStringLiteral("直播状态暂不可确认，可刷新重试。"));
+            refreshPlatformState();
+        });
+    }
+    void saveRoom(std::function<void(bool)> complete) {
+        if (roomBusy_ || closing_ || !api_->authenticated() || roomId_.isEmpty()) {
+            if (complete) complete(false); return;
+        }
+        const QString title = roomTitle_->text();
+        if (title.trimmed().isEmpty() || title.toUcs4().size() > 120) {
+            setPlatformState(QStringLiteral("标题需要 1–120 个字符。")); if (complete) complete(false); return;
+        }
+        roomBusy_ = true; setPlatformState(QStringLiteral("正在保存房间…"));
+        api_->request(this, "PATCH", QStringLiteral("/api/v1/me/room"),
+            {{QStringLiteral("title"), title}, {QStringLiteral("category"), category_->currentData().toString()}}, true,
+            [this, complete = std::move(complete)](platform::ApiResult result) {
+                roomBusy_ = false;
+                const bool success = !authenticationLost(result) && result.ok() && validOwnRoom(result.data, roomId_);
+                if (!closing_) setPlatformState(success ? QStringLiteral("房间资料已保存。")
+                    : (result.ok() ? QStringLiteral("房间响应不完整，请刷新重试。") : result.message));
+                if (complete) complete(success);
+            });
+    }
+    void startPlatformLive() {
+        if (closing_ || needsLogin_ || platformBusy() || !observedSessionId_.isEmpty() ||
+            logoutRequested_ || !api_->authenticated() || !roomLoaded_ || roomId_.isEmpty()) return;
+        if (canVerifyCancelledRequest()) { verifyCancelledRequest(); return; }
+        if (api_->publishRecovery().stopRequested) return;
+        try {
+            auto config = formConfig(); config::validate(config);
+            pendingPlatformConfig_ = std::move(config);
+        } catch (const std::exception& problem) { showUiError(problem); return; }
+        cancelRequested_ = false; uiError_.clear(); stopPostAttempts_ = 0; needsStopConfirmation_ = false;
+        // 响应丢失后再次点击仍使用同一个 UUID，不创建并行会话。
+        if (requestId_.isEmpty()) requestId_ = QUuid::createUuid().toString(QUuid::WithoutBraces).toLower();
+        saveRoom([this](bool success) {
+            if (!success || closing_ || cancelRequested_) {
+                pendingPlatformConfig_.reset();
+                if (!uncertainApply_ && ownedSessionId_.isEmpty() &&
+                    api_->publishRecovery().clientRequestId != requestId_) requestId_.clear();
+                return;
+            }
+            applying_ = true; uncertainApply_ = true; setPlatformState(QStringLiteral("正在申请开播…"));
+            rememberAttempt();
+            const QString requestId = requestId_;
+            api_->request(this, "POST", QStringLiteral("/api/v1/me/room/live-sessions"),
+                {{QStringLiteral("client_request_id"), requestId}}, true,
+                [this, requestId](platform::ApiResult result) { finishApply(requestId, std::move(result)); });
+        });
+    }
+    void finishApply(const QString& requestId, platform::ApiResult result) {
+        applying_ = false;
+        if (authenticationLost(result)) { pendingPlatformConfig_.reset(); return; }
+        const QString id = result.data.value(QStringLiteral("live_session_id")).toString();
+        const QString returnedRequestId = result.data.value(QStringLiteral("client_request_id")).toString();
+        if (!result.ok()) {
+            pendingPlatformConfig_.reset();
+            if (result.httpStatus == 409 && matchesSession(result.data, id, roomId_) && !returnedRequestId.isEmpty()) {
+                observedSessionId_ = id; platformStatus_ = result.data.value(QStringLiteral("status")).toString();
+                uncertainApply_ = false;
+                const bool same = returnedRequestId == requestId;
+                if (same) {
+                    ownedSessionId_ = id;
+                    api_->setPublishRecovery({roomId_, requestId, id, closing_ || cancelRequested_});
+                } else {
+                    const auto record = api_->publishRecovery();
+                    if (record.clientRequestId == requestId) clearRecovery(record);
+                }
+                setPlatformState(same ? QStringLiteral("本次申请已创建会话，但推流凭证无法再次取得。请明确结束该会话后重新开播。")
+                    : QStringLiteral("房间已有其他客户端的会话。可刷新状态，或明确结束该会话。"));
+                if (terminal(platformStatus_)) { clearTerminalSession(); }
+                else if ((closing_ || cancelRequested_) && same) {
+                    ownedSessionId_ = id; requestPlatformStop();
+                }
+            } else {
+                // 明确的参数/限频拒绝不保留一次新开播操作；网络及服务错误保留 UUID。
+                if (result.httpStatus >= 400 && result.httpStatus < 500 && result.httpStatus != 409) {
+                    const auto record = api_->publishRecovery();
+                    if (record.clientRequestId == requestId) clearRecovery(record);
+                    uncertainApply_ = false; requestId_.clear();
+                }
+                setPlatformState(result.message + QStringLiteral("；可重试申请。"));
+            }
+            if ((closing_ || cancelRequested_) && uncertainApply_) recoverOwnPreparation();
+            return;
+        }
+        // 在任何本地启动或自动撤销前，先确认响应对应本次房间、请求与新建准备会话。
+        if (result.httpStatus != 201 || requestId_ != requestId || returnedRequestId != requestId ||
+            !matchesSession(result.data, id, roomId_) ||
+            result.data.value(QStringLiteral("status")).toString() != QStringLiteral("PREPARING")) {
+            pendingPlatformConfig_.reset(); uncertainApply_ = true;
+            setPlatformState(QStringLiteral("开播响应不完整，正在核实本次准备会话。"));
+            // 不信任不完整响应中的会话 ID，通过个人房间和会话查询核对后再回收。
+            auto record = api_->publishRecovery(); record.stopRequested = true; api_->setPublishRecovery(record);
+            recoverOwnPreparation(); return;
+        }
+        uncertainApply_ = false; ownedSessionId_ = id; observedSessionId_ = id;
+        platformStatus_ = QStringLiteral("PREPARING");
+        rememberAttempt();
+        if (closing_ || cancelRequested_) { pendingPlatformConfig_.reset(); requestPlatformStop(); return; }
+        const QUrl publishUrl(result.data.value(QStringLiteral("publish_url")).toString());
+        if (!publishUrl.isValid() || publishUrl.host().isEmpty() ||
+            (publishUrl.scheme() != QStringLiteral("rtmp") && publishUrl.scheme() != QStringLiteral("rtmps")) ||
+            !publishUrl.userInfo().isEmpty() || !pendingPlatformConfig_) {
+            pendingPlatformConfig_.reset(); setPlatformState(QStringLiteral("推流地址响应无效，正在取消准备会话。"));
+            requestPlatformStop(); return;
+        }
+        auto config = std::move(*pendingPlatformConfig_); pendingPlatformConfig_.reset();
+        config.outputUrl = bytes(publishUrl.toString(QUrl::FullyEncoded));
+        try {
+            config::validate(config); mediaOwned_ = true; cleanupRequested_ = false;
+            if (active(session_.snapshot().state)) { pendingLive_ = std::move(config); session_.requestStop(); }
+            else { previewRequested_ = false; clearPreview(); if (!session_.start(config)) requestPlatformStop(); }
+            setPlatformState(platformStatusText(platformStatus_));
+        } catch (const std::exception& problem) { showUiError(problem); requestPlatformStop(); }
+    }
+    void recoverOwnPreparation() {
+        if (recoveryBusy_ || applying_ || stopBusy_ || !api_->authenticated()) return;
+        const auto record = api_->publishRecovery();
+        if (!validRoomId(record.roomId) || record.roomId != roomId_ ||
+            (!validSessionId(record.liveSessionId) && !validRequestId(record.clientRequestId))) return;
+        recoveryBusy_ = true;
+        if (validSessionId(record.liveSessionId)) { inspectRecoverySession(record, record.liveSessionId); return; }
+        api_->request(this, "GET", QStringLiteral("/api/v1/me/room"), {}, true,
+            [this, record](platform::ApiResult result) {
+                if (authenticationLost(result) || !result.ok() || !sameRecovery(api_->publishRecovery(), record) ||
+                    !validOwnRoom(result.data, record.roomId)) { recoveryUnconfirmed(); return; }
+                const QString id = result.data.value(QStringLiteral("current_session_id")).toString();
+                if (!validSessionId(id)) {
+                    // 一次空查询不能证明先前超时的事务以后不会提交。保留 UUID，可安全重试同一次申请。
+                    recoveryBusy_ = false;
+                    platformStatus_ = QStringLiteral("OFFLINE");
+                    setPlatformState(record.stopRequested
+                        ? QStringLiteral("上次申请的结束结果仍未确认。可点击“核实并结束上次申请”，仅复用原请求编号核实并取消。")
+                        : QStringLiteral("未发现当前直播；可以重试申请，客户端将继续复用未确认的请求编号。")); return;
+                }
+                inspectRecoverySession(record, id);
+            });
+    }
+    void inspectRecoverySession(platform::PublishRecovery record, const QString& id) {
+        api_->request(this, "GET", QStringLiteral("/api/v1/live-sessions/") + id, {}, true,
+            [this, record, id](platform::ApiResult result) mutable {
+                recoveryBusy_ = false;
+                if (result.httpStatus == 404 && result.code == QStringLiteral("LIVE_SESSION_NOT_FOUND") &&
+                    sameRecovery(api_->publishRecovery(), record)) {
+                    clearRecovery(record);
+                    if (observedSessionId_ == id || ownedSessionId_ == id) clearTerminalSession();
+                    setPlatformState(QStringLiteral("服务器已无此直播会话，可以重新开播。")); return;
+                }
+                if (authenticationLost(result) || !result.ok() || !sameRecovery(api_->publishRecovery(), record) ||
+                    !matchesSession(result.data, id, record.roomId)) { recoveryUnconfirmed(); return; }
+                const QString actualRequest = result.data.value(QStringLiteral("client_request_id")).toString();
+                if (!record.clientRequestId.isEmpty() && actualRequest != record.clientRequestId) {
+                    // 同一房间只有一个有效会话。另一请求占用房间时，绝不能把恢复意图转给它。
+                    if (record.liveSessionId.isEmpty()) {
+                        clearRecovery(record);
+                        if (requestId_ == record.clientRequestId) { requestId_.clear(); uncertainApply_ = false; }
+                    }
+                    setPlatformState(QStringLiteral("房间当前会话属于另一次开播，已保留该会话；请刷新状态。")); return;
+                }
+                const QString status = result.data.value(QStringLiteral("status")).toString();
+                if (terminal(status)) {
+                    clearRecovery(record);
+                    if (observedSessionId_ == id || ownedSessionId_ == id) clearTerminalSession();
+                    else if (requestId_ == record.clientRequestId) { requestId_.clear(); uncertainApply_ = false; }
+                    setPlatformState(platformStatusText(status)); return;
+                }
+                record.liveSessionId = id;
+                if (!actualRequest.isEmpty()) record.clientRequestId = actualRequest;
+                api_->setPublishRecovery(record);
+                // 只有查询确认属于本次请求的会话才恢复本进程的回收责任。
+                if (observedSessionId_.isEmpty() || observedSessionId_ == id) {
+                    observedSessionId_ = id; ownedSessionId_ = id; platformStatus_ = status; uncertainApply_ = false;
+                }
+                if (!record.stopRequested) {
+                    setPlatformState(QStringLiteral("本次申请已建立会话，推流凭证无法再次取得；请明确结束该会话后重新开播。")); return;
+                }
+                if (status == QStringLiteral("STOPPING")) { setPlatformState(platformStatusText(status)); return; }
+                if (!result.data.value(QStringLiteral("allow_publish")).isBool() ||
+                    !result.data.value(QStringLiteral("allow_publish")).toBool()) {
+                    recoveryUnconfirmed(); return;
+                }
+                // 每次重发下播前先确认确切的会话仍允许发布；最多三次，之后保留人工重试入口。
+                sendPlatformStop(record);
+            });
+    }
+    void recoveryUnconfirmed() {
+        recoveryBusy_ = false;
+        if (!closing_ && !needsLogin_) setPlatformState(QStringLiteral("未能确认本次准备会话，可刷新状态或使用同一次申请重试。"));
+    }
+    void requestPlatformStop(bool explicitExisting = false) {
+        pendingLive_.reset(); pendingPlatformConfig_.reset(); session_.requestStop();
+        if (!api_->authenticated()) return;
+        const QString id = !ownedSessionId_.isEmpty() ? ownedSessionId_ : (explicitExisting ? observedSessionId_ : QString{});
+        auto record = api_->publishRecovery();
+        if (!id.isEmpty()) {
+            if (record.liveSessionId != id) {
+                record = {roomId_, id == ownedSessionId_ ? requestId_ : QString{}, id, true};
+            } else record.stopRequested = true;
+            api_->setPublishRecovery(record);
+        } else if (record.clientRequestId == requestId_ && !requestId_.isEmpty()) {
+            record.stopRequested = true; api_->setPublishRecovery(record);
+        }
+        if (stopBusy_ || applying_ || recoveryBusy_) return;
+        ++sessionEpoch_;
+        if (id.isEmpty()) {
+            if (record.stopRequested && (uncertainApply_ || validRequestId(record.clientRequestId))) recoverOwnPreparation();
+            return;
+        }
+        if (needsStopConfirmation_) { recoverOwnPreparation(); return; }
+        sendPlatformStop(record);
+    }
+    void sendPlatformStop(const platform::PublishRecovery& record) {
+        if (stopBusy_ || !sameRecovery(api_->publishRecovery(), record) || !record.stopRequested) return;
+        if (stopPostAttempts_ >= 3) {
+            setPlatformState(QStringLiteral("本地已停止，下播确认仍未完成；可手动重试或稍后重新进入控制台。")); return;
+        }
+        const QString id = record.liveSessionId; const QString roomId = record.roomId;
+        if (!validSessionId(id) || !validRoomId(roomId)) return;
+        ++stopPostAttempts_; needsStopConfirmation_ = true;
+        ++sessionEpoch_; const auto epoch = sessionEpoch_;
+        stopBusy_ = true; setPlatformState(QStringLiteral("本地已请求停止，正在申请下播…"));
+        api_->request(this, "POST", QStringLiteral("/api/v1/live-sessions/") + id + QStringLiteral("/stop"), {}, true,
+            [this, id, roomId, epoch, record](platform::ApiResult result) {
+                stopBusy_ = false;
+                if (authenticationLost(result)) return;
+                if (result.httpStatus == 404 && result.code == QStringLiteral("LIVE_SESSION_NOT_FOUND") &&
+                    sameRecovery(api_->publishRecovery(), record)) {
+                    clearRecovery(record);
+                    if (observedSessionId_ == id || ownedSessionId_ == id) clearTerminalSession();
+                    setPlatformState(QStringLiteral("服务器已无此直播会话，本地已停止。")); return;
+                }
+                if (!result.ok()) { setPlatformState(QStringLiteral("本地已停止，下播请求未确认，可点击停止直播重试。")); return; }
+                if (roomId_ != roomId || epoch != sessionEpoch_ || !sameRecovery(api_->publishRecovery(), record)) return;
+                if (!matchesSession(result.data, id, roomId) ||
+                    (result.data.value(QStringLiteral("status")).toString() != QStringLiteral("STOPPING") &&
+                     !terminal(result.data.value(QStringLiteral("status")).toString()))) {
+                    setPlatformState(QStringLiteral("本地已停止，下播响应不完整，请刷新状态或重试下播。")); return;
+                }
+                platformStatus_ = result.data.value(QStringLiteral("status")).toString();
+                setPlatformState(platformStatusText(platformStatus_));
+                if (terminal(platformStatus_)) {
+                    clearRecovery(record);
+                    if (observedSessionId_ == id || ownedSessionId_ == id) clearTerminalSession();
+                }
+            });
+    }
+    void clearTerminalSession() {
+        const auto record = api_->publishRecovery();
+        if (validSessionId(record.liveSessionId) &&
+            (record.liveSessionId == observedSessionId_ || record.liveSessionId == ownedSessionId_))
+            clearRecovery(record);
+        session_.requestStop(); pendingLive_.reset(); pendingPlatformConfig_.reset();
+        ownedSessionId_.clear(); observedSessionId_.clear(); requestId_.clear();
+        mediaOwned_ = false; uncertainApply_ = false; needsStopConfirmation_ = false; stopPostAttempts_ = 0;
+    }
+    void queryPlatformSession() {
+        if (sessionQueryBusy_ || platformBusy() || closing_ || !api_->authenticated() || observedSessionId_.isEmpty()) return;
+        const QString id = observedSessionId_; const QString roomId = roomId_;
+        const auto epoch = sessionEpoch_; sessionQueryBusy_ = true;
+        api_->request(this, "GET", QStringLiteral("/api/v1/live-sessions/") + id, {}, true,
+            [this, id, roomId, epoch](platform::ApiResult result) {
+                sessionQueryBusy_ = false;
+                if (authenticationLost(result) || closing_ || observedSessionId_ != id || roomId_ != roomId || epoch != sessionEpoch_) return;
+                if (result.httpStatus == 404 && result.code == QStringLiteral("LIVE_SESSION_NOT_FOUND")) {
+                    clearTerminalSession(); setPlatformState(QStringLiteral("服务器已无此直播会话，本地已停止，可以重新开播。")); return;
+                }
+                if (!result.ok()) { setPlatformState(QStringLiteral("平台状态查询失败，本地媒体状态见预览区，可刷新重试。")); return; }
+                if (!matchesSession(result.data, id, roomId)) {
+                    setPlatformState(QStringLiteral("会话状态响应不完整，保持本地媒体状态，可刷新重试。")); return;
+                }
+                platformStatus_ = result.data.value(QStringLiteral("status")).toString();
+                setPlatformState(platformStatusText(platformStatus_));
+                if (platformStatus_ == QStringLiteral("STOPPING") || terminal(platformStatus_)) {
+                    pendingLive_.reset(); session_.requestStop();
+                    if (terminal(platformStatus_)) clearTerminalSession();
+                } else if (result.meta.value(QStringLiteral("media_service_status")).toString() != QStringLiteral("AVAILABLE")) {
+                    setPlatformState(QStringLiteral("直播状态暂不可确认；本地媒体继续运行。"));
+                }
+            });
+    }
+    void beginLogout() {
+        if (platformBusy() || closing_) return;
+        if (!observedSessionId_.isEmpty() || active(session_.snapshot().state)) {
+            setPlatformState(QStringLiteral("请先停止本地预览和当前直播，再退出登录。")); return;
+        }
+        const auto record = api_->publishRecovery();
+        if (!record.clientRequestId.isEmpty() || !record.liveSessionId.isEmpty()) {
+            logoutRequested_ = true; cancelRequested_ = true;
+            requestPlatformStop(); return;
+        }
+        finishLogout();
+    }
+    void finishLogout() {
+        logoutRequested_ = false;
+        logoutBusy_ = true;
+        api_->request(this, "POST", QStringLiteral("/api/v1/auth/logout"), {}, true,
+            [this](platform::ApiResult result) {
+                logoutBusy_ = false;
+                if (result.code == QStringLiteral("AUTHENTICATION_CHANGED")) return;
+                // 即使服务不可用也允许退出本地登录；明确提示服务端撤销尚未确认。
+                api_->clearAuthentication(); needsLogin_ = true;
+                authState_->setText(result.ok() || result.httpStatus == 401 ? QStringLiteral("已退出登录。")
+                    : QStringLiteral("已退出本地登录，服务端令牌撤销未确认。"));
+            });
+    }
     QWidget* buildSidebar() {
         auto* side = panel("sidebar"); side->setFixedWidth(188);
         auto* layout = new QVBoxLayout(side);
@@ -408,6 +949,7 @@ private:
         addressLayout->addLayout(addressTitle); addressDisplay_ = new QLineEdit;
         addressDisplay_->setObjectName(QStringLiteral("addressDisplay")); addressDisplay_->setReadOnly(true);
         addressLayout->addWidget(addressDisplay_); layout->addWidget(addressCard);
+        if (api_) addressCard->hide();
         auto* logs = panel(); auto* logLayout = new QVBoxLayout(logs);
         logLayout->setContentsMargins(12, 7, 12, 7); logLayout->setSpacing(2);
         auto* logTitle = new QHBoxLayout; logTitle->addWidget(label(QStringLiteral("运行日志"), "sectionTitle"));
@@ -426,6 +968,7 @@ private:
         settingsScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         auto* content = new QWidget; settingsContent_ = content; auto* layout = new QVBoxLayout(content);
         layout->setContentsMargins(18, 20, 18, 20); layout->setSpacing(15);
+        if (api_) layout->addWidget(buildRoomSettings());
         captureSection_ = new QWidget; auto* captureLayout = new QVBoxLayout(captureSection_);
         captureLayout->setContentsMargins(0, 0, 0, 0); captureLayout->setSpacing(10);
         captureLayout->addWidget(label(QStringLiteral("采集设备"), "sectionTitle"));
@@ -455,8 +998,10 @@ private:
         outputLayout->addWidget(label(QStringLiteral("输出设置"), "sectionTitle"));
         auto* outputCard = panel("settingsCard"); auto* output = new QVBoxLayout(outputCard);
         output->setContentsMargins(13, 14, 13, 14); output->setSpacing(8);
-        sectionLabel(output, QStringLiteral("RTMP / RTMPS 地址")); url_ = new QLineEdit(utf8(initial_.outputUrl));
+        if (!api_) sectionLabel(output, QStringLiteral("RTMP / RTMPS 地址"));
+        url_ = new QLineEdit(api_ ? QString{} : utf8(initial_.outputUrl));
         url_->setPlaceholderText(QStringLiteral("rtmp://127.0.0.1/live/livestream")); output->addWidget(url_);
+        if (api_) url_->hide();
         sectionLabel(output, QStringLiteral("输出分辨率")); resolution_ = new QComboBox;
         const QSize initialSize(initial_.video.width, initial_.video.height);
         for (const auto& size : {initialSize, QSize(1920, 1080), QSize(1280, 720), QSize(960, 540), QSize(640, 360)})
@@ -520,7 +1065,19 @@ private:
         connect(url_, &QLineEdit::textChanged, this, [this] { addressDisplay_->setText(url_->text()); addressDisplay_->setCursorPosition(0); });
         connect(refresh_, &QPushButton::clicked, this, [this] { refreshDevices(); });
         connect(start_, &QPushButton::clicked, this, [this] { startLive(); });
-        connect(stop_, &QPushButton::clicked, this, [this] { session_.requestStop(); pollSafely(); });
+        connect(stop_, &QPushButton::clicked, this, [this] {
+            if (api_) {
+                const auto recorded = api_->publishRecovery();
+                if (ownedSessionId_.isEmpty() && !observedSessionId_.isEmpty() &&
+                    !(recorded.stopRequested && recorded.liveSessionId == observedSessionId_) &&
+                    QMessageBox::question(this, QStringLiteral("结束已有直播"),
+                        QStringLiteral("该会话可能由其他客户端使用。确定结束此直播会话？")) != QMessageBox::Yes) return;
+                cancelRequested_ = true; pendingLive_.reset(); session_.requestStop();
+                stopPostAttempts_ = 0;
+                requestPlatformStop(true);
+            } else session_.requestStop();
+            pollSafely();
+        });
         connect(previewButton_, &QPushButton::clicked, this, [this] { togglePreview(); });
         connect(copyAddress_, &QPushButton::clicked, this, [this] {
             QApplication::clipboard()->setText(addressDisplay_->text()); copyAddress_->setText(QStringLiteral("已复制"));
@@ -631,7 +1188,9 @@ private:
         config.capture.video = true; config.capture.audio = true; config.capture.loop = false; config.capture.realtime = true;
         config.videoDevice = config.capture.videoSource == "camera" ? deviceValue(camera_) : "default";
         config.audioDevice = config.capture.audioSource == "microphone" ? bytes(audioSource_->currentData(audioDeviceRole).toString()) : "default";
-        config.outputUrl = bytes(url_->text()); config.streaming.enabled = true; config.videoFile.clear(); config.audioFile.clear();
+        // 平台预览/参数校验使用占位地址，真实地址仅存在于申请成功后的配置副本中。
+        config.outputUrl = api_ ? "rtmp://127.0.0.1/live/preparing" : bytes(url_->text());
+        config.streaming.enabled = true; config.videoFile.clear(); config.audioFile.clear();
         const QSize size = resolution_->currentData().toSize(); config.video.width = size.width(); config.video.height = size.height();
         config.video.fps = targetFps_->value();
         config.video.bitrate = targetBitrate_->value() == initial_.video.bitrate / 1000
@@ -640,11 +1199,14 @@ private:
     }
     void clearPreview() { preview_->clearFrame(); lastSequence_ = 0; }
     void showUiError(const std::exception& problem) {
-        uiError_ = QString::fromUtf8(problem.what()); logger_.log(logging::Level::Error, "publisher_ui", bytes(uiError_));
+        uiError_ = api_ ? QStringLiteral("媒体操作失败，请查看已脱敏的运行日志。")
+            : utf8(logging::redactSecrets(problem.what()));
+        logger_.log(logging::Level::Error, "publisher_ui", bytes(uiError_));
         banner_->setText(uiError_); banner_->show();
     }
     void startLive() {
         if (closing_ || pendingLive_) return;
+        if (api_) { startPlatformLive(); return; }
         try {
             uiError_.clear(); auto config = formConfig(); config::validate(config);
             if (session_.snapshot().state == State::Previewing) {
@@ -656,7 +1218,7 @@ private:
         } catch (const std::exception& problem) { showUiError(problem); }
     }
     void togglePreview() {
-        if (closing_ || pendingLive_) return;
+        if (closing_ || pendingLive_ || (api_ && (platformBusy() || !observedSessionId_.isEmpty()))) return;
         try {
             uiError_.clear(); const auto snapshot = session_.snapshot();
             if (previewRequested_ && active(snapshot.state)) session_.requestStop();
@@ -709,10 +1271,20 @@ private:
         abortedEvents_->setToolTip(QStringLiteral("封装输出队列中止时丢弃的混合事件，包含参数、编码包或结束事件；不等同于视频帧或压缩包"));
     }
     void poll() {
+        if (api_ && !closing_ && !needsLogin_ && !api_->authenticated() && !roomId_.isEmpty()) {
+            cancelRequested_ = true; pendingLive_.reset(); pendingPlatformConfig_.reset();
+            session_.requestStop(); needsLogin_ = true;
+            uiError_ = QStringLiteral("登录已失效，本地媒体已停止，请重新登录。");
+        }
         auto snapshot = session_.snapshot();
         if (pendingLive_ && snapshot.state == State::Stopped) {
             auto config = std::move(*pendingLive_); pendingLive_.reset(); previewRequested_ = false;
-            if (!closing_) { clearPreview(); session_.start(config); snapshot = session_.snapshot(); }
+            if (!closing_ && !cancelRequested_) {
+                clearPreview();
+                const bool started = session_.start(config);
+                if (api_ && !started) requestPlatformStop();
+                snapshot = session_.snapshot();
+            }
         } else if (pendingLive_ && !active(snapshot.state)) {
             // 预览关闭失败时保留错误，不自动启动另一轮设备采集。
             pendingLive_.reset();
@@ -724,6 +1296,40 @@ private:
         start_->setEnabled(!closing_ && !pendingLive_ && (!running || snapshot.state == State::Previewing));
         stop_->setEnabled(!closing_ && running && !previewRequested_ && !stopping && !pendingLive_);
         previewButton_->setEnabled(!closing_ && !pendingLive_ && (!running || (previewRequested_ && !stopping)));
+        if (api_) {
+            const bool busy = platformBusy();
+            const bool ready = api_->authenticated() && roomLoaded_ && !roomId_.isEmpty();
+            const bool verifyCancelled = canVerifyCancelledRequest();
+            start_->setText(verifyCancelled ? QStringLiteral("核实并结束上次申请") : QStringLiteral("开始直播"));
+            start_->setEnabled(ready && !closing_ && !busy && !logoutRequested_ && !pendingLive_ &&
+                (!api_->publishRecovery().stopRequested || verifyCancelled) && observedSessionId_.isEmpty()
+                && (!running || snapshot.state == State::Previewing));
+            stop_->setEnabled(!closing_ && !stopBusy_ &&
+                (applying_ || pendingPlatformConfig_ || uncertainApply_ || !observedSessionId_.isEmpty() ||
+                 (running && !previewRequested_)));
+            stop_->setText(ownedSessionId_.isEmpty() && !observedSessionId_.isEmpty()
+                ? QStringLiteral("结束已有会话") : QStringLiteral("停止直播"));
+            previewButton_->setEnabled(ready && !closing_ && !busy && observedSessionId_.isEmpty()
+                && !pendingLive_ && (!running || (previewRequested_ && !stopping)));
+            captureSection_->setEnabled(!running && !closing_ && !busy && !pendingLive_);
+            outputSection_->setEnabled(!running && !closing_ && !busy && !pendingLive_);
+            roomTitle_->setEnabled(!closing_ && !busy); category_->setEnabled(!closing_ && !busy);
+            saveRoom_->setEnabled(ready && !closing_ && !busy);
+            refreshRoom_->setEnabled(api_->authenticated() && !closing_ && !busy && !sessionQueryBusy_);
+            logout_->setEnabled(!closing_ && !busy && !logoutRequested_);
+            if (mediaOwned_ && !running && !pendingLive_ && !cleanupRequested_ && !ownedSessionId_.isEmpty()) {
+                cleanupRequested_ = true; requestPlatformStop();
+            }
+            if (needsLogin_ && !running && !busy && !closing_) {
+                ++sessionEpoch_; api_->cancel(this); sessionQueryBusy_ = false; needsLogin_ = false;
+                ownedSessionId_.clear(); observedSessionId_.clear(); roomId_.clear(); requestId_.clear();
+                uncertainApply_ = false; mediaOwned_ = false; cancelRequested_ = false; roomLoaded_ = false;
+                logoutRequested_ = false;
+                pendingPlatformConfig_.reset(); pendingLive_.reset(); password_->clear();
+                pages_->setCurrentWidget(loginPage_);
+            }
+            if (logoutRequested_ && !running && !platformBusy() && !closing_) finishLogout();
+        }
         previewButton_->setText(previewRequested_ && running ? QStringLiteral("停止预览") : QStringLiteral("开始预览"));
         const auto state = stateText(snapshot.state, previewRequested_); preview_->setStatus(state, snapshot.state == State::Streaming);
         updateStats(snapshot); duration_->setValue(durationText(snapshot.liveSeconds));
@@ -732,14 +1338,32 @@ private:
         footerState_->setText(QStringLiteral("●  ") + state); sidebarStatus_->setText(QStringLiteral("●  本机控制台 · ") + state);
         if (!snapshot.error.empty() || !uiError_.isEmpty() || closing_) {
             banner_->setText(closing_ ? QStringLiteral("正在停止采集并释放资源，完成后自动关闭窗口。")
-                : (!uiError_.isEmpty() ? uiError_ : utf8(snapshot.error))); banner_->show();
+                : (!uiError_.isEmpty() ? uiError_ : utf8(logging::redactSecrets(snapshot.error)))); banner_->show();
         } else banner_->hide();
-        updatePreviewAndLogs(); if (closing_ && !running) close();
+        updatePreviewAndLogs();
+        if (closing_ && !running && (!platformBusy() || remoteCloseGraceExpired())) close();
     }
 
     config::PublisherConfig initial_;
     logging::Logger& logger_;
     pipeline::PublisherSession session_;
+    platform::ApiClient* api_ = nullptr;
+    QStackedWidget* pages_ = nullptr;
+    QWidget* loginPage_ = nullptr;
+    QTimer* platformTimer_ = nullptr;
+    QLineEdit *username_ = nullptr, *nickname_ = nullptr, *password_ = nullptr, *roomTitle_ = nullptr;
+    QComboBox* category_ = nullptr;
+    QLabel *authState_ = nullptr, *platformState_ = nullptr, *account_ = nullptr;
+    QPushButton *login_ = nullptr, *register_ = nullptr, *saveRoom_ = nullptr, *refreshRoom_ = nullptr, *logout_ = nullptr;
+    QString roomId_, observedSessionId_, ownedSessionId_, requestId_, platformStatus_;
+    std::uint64_t sessionEpoch_ = 0;
+    std::optional<config::PublisherConfig> pendingPlatformConfig_;
+    bool authBusy_ = false, roomBusy_ = false, applying_ = false, stopBusy_ = false, recoveryBusy_ = false,
+        logoutBusy_ = false, sessionQueryBusy_ = false, needsLogin_ = false, uncertainApply_ = false,
+        mediaOwned_ = false, cancelRequested_ = false, cleanupRequested_ = false;
+    bool roomLoaded_ = false, needsStopConfirmation_ = false, logoutRequested_ = false;
+    int stopPostAttempts_ = 0;
+    QElapsedTimer closeClock_;
     std::optional<config::PublisherConfig> pendingLive_;
     bool previewRequested_ = false, closing_ = false;
     std::uint64_t lastSequence_ = 0, logCursor_ = 0;
@@ -769,5 +1393,9 @@ private:
 
 QWidget* createPublisherControl(const config::PublisherConfig& config, logging::Logger& logger) {
     return new PublisherWindow(config, logger);
+}
+QWidget* createPlatformPublisherControl(const config::PublisherConfig& config, logging::Logger& logger,
+                                       platform::ApiClient& api) {
+    return new PublisherWindow(config, logger, &api);
 }
 } // namespace lsl::ui

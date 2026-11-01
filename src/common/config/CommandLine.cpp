@@ -1,4 +1,5 @@
 #include "common/config/CommandLine.hpp"
+#include "common/logger/Redaction.hpp"
 
 #include <iostream>
 #include <map>
@@ -15,7 +16,7 @@ namespace {
 void reportFallback(const error::AppError& e) {
     logging::Logger fallback;
     if (!fallback.log(logging::Level::Error, e.module, e.what(), e.code)) {
-        std::cerr << e.what() << '\n';
+        std::cerr << logging::redactSecrets(e.what()) << '\n';
     }
 }
 

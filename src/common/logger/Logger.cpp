@@ -1,4 +1,5 @@
 #include "common/logger/Logger.hpp"
+#include "common/logger/Redaction.hpp"
 #include "common/error/Error.hpp"
 
 #include <chrono>
@@ -57,7 +58,7 @@ bool Logger::log(Level level, std::string_view module, std::string_view message,
             << " module=" << module << " thread=" << std::this_thread::get_id()
             << " code=" << code << " message=";
         // 防止消息中的换行把一条日志拆成多行。
-        for (char ch : message) {
+        for (char ch : redactSecrets(message)) {
             if (ch == '\n') out << "\\n";
             else if (ch == '\r') out << "\\r";
             else out << ch;

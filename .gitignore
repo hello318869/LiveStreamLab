@@ -5,6 +5,12 @@
 /external/qt/
 CMakeFiles/
 CMakeUserPresets.json
+# Local server configuration (credentials are supplied through environment variables).
+/config/server.local.json
+/config/platform.local.json
+/config/server.lan.local.json
+/deploy/*.env
+/deploy/srs-platform.local.conf
 .vs/
 *.user
 *.suo

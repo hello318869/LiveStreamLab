@@ -1,6 +1,8 @@
 #include "player/ui/PlayerControl.hpp"
 #include "player/pipeline/PlayerSession.hpp"
 #include "common/stats/PerformanceStats.hpp"
+#include "common/logger/Redaction.hpp"
+#include "apps/platform/ApiClient.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -25,12 +27,14 @@
 #include <QPlainTextEdit>
 #include <QPolygonF>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QStyle>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -271,9 +275,9 @@ QLabel#error { color: #e3b2ab; background: #2a1d1f; border: 1px solid #563b3b; b
 
 class PlayerWindow final : public QWidget {
 public:
-    PlayerWindow(config::PlayerConfig config, logging::Logger& logger)
+    PlayerWindow(config::PlayerConfig config, logging::Logger& logger, RoomPlaybackContext room = {})
         : initial_(std::move(config)), logger_(logger), session_(logger),
-          muted_(initial_.audioPlayback.muted), paused_(initial_.audioPlayback.paused), volume_(initial_.audioPlayback.volume) {
+          room_(std::move(room)), muted_(initial_.audioPlayback.muted), paused_(initial_.audioPlayback.paused), volume_(initial_.audioPlayback.volume) {
         logger_.enableMemoryLog(512);
         setObjectName(QStringLiteral("playerWindow")); setWindowTitle(QStringLiteral("Local Live Studio · 观众播放"));
         setWindowIcon(icon(Glyph::Studio)); resize(1100, 760); setMinimumSize(880, 620);
@@ -284,13 +288,13 @@ public:
         header->addWidget(label(QStringLiteral("LOCAL LIVE"), "brand"));
         header->addWidget(label(QStringLiteral("观众播放器"), "fieldLabel")); header->addStretch();
         status_ = label(QStringLiteral("●  未连接"), "status"); header->addWidget(status_);
-        auto* home = new QPushButton(QStringLiteral("返回首页"));
+        auto* home = new QPushButton(room_.api ? QStringLiteral("返回直播大厅") : QStringLiteral("返回首页"));
         home->setObjectName(QStringLiteral("link")); home->setCursor(Qt::PointingHandCursor);
-        home->setToolTip(QStringLiteral("停止当前播放后返回功能选择"));
+        home->setToolTip(room_.api ? QStringLiteral("停止当前播放后返回直播大厅") : QStringLiteral("停止当前播放后返回功能选择"));
         connect(home, &QPushButton::clicked, this, &QWidget::close); header->addWidget(home); layout->addLayout(header);
         auto* addressPanel = new QFrame; addressPanel->setObjectName(QStringLiteral("panel"));
         auto* addressRow = new QHBoxLayout(addressPanel); addressRow->setContentsMargins(12, 9, 12, 9); addressRow->setSpacing(9);
-        addressRow->addWidget(label(QStringLiteral("直播流地址"), "fieldLabel"));
+        auto* addressLabel = label(QStringLiteral("直播流地址"), "fieldLabel"); addressRow->addWidget(addressLabel);
         url_ = new QLineEdit(utf8(initial_.inputUrl)); url_->setPlaceholderText(QStringLiteral("RTMP(S) 或 HTTP(S)-FLV 地址"));
         addressRow->addWidget(url_, 1);
         connect_ = new QPushButton(icon(Glyph::Connect, QColor(19, 53, 44)), QStringLiteral("连接直播"));
@@ -298,6 +302,13 @@ public:
         stop_ = new QPushButton(icon(Glyph::Stop, QColor(193, 140, 132)), QStringLiteral("停止"));
         stop_->setObjectName(QStringLiteral("stop")); stop_->setCursor(Qt::PointingHandCursor);
         addressRow->addWidget(connect_); addressRow->addWidget(stop_); layout->addWidget(addressPanel);
+        if (room_.api) {
+            addressLabel->hide(); url_->hide(); connect_->setText(QStringLiteral("重新连接"));
+            auto* information = label(room_.title + QStringLiteral("  ·  ") + room_.nickname, "fieldLabel");
+            information->setWordWrap(true); addressRow->insertWidget(0, information, 1);
+            platformStatus_ = label(QStringLiteral("正在观看直播"), "fieldLabel");
+            platformStatus_->setWordWrap(true); layout->addWidget(platformStatus_);
+        }
         error_ = label({}, "error"); error_->setWordWrap(true); error_->hide(); layout->addWidget(error_);
         video_ = new VideoSurface; video_->toggleFullscreen = [this] { toggleFullscreen(); };
         video_->presented = [this](std::uint64_t sequence, std::int64_t capturedUnixUs) {
@@ -365,8 +376,15 @@ public:
         logClock_.start(); timer_ = new QTimer(this); timer_->setTimerType(Qt::PreciseTimer); timer_->setInterval(16);
         connect(timer_, &QTimer::timeout, this, [this] { pollSafely(); }); timer_->start();
         logger_.log(logging::Level::Info, "player_ui", "Qt Widgets player ready; input opens only on Connect"); poll();
+        if (room_.api) {
+            roomTimer_ = new QTimer(this); roomTimer_->setInterval(room_.api->config().roomRefreshMs);
+            connect(roomTimer_, &QTimer::timeout, this, [this] { queryRoom(); }); roomTimer_->start();
+            QTimer::singleShot(0, this, [this] { if (!closing_) { connectStream(); queryRoom(); } });
+        }
     }
-    ~PlayerWindow() override { timer_->stop(); session_.requestStop(); }
+    ~PlayerWindow() override {
+        timer_->stop(); if (room_.api) room_.api->cancel(this); session_.requestStop();
+    }
 protected:
     void changeEvent(QEvent* event) override {
         QWidget::changeEvent(event);
@@ -374,6 +392,10 @@ protected:
             fullscreen_->setText(isFullScreen() ? QStringLiteral("退出全屏") : QStringLiteral("全屏"));
     }
     void closeEvent(QCloseEvent* event) override {
+        if (!closing_) {
+            ++roomGeneration_; if (roomTimer_) roomTimer_->stop();
+            if (room_.api) room_.api->cancel(this);
+        }
         closing_ = true; session_.requestStop();
         if (active(session_.snapshot().state)) {
             event->ignore(); error_->setText(QStringLiteral("正在停止播放并释放资源，完成后自动关闭窗口。")); error_->show();
@@ -393,9 +415,16 @@ private:
         return qobject_cast<QLineEdit*>(focus) || qobject_cast<QPlainTextEdit*>(focus);
     }
     void connectControls() {
-        connect(connect_, &QPushButton::clicked, this, [this] { connectStream(); });
+        connect(connect_, &QPushButton::clicked, this, [this] { if (room_.api) refreshPlayback(); else connectStream(); });
         connect(url_, &QLineEdit::returnPressed, this, [this] { if (connect_->isEnabled()) connectStream(); });
-        connect(stop_, &QPushButton::clicked, this, [this] { session_.requestStop(); pollSafely(); });
+        connect(stop_, &QPushButton::clicked, this, [this] {
+            if (room_.api) {
+                ++roomGeneration_; room_.api->cancel(this); roomPending_ = playbackPending_ = false;
+                roomTimer_->stop();
+                platformStatus_->setText(QStringLiteral("已停止播放，可重新连接或返回大厅"));
+            }
+            session_.requestStop(); pollSafely();
+        });
         connect(pause_, &QPushButton::clicked, this, [this] {
             paused_ = !session_.snapshot().paused; session_.setPaused(paused_); updateSoundControls();
         });
@@ -447,7 +476,7 @@ private:
         return config;
     }
     void connectStream() {
-        if (closing_ || active(session_.snapshot().state)) return;
+        if (closing_ || roomEnded_ || active(session_.snapshot().state)) return;
         try {
             uiError_.clear(); auto config = formConfig(); config::validate(config);
             url_->setText(utf8(config.inputUrl)); video_->clearFrame();
@@ -455,8 +484,80 @@ private:
             session_.start(config); poll();
         } catch (const std::exception& problem) { showError(problem); }
     }
+    void endRoom() {
+        roomEnded_ = true; ++roomGeneration_; roomPending_ = playbackPending_ = false;
+        room_.api->cancel(this); roomTimer_->stop(); session_.requestStop();
+        platformStatus_->setText(QStringLiteral("直播已结束，请返回大厅刷新并选择直播"));
+        pollSafely();
+    }
+    void queryRoom() {
+        if (closing_ || roomEnded_ || roomPending_ || playbackPending_) return;
+        roomPending_ = true; const auto generation = roomGeneration_;
+        room_.api->request(this, "GET", QStringLiteral("/api/v1/rooms/") + room_.roomId, {}, false,
+            [this, generation](platform::ApiResult result) {
+                if (closing_ || generation != roomGeneration_) return;
+                roomPending_ = false;
+                if (!result.ok()) {
+                    platformStatus_->setText(QStringLiteral("直播状态暂不可确认，当前媒体播放继续")); return;
+                }
+                if (result.data.value(QStringLiteral("room_id")).toString() != room_.roomId) {
+                    platformStatus_->setText(QStringLiteral("房间状态响应无效，稍后重试")); return;
+                }
+                const auto session = result.data.value(QStringLiteral("current_session_id"));
+                const auto status = result.data.value(QStringLiteral("status")).toString();
+                static const QRegularExpression sessionPattern(QStringLiteral("^[0-9a-f]{32}$"));
+                const bool hasCurrentSession = session.isString() && sessionPattern.match(session.toString()).hasMatch();
+                const bool offline = session.isNull() && status == QStringLiteral("OFFLINE");
+                const bool terminal = status == QStringLiteral("STOPPING") || status == QStringLiteral("ENDED") || status == QStringLiteral("FAILED");
+                const bool knownSessionStatus = terminal || status == QStringLiteral("PREPARING") ||
+                    status == QStringLiteral("LIVE") || status == QStringLiteral("RECONNECTING");
+                if (!offline && !(hasCurrentSession && knownSessionStatus)) {
+                    platformStatus_->setText(QStringLiteral("房间状态响应无效，稍后重试")); return;
+                }
+                const bool replaced = hasCurrentSession && session.toString() != room_.liveSessionId;
+                // 数据库中的下播意图、终态和当前场次关联不依赖 SRS 本次查询成功。
+                if (replaced || offline || (session.toString() == room_.liveSessionId && terminal)) { endRoom(); return; }
+                if (result.meta.value(QStringLiteral("media_service_status")).toString() != QStringLiteral("AVAILABLE")) {
+                    platformStatus_->setText(QStringLiteral("直播状态暂不可确认，当前媒体播放继续")); return;
+                }
+                platformStatus_->setText(status == QStringLiteral("RECONNECTING") ? QStringLiteral("主播正在重连，等待恢复")
+                    : (status == QStringLiteral("LIVE") ? QStringLiteral("直播进行中") : QStringLiteral("正在确认直播状态")));
+            });
+    }
+    void refreshPlayback() {
+        if (closing_ || roomEnded_ || playbackPending_ || active(session_.snapshot().state)) return;
+        ++roomGeneration_; room_.api->cancel(this); roomPending_ = false; playbackPending_ = true;
+        roomTimer_->start();
+        const auto generation = roomGeneration_; pollSafely();
+        platformStatus_->setText(QStringLiteral("正在重新取得播放信息…"));
+        room_.api->request(this, "GET", QStringLiteral("/api/v1/rooms/") + room_.roomId + QStringLiteral("/playback"), {}, false,
+            [this, generation](platform::ApiResult result) {
+                if (closing_ || generation != roomGeneration_) return;
+                playbackPending_ = false;
+                if (!result.ok()) {
+                    platformStatus_->setText(result.code == QStringLiteral("ROOM_NOT_LIVE")
+                        ? QStringLiteral("当前房间暂不能观看，请等待恢复或返回大厅刷新") : result.message);
+                    pollSafely(); return;
+                }
+                const auto sessionId = result.data.value(QStringLiteral("live_session_id")).toString();
+                static const QRegularExpression sessionPattern(QStringLiteral("^[0-9a-f]{32}$"));
+                if (result.data.value(QStringLiteral("room_id")).toString() != room_.roomId || !sessionPattern.match(sessionId).hasMatch()) {
+                    platformStatus_->setText(QStringLiteral("播放信息无效，请返回大厅重试")); pollSafely(); return;
+                }
+                const QUrl url(result.data.value(QStringLiteral("playback_url")).toString());
+                if (result.meta.value(QStringLiteral("media_service_status")).toString() != QStringLiteral("AVAILABLE") ||
+                    result.data.value(QStringLiteral("status")).toString() != QStringLiteral("LIVE") ||
+                    result.data.value(QStringLiteral("protocol")).toString() != QStringLiteral("http-flv") ||
+                    (url.scheme() != QStringLiteral("http") && url.scheme() != QStringLiteral("https")) ||
+                    !url.isValid() || url.host().isEmpty() || !url.userInfo().isEmpty() || url.hasQuery() || url.hasFragment()) {
+                    platformStatus_->setText(QStringLiteral("播放信息无效，请返回大厅重试")); pollSafely(); return;
+                }
+                if (sessionId != room_.liveSessionId) { endRoom(); return; }
+                url_->setText(url.toString(QUrl::FullyEncoded)); connectStream();
+            });
+    }
     void showError(const std::exception& problem) {
-        uiError_ = QString::fromUtf8(problem.what()); error_->setText(uiError_); error_->show();
+        uiError_ = utf8(logging::redactSecrets(problem.what())); error_->setText(uiError_); error_->show();
         logger_.log(logging::Level::Error, "player_ui", bytes(uiError_));
     }
     void pollSafely() {
@@ -506,7 +607,7 @@ private:
         }
         const auto snapshot = session_.snapshot(); const bool running = active(snapshot.state);
         const bool stopping = snapshot.state == State::Stopping;
-        connect_->setEnabled(!running && !closing_); url_->setEnabled(!running && !closing_);
+        connect_->setEnabled(!running && !closing_ && !roomEnded_ && !playbackPending_); url_->setEnabled(!running && !closing_);
         stop_->setEnabled(running && !stopping && !closing_);
         pause_->setEnabled(running && !stopping && !closing_);
         mute_->setEnabled(initial_.audioPlayback.enabled && !stopping && !closing_);
@@ -537,7 +638,7 @@ private:
             + (initial_.audioPlayback.enabled ? QString() : QStringLiteral("  ·  音频输出已禁用")));
         if (closing_ || !uiError_.isEmpty() || !snapshot.error.empty()) {
             error_->setText(closing_ ? QStringLiteral("正在停止播放并释放资源，完成后自动关闭窗口。")
-                : (!uiError_.isEmpty() ? uiError_ : utf8(snapshot.error))); error_->show();
+                : (!uiError_.isEmpty() ? uiError_ : utf8(logging::redactSecrets(snapshot.error)))); error_->show();
         } else error_->hide();
         if (logClock_.elapsed() >= 100) {
             for (const auto& line : logger_.linesSince(logCursor_)) log_->appendPlainText(utf8(line).trimmed());
@@ -549,6 +650,11 @@ private:
     config::PlayerConfig initial_;
     logging::Logger& logger_;
     player::PlayerSession session_;
+    RoomPlaybackContext room_;
+    QLabel* platformStatus_ = nullptr;
+    QTimer* roomTimer_ = nullptr;
+    std::uint64_t roomGeneration_ = 0;
+    bool roomPending_ = false, playbackPending_ = false, roomEnded_ = false;
     bool muted_ = false, paused_ = false;
     int volume_ = 100;
     bool closing_ = false, wasMaximized_ = false;
@@ -575,5 +681,9 @@ private:
 
 QWidget* createPlayerControl(const config::PlayerConfig& config, logging::Logger& logger) {
     return new PlayerWindow(config, logger);
+}
+QWidget* createPlatformPlayerControl(const config::PlayerConfig& config, logging::Logger& logger,
+                                     RoomPlaybackContext context) {
+    return new PlayerWindow(config, logger, std::move(context));
 }
 } // namespace lsl::ui
