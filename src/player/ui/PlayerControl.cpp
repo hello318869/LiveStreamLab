@@ -9,6 +9,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QFont>
@@ -258,9 +259,11 @@ QPushButton#stop { background: #271e21; color: #d0a19a; border-color: #573c3d; }
 QPushButton#stop:disabled { color: #655754; background: #171a1e; border-color: #343139; }
 QPushButton#mute:checked { color: #8cd5bf; background: #173129; border-color: #3a6958; }
 QPushButton#link { padding: 2px 4px; background: transparent; border: none; color: #7ba798; font-size: 10px; }
-QLineEdit { background: #0b151c; color: #c9dbe1; border: 1px solid #304650; border-radius: 6px; padding: 7px 10px; min-height: 17px; selection-background-color: #315a4d; }
-QLineEdit:focus { border-color: #619e8e; }
-QLineEdit:disabled { color: #6e8691; background: #0e181e; border-color: #293b44; }
+QLineEdit, QComboBox { background: #0b151c; color: #c9dbe1; border: 1px solid #304650; border-radius: 6px; padding: 7px 10px; min-height: 17px; selection-background-color: #315a4d; }
+QLineEdit:focus, QComboBox:focus { border-color: #619e8e; }
+QLineEdit:disabled, QComboBox:disabled { color: #6e8691; background: #0e181e; border-color: #293b44; }
+QComboBox::drop-down { width: 24px; border: none; }
+QComboBox QAbstractItemView { background: #14242d; color: #bdd0d8; selection-background-color: #285246; outline: 0; border: 1px solid #34505b; }
 QSlider::groove:horizontal { height: 4px; background: #293b44; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #62b9a2; border-radius: 2px; }
 QSlider::handle:horizontal { width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; background: #93d3c2; border: 1px solid #b0e1d1; }
@@ -288,15 +291,25 @@ public:
         header->addWidget(label(QStringLiteral("LOCAL LIVE"), "brand"));
         header->addWidget(label(QStringLiteral("观众播放器"), "fieldLabel")); header->addStretch();
         status_ = label(QStringLiteral("●  未连接"), "status"); header->addWidget(status_);
-        auto* home = new QPushButton(room_.api ? QStringLiteral("返回直播大厅") : QStringLiteral("返回首页"));
+        auto* home = new QPushButton(QStringLiteral("返回直播大厅"));
         home->setObjectName(QStringLiteral("link")); home->setCursor(Qt::PointingHandCursor);
-        home->setToolTip(room_.api ? QStringLiteral("停止当前播放后返回直播大厅") : QStringLiteral("停止当前播放后返回功能选择"));
+        home->setToolTip(QStringLiteral("停止当前播放后返回直播大厅"));
         connect(home, &QPushButton::clicked, this, &QWidget::close); header->addWidget(home); layout->addLayout(header);
         auto* addressPanel = new QFrame; addressPanel->setObjectName(QStringLiteral("panel"));
         auto* addressRow = new QHBoxLayout(addressPanel); addressRow->setContentsMargins(12, 9, 12, 9); addressRow->setSpacing(9);
         auto* addressLabel = label(QStringLiteral("直播流地址"), "fieldLabel"); addressRow->addWidget(addressLabel);
         url_ = new QLineEdit(utf8(initial_.inputUrl)); url_->setPlaceholderText(QStringLiteral("RTMP(S) 或 HTTP(S)-FLV 地址"));
         addressRow->addWidget(url_, 1);
+        auto* decoderLabel = label(QStringLiteral("视频解码方式"), "fieldLabel");
+        videoDecoder_ = new QComboBox;
+        videoDecoder_->setAccessibleName(decoderLabel->text());
+        decoderLabel->setBuddy(videoDecoder_);
+        videoDecoder_->addItem(QStringLiteral("软件解码（CPU）"), QStringLiteral("software"));
+        videoDecoder_->addItem(QStringLiteral("硬件解码（NVIDIA NVDEC）"), QStringLiteral("nvdec"));
+        videoDecoder_->addItem(QStringLiteral("自动（优先 NVDEC）"), QStringLiteral("auto"));
+        videoDecoder_->setCurrentIndex(std::max(0, videoDecoder_->findData(utf8(initial_.videoDecoderBackend))));
+        videoDecoder_->setToolTip(QStringLiteral("自动模式在 NVDEC 不可用时使用软件解码。停止播放后可切换解码方式。"));
+        addressRow->addWidget(decoderLabel); addressRow->addWidget(videoDecoder_);
         connect_ = new QPushButton(icon(Glyph::Connect, QColor(19, 53, 44)), QStringLiteral("连接直播"));
         connect_->setObjectName(QStringLiteral("connect")); connect_->setCursor(Qt::PointingHandCursor);
         stop_ = new QPushButton(icon(Glyph::Stop, QColor(193, 140, 132)), QStringLiteral("停止"));
@@ -472,6 +485,7 @@ private:
     }
     config::PlayerConfig formConfig() const {
         auto config = initial_; config.inputUrl = bytes(url_->text().trimmed());
+        config.videoDecoderBackend = bytes(videoDecoder_->currentData().toString());
         config.audioPlayback.volume = volume_; config.audioPlayback.muted = muted_; config.audioPlayback.paused = paused_;
         return config;
     }
@@ -608,6 +622,7 @@ private:
         const auto snapshot = session_.snapshot(); const bool running = active(snapshot.state);
         const bool stopping = snapshot.state == State::Stopping;
         connect_->setEnabled(!running && !closing_ && !roomEnded_ && !playbackPending_); url_->setEnabled(!running && !closing_);
+        videoDecoder_->setEnabled(connect_->isEnabled());
         stop_->setEnabled(running && !stopping && !closing_);
         pause_->setEnabled(running && !stopping && !closing_);
         mute_->setEnabled(initial_.audioPlayback.enabled && !stopping && !closing_);
@@ -665,6 +680,7 @@ private:
     QTimer* timer_ = nullptr;
     VideoSurface* video_ = nullptr;
     QLineEdit* url_ = nullptr;
+    QComboBox* videoDecoder_ = nullptr;
     QPushButton *connect_ = nullptr, *stop_ = nullptr, *pause_ = nullptr, *mute_ = nullptr,
         *fullscreen_ = nullptr, *toggleLogs_ = nullptr, *clearLogs_ = nullptr;
     QSlider* volumeSlider_ = nullptr;

@@ -162,6 +162,7 @@ encoder::VideoEncoderOptions encoderOptions(const config::PublisherConfig& confi
     options.gopSize = config.videoEncoder.gopSize;
     options.preset = config.videoEncoder.preset;
     options.lowLatency = config.videoEncoder.lowLatency;
+    options.backend = config.videoEncoder.backend;
     options.captureTelemetry = config.capture.source != "file";
     // 编码会话的颜色描述与首个预处理帧一致，并写入 H.264 / MP4 流参数。
     options.colorRange = firstFrame.color_range;
@@ -583,6 +584,10 @@ int runPublisherPipeline(const config::PublisherConfig& config, logging::Logger&
                     }
                     if (!encoder) {
                         encoder = std::make_unique<encoder::VideoEncoder>(encoderOptions(config, *frame));
+                        if (!encoder->fallbackReason().empty()) {
+                            logger.log(logging::Level::Warn, "video_encode",
+                                "NVENC initialization failed, using software encoding: " + encoder->fallbackReason());
+                        }
                         if (!sendParameters(capture::Kind::Video, encoder->parameters(), encoder->timeBase())) return;
                         logger.log(logging::Level::Info, "video_encode", "encoder=" + encoder->codecName()
                             + " bitrate=" + std::to_string(config.video.bitrate)

@@ -486,7 +486,7 @@ private:
         login_ = new QPushButton(QStringLiteral("登录")); register_ = new QPushButton(QStringLiteral("注册账号"));
         row->addWidget(login_); row->addWidget(register_); outer->addLayout(row);
         authState_ = label({}, "fieldLabel"); authState_->setWordWrap(true); outer->addWidget(authState_);
-        auto* home = new QPushButton(QStringLiteral("返回首页")); outer->addWidget(home);
+        auto* home = new QPushButton(QStringLiteral("返回直播大厅")); outer->addWidget(home);
         connect(home, &QPushButton::clicked, this, &QWidget::close);
         connect(login_, &QPushButton::clicked, this, [this] { authenticate(false); });
         connect(register_, &QPushButton::clicked, this, [this] { authenticate(true); });
@@ -906,9 +906,9 @@ private:
             navigation_.push_back(button); layout->addWidget(button);
         }
         layout->addStretch();
-        auto* home = new QPushButton(QStringLiteral("返回首页"));
+        auto* home = new QPushButton(QStringLiteral("返回直播大厅"));
         home->setObjectName(QStringLiteral("navButton")); home->setCursor(Qt::PointingHandCursor);
-        home->setToolTip(QStringLiteral("停止当前采集或直播后返回功能选择"));
+        home->setToolTip(QStringLiteral("停止当前采集或直播后返回直播大厅"));
         connect(home, &QPushButton::clicked, this, &QWidget::close); layout->addWidget(home);
         layout->addSpacing(12); sidebarStatus_ = label(QStringLiteral("●  本机控制台 · 待机"), "subtle");
         layout->addWidget(sidebarStatus_); layout->addSpacing(6);
@@ -982,7 +982,7 @@ private:
         cameraLabel_ = label(QStringLiteral("摄像头设备 / 设备 ID"), "fieldLabel"); devices->addWidget(cameraLabel_);
         camera_ = new QComboBox; camera_->setEditable(true); camera_->setMinimumContentsLength(12);
         camera_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); devices->addWidget(camera_);
-        videoDescription_ = label(QStringLiteral("完整虚拟桌面，包含鼠标光标"), "subtle");
+        videoDescription_ = label(QStringLiteral("采集默认显示输出，包含鼠标光标"), "subtle");
         videoDescription_->setWordWrap(true); devices->addWidget(videoDescription_); devices->addSpacing(7);
         sectionLabel(devices, QStringLiteral("音频源")); audioSource_ = new QComboBox;
         // 类型和具体设备在同一列表选择，避免可编辑设备框遮挡下拉入口。
@@ -1015,6 +1015,15 @@ private:
         targetBitrate_ = new QSpinBox; targetBitrate_->setRange(64, 100000); targetBitrate_->setSingleStep(100);
         targetBitrate_->setSuffix(QStringLiteral(" kbps")); targetBitrate_->setValue(initial_.video.bitrate / 1000);
         bitrateColumn->addWidget(targetBitrate_); row->addLayout(fpsColumn, 1); row->addLayout(bitrateColumn, 1); output->addLayout(row);
+        sectionLabel(output, QStringLiteral("视频编码方式"));
+        encodingBackend_ = new QComboBox;
+        encodingBackend_->setAccessibleName(QStringLiteral("视频编码方式"));
+        encodingBackend_->addItem(QStringLiteral("软件编码（CPU）"), QStringLiteral("software"));
+        encodingBackend_->addItem(QStringLiteral("硬件编码（NVIDIA NVENC）"), QStringLiteral("nvenc"));
+        encodingBackend_->addItem(QStringLiteral("自动（优先 NVENC）"), QStringLiteral("auto"));
+        encodingBackend_->setCurrentIndex(std::max(0, encodingBackend_->findData(utf8(initial_.videoEncoder.backend))));
+        encodingBackend_->setToolTip(QStringLiteral("硬件编码需要可用的 NVIDIA NVENC；自动模式在硬件编码初始化失败时改用软件编码。"));
+        output->addWidget(encodingBackend_);
         output->addSpacing(2); lowLatency_ = new QCheckBox(QStringLiteral("低延迟编码"));
         lowLatency_->setChecked(initial_.videoEncoder.lowLatency); output->addWidget(lowLatency_);
         auto* encoding = label(QStringLiteral("H.264 视频  ·  AAC 音频\n仅直播推流，不生成本地录像文件"), "subtle");
@@ -1166,7 +1175,7 @@ private:
         const bool camera = videoSource_->currentData().toString() == QStringLiteral("camera");
         cameraLabel_->setVisible(camera); camera_->setVisible(camera);
         videoDescription_->setText(camera ? QStringLiteral("可选择设备或直接输入名称 / ID")
-            : QStringLiteral("完整虚拟桌面，包含鼠标光标"));
+            : QStringLiteral("采集默认显示输出，包含鼠标光标"));
         const bool microphone = audioSource_->currentData().toString() == QStringLiteral("microphone");
         audioDescription_->setText(microphone ? QStringLiteral("直接在上方选择麦克风设备，可刷新设备列表")
             : QStringLiteral("Windows 默认播放设备回采，不与麦克风混音"));
@@ -1195,7 +1204,9 @@ private:
         config.video.fps = targetFps_->value();
         config.video.bitrate = targetBitrate_->value() == initial_.video.bitrate / 1000
             ? initial_.video.bitrate : targetBitrate_->value() * 1000;
-        config.videoEncoder.lowLatency = lowLatency_->isChecked(); return config;
+        config.videoEncoder.backend = bytes(encodingBackend_->currentData().toString());
+        config.videoEncoder.lowLatency = lowLatency_->isChecked();
+        return config;
     }
     void clearPreview() { preview_->clearFrame(); lastSequence_ = 0; }
     void showUiError(const std::exception& problem) {
@@ -1377,6 +1388,7 @@ private:
     QPushButton *start_ = nullptr, *stop_ = nullptr, *previewButton_ = nullptr, *refresh_ = nullptr,
         *copyAddress_ = nullptr, *clearLogs_ = nullptr;
     QComboBox *videoSource_ = nullptr, *audioSource_ = nullptr, *camera_ = nullptr, *resolution_ = nullptr;
+    QComboBox* encodingBackend_ = nullptr;
     QSpinBox *targetFps_ = nullptr, *targetBitrate_ = nullptr;
     QCheckBox* lowLatency_ = nullptr;
     QLineEdit *url_ = nullptr, *addressDisplay_ = nullptr;

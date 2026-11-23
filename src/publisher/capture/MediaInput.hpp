@@ -33,7 +33,7 @@ struct CapturedFrame {
 };
 
 // open/read/close 必须在同一线程执行；若析构时仍持有媒体资源，析构也须在该线程。
-// 每个输入独占解复用和解码上下文。
+// 每个输入独占对应的解复用、解码或桌面采集上下文。
 // 其他线程只允许 requestStop()；它不会并发释放 FFmpeg 正在使用的资源。
 // readFrame 返回独占帧，可移动交给下游；nullopt 表示文件 EOF 或主动停止。
 class MediaInput {

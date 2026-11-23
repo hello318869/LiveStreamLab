@@ -51,12 +51,12 @@
 ## 采集到显示估计
 
 ```text
-设备视频输出帧 → Unix 微秒时间戳 side data → libx264 UDU SEI
+设备视频输出帧 → Unix 微秒时间戳 side data → libx264 / NVENC UDU SEI
  → SRS/网络 → H.264 解码还原 → Qt 新帧首次 paintEvent 完成 → 时间差
 ```
 
 设备帧在原始队列入队前调用 `av_gettime()` 打戳；预处理/缩放/帧引用与补帧传播属性，
-补帧保留原画面采集时间。libx264 设备路径启用 `udu_sei=1`。
+补帧保留原画面采集时间。libx264 和 NVENC 设备路径启用 `udu_sei=1`。
 CLI 在 `render()` 返回后采样，日志名为 `capture_to_backend_ms`。
 
 载荷为 `AV_FRAME_DATA_SEI_UNREGISTERED`，UUID

@@ -3,11 +3,11 @@
 ## 入口与控制层
 
 CMake 只生成统一应用 `livestreamlab`，入口为 `src/apps/livestreamlab_main.cpp`。
-无参数启动 Qt 首页，选择开播或观看；`--mode publisher|player` 直接进入对应窗口，
+无参数启动 Qt 直播大厅，右上角提供开播入口。`--mode publisher|player` 直接进入对应窗口，
 加 `--cli` 运行控制台流水线。帮助、配置检查和设备查询直接返回结果。
 `LSL_BUILD_GUI=OFF` 时仍使用同一入口，由 `--mode` 选择 CLI。
 
-`ApplicationControl` 持有唯一 `QApplication`。返回首页或关闭功能窗口时，先请求停止，
+`ApplicationControl` 使用唯一 `QApplication`。返回直播大厅或关闭功能窗口时，先请求停止，
 待工作线程回收后销毁窗口；日志活到会话和控件销毁之后。默认 GUI 配置位于可执行文件旁
 `config/`，显式 `--config` 优先。构建与运行命令见 [README](../README.md)。
 
@@ -61,11 +61,11 @@ SDL 音频子系统在主线程创建/销毁；CLI 的 SDL 事件、窗口和渲
 
 `apps/platform/ApiClient` 持有 Qt Network 异步网络管理器、平台配置和内存登录态，统一处理
 Bearer、HTTP 状态、JSON、超时、取消与固定错误文案。API 请求只在 Qt 主线程协调，不进入媒体线程。
-首页默认进入平台流程；`--mode publisher|player` 保留原直连工具。
+直播大厅是默认入口。`--mode publisher|player` 保留直连工具。
 
-`apps/ui/LobbyControl` 在可见时定时刷新大厅，点击卡片重新取得播放信息后创建平台播放器。
+`apps/ui/LobbyControl` 在可见时定时刷新大厅，点击卡片重新取得播放信息后创建平台播放器。点击「我要开播」进入共享 API 会话的主播界面。
 播放器持有房间和直播场次上下文，低频查询当前房间；确认原场次结束或被替换时停止媒体，
-查询失败与 `RECONNECTING` 保留当前播放恢复。关闭播放器待媒体回收后返回大厅。
+查询失败与 `RECONNECTING` 保留当前播放恢复。关闭播放器或主播窗口后，返回同一大厅并刷新列表。
 
 主播界面负责登录、个人房间和开播协调：先申请服务端会话，再将完整 URL 交给既有
 `PublisherSession`；预览不申请会话，停止与退出同时发出本地停止和服务端下播意图。

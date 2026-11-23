@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace lsl::decoder {
@@ -34,7 +35,7 @@ struct VideoDecodeStats {
 // reset({}, serial) 可用于失去视频流的会话，此时 decode/flush 都不产生帧。
 class VideoDecoder {
 public:
-    explicit VideoDecoder(logging::Logger& logger);
+    explicit VideoDecoder(logging::Logger& logger, std::string backend = "software");
     ~VideoDecoder();
     VideoDecoder(const VideoDecoder&) = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;

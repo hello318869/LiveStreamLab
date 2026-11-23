@@ -1,6 +1,7 @@
 #include "player/decoder/VideoDecoder.hpp"
 
 extern "C" {
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 }
@@ -9,6 +10,7 @@ extern "C" {
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,6 +31,78 @@ constexpr std::size_t maxBatchBytes = 128ULL * 1024 * 1024;
 }
 
 bool validTimeBase(AVRational value) { return value.num > 0 && value.den > 0; }
+
+class NvdecInitializationError final : public error::AppError {
+public:
+    NvdecInitializationError(int code, std::string message)
+        : AppError(std::string(module), code, std::move(message)) {}
+};
+
+void checkNvdecInitialization(int result, std::string_view operation) {
+    if (result == AVERROR(ENOMEM)) throw std::bad_alloc{};
+    if (result < 0) {
+        throw NvdecInitializationError(result, std::string(operation) + ": " + error::ffmpegErrorString(result));
+    }
+}
+
+struct NvdecFormat {
+    AVPixelFormat hardware = AV_PIX_FMT_NONE;
+    bool allowSoftware = false;
+    bool rejected = false;
+};
+
+AVPixelFormat selectNvdecFormat(AVCodecContext* context, const AVPixelFormat* formats) noexcept {
+    auto& selection = *static_cast<NvdecFormat*>(context->opaque);
+    AVPixelFormat software = AV_PIX_FMT_NONE;
+    for (auto format = formats; *format != AV_PIX_FMT_NONE; ++format) {
+        if (*format == selection.hardware) {
+            selection.rejected = false;
+            return *format;
+        }
+        const auto* descriptor = av_pix_fmt_desc_get(*format);
+        if (software == AV_PIX_FMT_NONE && descriptor && !(descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            software = *format;
+        }
+    }
+    // 若 CUDA 初始化失败，FFmpeg 会带着去掉 CUDA 的格式列表再次协商。
+    selection.rejected = true;
+    return selection.allowSoftware ? software : AV_PIX_FMT_NONE;
+}
+
+AVPixelFormat nvdecPixelFormat(const AVCodec* codec) {
+    for (int index = 0; const auto* hardware = avcodec_get_hw_config(codec, index); ++index) {
+        if (hardware->device_type == AV_HWDEVICE_TYPE_CUDA && hardware->pix_fmt == AV_PIX_FMT_CUDA &&
+            (hardware->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+            return hardware->pix_fmt;
+        }
+    }
+    throw NvdecInitializationError(error::NotImplemented,
+        "NVDEC is unavailable for decoder " + std::string(codec->name) + " in this FFmpeg build");
+}
+
+media::CodecContextPtr makeContext(const AVCodec* codec, const demuxer::TrackInfo& track) {
+    media::CodecContextPtr context{avcodec_alloc_context3(codec)};
+    if (!context) throw std::bad_alloc{};
+    error::throwIfFFmpegFailed(avcodec_parameters_to_context(context.get(), track.parameters.get()), module,
+        "import video stream codec parameters");
+    context->pkt_timebase = track.timeBase;
+    context->max_pixels = maxPixels;
+    // 只在同一帧内并行，避免帧级线程额外缓存后续帧；B 帧仍按码流正常重排。
+    context->thread_count = 2;
+    context->thread_type = FF_THREAD_SLICE;
+    return context;
+}
+
+media::FramePtr downloadNvdecFrame(const AVFrame& frame) {
+    media::FramePtr output{av_frame_alloc()};
+    if (!output) throw std::bad_alloc{};
+    error::throwIfFFmpegFailed(av_hwframe_transfer_data(output.get(), &frame, 0), module,
+        "download NVDEC frame to system memory");
+    // 下载只传输像素，显示时间戳、裁剪和采集时间 SEI 等属性单独复制。
+    error::throwIfFFmpegFailed(av_frame_copy_props(output.get(), &frame), module,
+        "copy downloaded NVDEC frame properties");
+    return output;
+}
 
 class DecodeTimer {
 public:
@@ -116,6 +190,9 @@ bool fullRange(const AVFrame& frame) {
 
 struct VideoDecoder::Impl {
     logging::Logger& logger;
+    const std::string backend;
+    NvdecFormat nvdecFormat;
+    media::BufferRefPtr cudaDevice;
     media::CodecContextPtr context;
     media::SwsContextPtr scaler;
     VideoDecodeStats counters;
@@ -128,8 +205,47 @@ struct VideoDecoder::Impl {
     int previousWidth = 0;
     int previousHeight = 0;
     int previousFormat = AV_PIX_FMT_NONE;
+    bool reportedFormatFallback = false;
+    std::optional<bool> usingNvdec;
 
-    explicit Impl(logging::Logger& output) : logger(output) {}
+    explicit Impl(logging::Logger& output, std::string value) : logger(output), backend(std::move(value)) {
+        if (backend != "software" && backend != "nvdec" && backend != "auto") {
+            throw error::AppError(std::string(module), error::InvalidConfig,
+                "video decoder backend must be software, nvdec or auto");
+        }
+    }
+
+    media::CodecContextPtr openNvdec(const AVCodec* codec, const demuxer::TrackInfo& track) {
+        nvdecFormat = {nvdecPixelFormat(codec), backend == "auto", false};
+        if (!cudaDevice) {
+            AVBufferRef* device = nullptr;
+            const int result = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+            media::BufferRefPtr candidate{device};
+            checkNvdecInitialization(result, "create NVDEC CUDA device");
+            cudaDevice = std::move(candidate);
+        }
+        auto candidate = makeContext(codec, track);
+        candidate->hw_device_ctx = av_buffer_ref(cudaDevice.get());
+        if (!candidate->hw_device_ctx) throw std::bad_alloc{};
+        candidate->opaque = &nvdecFormat;
+        candidate->get_format = selectNvdecFormat;
+        // 在取回 CPU 帧后统一按现有逻辑裁剪，保留硬件帧无法应用的上、左边界。
+        candidate->apply_cropping = 0;
+        checkNvdecInitialization(avcodec_open2(candidate.get(), codec, nullptr), "open NVDEC video decoder");
+        checkFormatNegotiation();
+        return candidate;
+    }
+
+    void checkFormatNegotiation() {
+        if (!nvdecFormat.rejected) return;
+        if (!nvdecFormat.allowSoftware) {
+            throw NvdecInitializationError(error::NotImplemented, "NVDEC cannot decode the negotiated video format");
+        }
+        if (!reportedFormatFallback) {
+            logger.log(logging::Level::Warn, module, "NVDEC format negotiation failed, using software decoding");
+            reportedFormatFallback = true;
+        }
+    }
 
     void warning(std::string_view message) {
         // 损坏数据可能持续出现；保留最初几次及周期性记录，避免日志反过来阻塞解码。
@@ -215,6 +331,7 @@ struct VideoDecoder::Impl {
             media::FramePtr frame{av_frame_alloc()};
             if (!frame) throw std::bad_alloc{};
             const int result = avcodec_receive_frame(context.get(), frame.get());
+            checkFormatNegotiation();
             if (result == AVERROR(EAGAIN)) return result;
             if (result == AVERROR_EOF) {
                 drained = true;
@@ -229,6 +346,11 @@ struct VideoDecoder::Impl {
                 recover("discarded damaged video frame; waiting for the next keyframe", true);
                 return AVERROR_INVALIDDATA;
             }
+            const bool hardware = frame->format == AV_PIX_FMT_CUDA;
+            if (!hardware && backend == "nvdec") {
+                unexpected("NVDEC returned a software frame while hardware decoding is required");
+            }
+            if (hardware) frame = downloadNvdecFrame(*frame);
             // pkt_timebase 与 TrackInfo::timeBase 相同；best_effort_timestamp 表示显示顺序，
             // 不拿 packet DTS 来覆盖帧 PTS，避免有 B 帧的直播流乱序显示。
             const auto pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ?
@@ -239,6 +361,11 @@ struct VideoDecoder::Impl {
             const auto timestampUs = pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
                 av_rescale_q(pts, timeBase, microseconds);
             frame = adapt(std::move(frame));
+            if (!usingNvdec || *usingNvdec != hardware) {
+                logger.log(logging::Level::Info, module, "decoding backend=" +
+                    std::string(hardware ? "nvdec" : "software") + " serial=" + std::to_string(serial));
+                usingNvdec = hardware;
+            }
             ++counters.decodedFrames;
             const auto bytes = storageBytes(*frame);
             if (bytes > maxBatchBytes) {
@@ -262,6 +389,7 @@ struct VideoDecoder::Impl {
     bool send(const AVPacket* packet, std::vector<DecodedVideoFrame>& output, std::size_t& outputBytes) {
         for (;;) {
             const int result = avcodec_send_packet(context.get(), packet);
+            checkFormatNegotiation();
             if (result == AVERROR(EAGAIN)) {
                 const auto before = counters.decodedFrames;
                 const int received = receive(output, outputBytes);
@@ -291,7 +419,8 @@ struct VideoDecoder::Impl {
     }
 };
 
-VideoDecoder::VideoDecoder(logging::Logger& logger) : impl_(std::make_unique<Impl>(logger)) {}
+VideoDecoder::VideoDecoder(logging::Logger& logger, std::string backend)
+    : impl_(std::make_unique<Impl>(logger, std::move(backend))) {}
 VideoDecoder::~VideoDecoder() = default;
 
 void VideoDecoder::reset(const demuxer::TrackInfo& track, std::uint64_t serial) {
@@ -299,6 +428,9 @@ void VideoDecoder::reset(const demuxer::TrackInfo& track, std::uint64_t serial) 
     // Reset 有意丢弃旧会话延迟帧，不发送空包把旧画面带入新代。
     state.context.reset();
     state.scaler.reset();
+    state.nvdecFormat = {};
+    state.reportedFormatFallback = false;
+    state.usingNvdec.reset();
     state.serial = serial;
     state.timeBase = track.timeBase;
     state.flushSent = state.drained = false;
@@ -315,18 +447,23 @@ void VideoDecoder::reset(const demuxer::TrackInfo& track, std::uint64_t serial) 
     if (!codec) {
         throw error::AppError(std::string(module), error::NotImplemented, "no decoder is available for the video stream codec");
     }
-    state.context.reset(avcodec_alloc_context3(codec));
-    if (!state.context) throw std::bad_alloc{};
-    error::throwIfFFmpegFailed(avcodec_parameters_to_context(state.context.get(), track.parameters.get()), module,
-        "import video stream codec parameters");
-    state.context->pkt_timebase = track.timeBase;
-    state.context->max_pixels = maxPixels;
-    // 只在同一帧内并行，避免帧级线程额外缓存后续帧；B 帧仍按码流正常重排。
-    state.context->thread_count = 2;
-    state.context->thread_type = FF_THREAD_SLICE;
-    error::throwIfFFmpegFailed(avcodec_open2(state.context.get(), codec, nullptr), module, "open video decoder");
+    if (state.backend != "software") {
+        try {
+            state.context = state.openNvdec(codec, track);
+        } catch (const NvdecInitializationError& problem) {
+            if (state.backend == "nvdec") throw;
+            state.nvdecFormat = {};
+            state.logger.log(logging::Level::Warn, module,
+                "NVDEC initialization failed, using software decoding: " + std::string(problem.what()));
+        }
+    }
+    if (!state.context) {
+        auto context = makeContext(codec, track);
+        error::throwIfFFmpegFailed(avcodec_open2(context.get(), codec, nullptr), module, "open video decoder");
+        state.context = std::move(context);
+    }
     state.logger.log(logging::Level::Info, module, "opened decoder=" + std::string(codec->name) +
-        " serial=" + std::to_string(serial));
+        " serial=" + std::to_string(serial) + " requested_backend=" + state.backend);
 }
 
 std::vector<DecodedVideoFrame> VideoDecoder::decode(const AVPacket& packet, std::uint64_t serial) {

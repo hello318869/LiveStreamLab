@@ -2,6 +2,7 @@
 
 extern "C" {
 #include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libavutil/rational.h>
 }
 
@@ -36,6 +37,9 @@ void validateOptions(const VideoEncoderOptions& options) {
     if (options.bitrate <= 0) invalid("video encoding bitrate must be positive");
     if (options.gopSize <= 0) invalid("video encoding GOP size must be positive");
     if (options.preset.empty()) invalid("video encoding preset must not be empty");
+    if (options.backend != "software" && options.backend != "nvenc" && options.backend != "auto") {
+        invalid("video encoder backend must be software, nvenc or auto");
+    }
 }
 
 const AVCodec* findSoftwareEncoder() {
@@ -51,6 +55,97 @@ void setOption(media::DictionaryPtr& options, const char* name, const char* valu
     const int result = av_dict_set(&raw, name, value, 0);
     options.reset(raw);
     error::throwIfFFmpegFailed(result, module, "set H.264 encoder option");
+}
+
+media::CodecContextPtr makeContext(const AVCodec* codec, const VideoEncoderOptions& options) {
+    media::CodecContextPtr context{avcodec_alloc_context3(codec)};
+    if (!context) throw std::bad_alloc{};
+    context->width = options.width;
+    context->height = options.height;
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->time_base = AVRational{1, options.fps};
+    context->framerate = AVRational{options.fps, 1};
+    context->sample_aspect_ratio = AVRational{1, 1};
+    context->color_range = options.colorRange;
+    context->colorspace = options.colorSpace;
+    context->color_primaries = options.colorPrimaries;
+    context->color_trc = options.colorTransfer;
+    context->chroma_sample_location = options.chromaLocation;
+    context->bit_rate = options.bitrate;
+    context->gop_size = options.gopSize;
+    if (options.lowLatency) context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    if (options.globalHeader) context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+#ifdef AV_CODEC_FLAG_FRAME_DURATION
+    // 新版 FFmpeg 显式要求该标记，才会将 AVFrame.duration 传给编码包。
+    context->flags |= AV_CODEC_FLAG_FRAME_DURATION;
+#endif
+    return context;
+}
+
+media::CodecContextPtr openSoftwareEncoder(const VideoEncoderOptions& options) {
+    const auto* codec = findSoftwareEncoder();
+    auto context = makeContext(codec, options);
+    const bool x264 = std::string_view(codec->name) == "libx264";
+    // OpenH264 不支持 B 帧；x264 的非低延迟模式允许两帧重排。
+    context->max_b_frames = options.lowLatency || !x264 ? 0 : 2;
+    media::DictionaryPtr codecOptions;
+    if (x264) {
+        setOption(codecOptions, "preset", options.preset.c_str());
+        if (options.lowLatency) setOption(codecOptions, "tune", "zerolatency");
+        if (options.captureTelemetry) setOption(codecOptions, "udu_sei", "1");
+    }
+    auto* raw = codecOptions.release();
+    const int result = avcodec_open2(context.get(), codec, &raw);
+    codecOptions.reset(raw);
+    error::throwIfFFmpegFailed(result, module, "open H.264 software encoder");
+    if (const auto* unused = av_dict_get(codecOptions.get(), "", nullptr, AV_DICT_IGNORE_SUFFIX)) {
+        invalid(std::string("unsupported H.264 encoder option: ") + unused->key);
+    }
+    return context;
+}
+
+class NvencInitializationError final : public error::AppError {
+public:
+    NvencInitializationError(int code, std::string message)
+        : AppError(std::string(module), code, std::move(message)) {}
+};
+
+void checkNvencResult(int result, std::string_view operation) {
+    if (result == AVERROR(ENOMEM)) throw std::bad_alloc{};
+    if (result < 0) {
+        throw NvencInitializationError(result, std::string(operation) + ": " + error::ffmpegErrorString(result));
+    }
+}
+
+void setNvencOption(AVCodecContext& context, const char* name, const char* value) {
+    const int result = av_opt_set(context.priv_data, name, value, 0);
+    if (result < 0) checkNvencResult(result, std::string("set h264_nvenc option ") + name);
+}
+
+media::CodecContextPtr openNvencEncoder(const VideoEncoderOptions& options) {
+    const auto* codec = avcodec_find_encoder_by_name("h264_nvenc");
+    if (!codec) {
+        throw NvencInitializationError(error::NotImplemented, "h264_nvenc is unavailable in this FFmpeg build");
+    }
+
+    // FFmpeg 接收 CPU 内存中的 YUV420P 帧并将其交给 NVENC。
+    auto context = makeContext(codec, options);
+    context->max_b_frames = 0;
+    setNvencOption(*context, "preset", "p4");
+    setNvencOption(*context, "tune", options.lowLatency ? "ll" : "hq");
+    if (options.lowLatency) {
+        setNvencOption(*context, "rc-lookahead", "0");
+        setNvencOption(*context, "zerolatency", "1");
+        setNvencOption(*context, "delay", "0");
+    }
+    if (options.captureTelemetry) setNvencOption(*context, "udu_sei", "1");
+
+    checkNvencResult(avcodec_open2(context.get(), codec, nullptr), "open h264_nvenc");
+    if ((context->flags & AV_CODEC_FLAG_GLOBAL_HEADER) &&
+        (!context->extradata || context->extradata_size <= 0)) {
+        throw NvencInitializationError(error::Unexpected, "h264_nvenc did not provide H.264 global headers (SPS/PPS)");
+    }
+    return context;
 }
 
 void validateFrame(const AVFrame& frame, const VideoEncoderOptions& options,
@@ -83,6 +178,7 @@ void validateFrame(const AVFrame& frame, const VideoEncoderOptions& options,
 struct VideoEncoder::Impl {
     VideoEncoderOptions options;
     media::CodecContextPtr context;
+    std::string fallbackReason;
     VideoEncoderStats counters;
     bool flushSent = false;
     bool drained = false;
@@ -91,44 +187,16 @@ struct VideoEncoder::Impl {
 
     explicit Impl(VideoEncoderOptions value) : options(std::move(value)) {
         validateOptions(options);
-        const auto* codec = findSoftwareEncoder();
-        context.reset(avcodec_alloc_context3(codec));
-        if (!context) throw std::bad_alloc{};
-        context->width = options.width;
-        context->height = options.height;
-        context->pix_fmt = AV_PIX_FMT_YUV420P;
-        context->time_base = AVRational{1, options.fps};
-        context->framerate = AVRational{options.fps, 1};
-        context->sample_aspect_ratio = AVRational{1, 1};
-        context->color_range = options.colorRange;
-        context->colorspace = options.colorSpace;
-        context->color_primaries = options.colorPrimaries;
-        context->color_trc = options.colorTransfer;
-        context->chroma_sample_location = options.chromaLocation;
-        context->bit_rate = options.bitrate;
-        context->gop_size = options.gopSize;
-        const bool x264 = std::string_view(codec->name) == "libx264";
-        // OpenH264 不支持 B 帧；x264 的非低延迟模式允许两帧重排。
-        context->max_b_frames = options.lowLatency || !x264 ? 0 : 2;
-        if (options.lowLatency) context->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        if (options.globalHeader) context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-#ifdef AV_CODEC_FLAG_FRAME_DURATION
-        // 新版 FFmpeg 显式要求该标记，才会将 AVFrame.duration 传给编码包。
-        context->flags |= AV_CODEC_FLAG_FRAME_DURATION;
-#endif
-        media::DictionaryPtr codecOptions;
-        if (x264) {
-            setOption(codecOptions, "preset", options.preset.c_str());
-            if (options.lowLatency) setOption(codecOptions, "tune", "zerolatency");
-            if (options.captureTelemetry) setOption(codecOptions, "udu_sei", "1");
+        if (options.backend != "software") {
+            try {
+                context = openNvencEncoder(options);
+                return;
+            } catch (const NvencInitializationError& problem) {
+                if (options.backend == "nvenc") throw;
+                fallbackReason = problem.what();
+            }
         }
-        auto* raw = codecOptions.release();
-        const int result = avcodec_open2(context.get(), codec, &raw);
-        codecOptions.reset(raw);
-        error::throwIfFFmpegFailed(result, module, "open H.264 software encoder");
-        if (const auto* unused = av_dict_get(codecOptions.get(), "", nullptr, AV_DICT_IGNORE_SUFFIX)) {
-            invalid(std::string("unsupported H.264 encoder option: ") + unused->key);
-        }
+        context = openSoftwareEncoder(options);
     }
 
     // 每次 receive 都使用新的 AVPacket。返回的包结构及其引用计数缓冲不被本模块复用。
@@ -226,5 +294,7 @@ media::CodecParametersPtr VideoEncoder::parameters() const {
 VideoEncoderStats VideoEncoder::stats() const noexcept { return impl_->counters; }
 
 std::string VideoEncoder::codecName() const { return impl_->context->codec->name; }
+
+const std::string& VideoEncoder::fallbackReason() const noexcept { return impl_->fallbackReason; }
 
 } // namespace lsl::encoder
