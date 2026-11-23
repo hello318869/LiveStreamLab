@@ -41,6 +41,8 @@ struct PublisherSession::Impl {
                 ownedConfig.streaming.enabled = false;
                 ownedConfig.videoFile.clear();
                 ownedConfig.audioFile.clear();
+                // 仅预览沿用软件路径，开播时再按用户选择初始化编码器。
+                ownedConfig.videoEncoder.backend = "software";
                 // 现有校验即使关闭推流也校验地址；预览不能依赖用户填写推流地址。
                 ownedConfig.outputUrl = config::PublisherConfig{}.outputUrl;
             }

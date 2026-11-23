@@ -113,7 +113,7 @@ add_library(lsl_capture STATIC
     src/publisher/capture/SystemAudioInput.cpp)
 target_link_libraries(lsl_capture PUBLIC lsl_common)
 if(WIN32)
-    target_link_libraries(lsl_capture PRIVATE ole32 oleaut32 strmiids uuid)
+    target_link_libraries(lsl_capture PRIVATE FFmpeg::avfilter ole32 oleaut32 strmiids uuid)
 endif()
 lsl_set_warnings(lsl_capture)
 

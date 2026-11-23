@@ -5,6 +5,11 @@
 
 extern "C" {
 #include <libavcodec/codec_desc.h>
+#ifdef _WIN32
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavutil/hwcontext.h>
+#endif
 #include <libavutil/pixdesc.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
@@ -17,11 +22,19 @@ extern "C" {
 #include <condition_variable>
 #include <limits>
 #include <mutex>
-#include <string_view>
 
 namespace lsl::capture {
 namespace {
 constexpr AVRational microseconds{1, 1000000};
+
+#ifdef _WIN32
+using FilterGraphPtr = std::unique_ptr<AVFilterGraph, media::detail::IndirectDeleter<avfilter_graph_free>>;
+
+bool desktopCanRecover(int code) {
+    return code == AVERROR_EXTERNAL || code == AVERROR_OUTPUT_CHANGED || code == AVERROR(EIO) ||
+        code == AVERROR(EBUSY) || code == AVERROR(EPERM) || code == AVERROR(EACCES);
+}
+#endif
 
 void setOption(media::DictionaryPtr& options, const char* key, const std::string& value) {
     auto* raw = options.release();
@@ -44,6 +57,11 @@ struct MediaInput::Impl {
 
     media::InputFormatPtr format;
     std::unique_ptr<SystemAudioInput> systemAudio;
+#ifdef _WIN32
+    FilterGraphPtr desktopGraph;
+    AVFilterContext* desktopSink = nullptr;
+    std::int64_t nextDesktopPullUs = 0;
+#endif
     std::string sourceDescription;
     std::vector<Decoder> decoders;
     media::PacketPtr packet;
@@ -74,13 +92,21 @@ struct MediaInput::Impl {
 
     void armTimeout() { deadlineUs = av_gettime_relative() + static_cast<std::int64_t>(timeoutMs) * 1000; }
 
+    void waitForInput(std::int64_t deadline, std::chrono::microseconds delay) {
+        const auto remaining = std::chrono::microseconds(std::max<std::int64_t>(0, deadline - av_gettime_relative()));
+        std::unique_lock<std::mutex> lock(waitMutex);
+        wake.wait_for(lock, std::min(delay, remaining), [&] { return stopped.load(); });
+    }
+
     void requireClosed() const {
-        if (format || systemAudio) throw error::AppError("capture", error::Io, "input already open; close it before reopening");
+        if (format || systemAudio || desktopFps) {
+            throw error::AppError("capture", error::Io, "input already open; close it before reopening");
+        }
         if (stopped) throw error::FFmpegError("capture", AVERROR_EXIT, "input was stopped; close it before reopening");
     }
 
     void open(const std::string& url, const AVInputFormat* backend, media::DictionaryPtr options,
-              AVCodecID videoCodec = AV_CODEC_ID_NONE, std::int64_t existingDeadline = 0) {
+              AVCodecID videoCodec = AV_CODEC_ID_NONE) {
         AVFormatContext* raw = avformat_alloc_context();
         if (!raw) throw std::bad_alloc{};
         raw->interrupt_callback = {interrupt, this};
@@ -88,16 +114,13 @@ struct MediaInput::Impl {
         if (!file) raw->flags |= AVFMT_FLAG_NONBLOCK;
         if (videoCodec != AV_CODEC_ID_NONE) raw->video_codec_id = videoCodec;
         auto* rawOptions = options.release();
-        if (existingDeadline) deadlineUs = existingDeadline;
-        else armTimeout();
+        armTimeout();
         const int result = avformat_open_input(&raw, url.c_str(), backend, &rawOptions);
         deadlineUs = 0;
         format.reset(raw);
         options.reset(rawOptions);
-        const bool desktop = backend && std::string_view(backend->name) == "gdigrab";
-        error::throwIfFFmpegFailed(result, "capture", desktop
-            ? "open Windows desktop (check interactive desktop access and permissions)"
-            : "open input (check device name, permissions, busy device and requested format)");
+        error::throwIfFFmpegFailed(result, "capture",
+            "open input (check device name, permissions, busy device and requested format)");
         if (options && av_dict_count(options.get())) {
             const auto* unknown = av_dict_get(options.get(), "", nullptr, AV_DICT_IGNORE_SUFFIX);
             throw error::AppError("capture", error::InvalidConfig, std::string("unsupported input option: ") + unknown->key);
@@ -140,71 +163,107 @@ struct MediaInput::Impl {
         return -1;
     }
 
-    void openDesktop(std::int64_t existingDeadline = 0) {
-        media::DictionaryPtr options;
-        setOption(options, "framerate", std::to_string(desktopFps));
-        setOption(options, "draw_mouse", "1");
-        // 不设置 video_size：完整虚拟桌面由 M03 缩放，不裁剪采集区域。
-        open("desktop", av_find_input_format("gdigrab"), std::move(options), AV_CODEC_ID_NONE, existingDeadline);
-        addDecoder(Kind::Video, true);
+#ifdef _WIN32
+    std::int64_t desktopFrameIntervalUs() const { return (1000000LL + desktopFps - 1) / desktopFps; }
+
+    void openDesktop() {
+        const auto* sourceFilter = avfilter_get_by_name("ddagrab");
+        const auto* sinkFilter = avfilter_get_by_name("buffersink");
+        if (!sourceFilter || !sinkFilter) {
+            throw error::AppError("capture", error::NotImplemented,
+                "FFmpeg was built without the ddagrab or buffersink filter");
+        }
+        FilterGraphPtr graph{avfilter_graph_alloc()};
+        if (!graph) throw std::bad_alloc{};
+        graph->nb_threads = 1;
+        AVFilterContext* source = nullptr;
+        AVFilterContext* sink = nullptr;
+        // ddagrab 采集一个 DXGI 显示输出的完整画面。编码分辨率仍由预处理控制。
+        // 桌面静止时使用滤镜默认的重复帧行为，兼容尚未提供 dup_frames 选项的 FFmpeg 6.0。
+        const auto options = "output_idx=0:draw_mouse=1:output_fmt=bgra:framerate=" + std::to_string(desktopFps);
+        error::throwIfFFmpegFailed(avfilter_graph_create_filter(&source, sourceFilter, "desktop", options.c_str(),
+            nullptr, graph.get()), "capture", "create ddagrab desktop source");
+        error::throwIfFFmpegFailed(avfilter_graph_create_filter(&sink, sinkFilter, "desktop_frames", nullptr,
+            nullptr, graph.get()), "capture", "create desktop frame sink");
+        error::throwIfFFmpegFailed(avfilter_link(source, 0, sink, 0), "capture", "link ddagrab desktop graph");
+        error::throwIfFFmpegFailed(avfilter_graph_config(graph.get(), nullptr), "capture",
+            "open ddagrab desktop (check interactive Windows session and DXGI display access)");
+        desktopGraph = std::move(graph);
+        desktopSink = sink;
+        nextDesktopPullUs = av_gettime_relative() + desktopFrameIntervalUs();
     }
 
     void releaseDesktop() noexcept {
-        packet.reset();
-        decoders.clear();
-        format.reset();
-        active = -1;
-        packetPending = false;
+        desktopSink = nullptr;
+        desktopGraph.reset();
+        nextDesktopPullUs = 0;
     }
+
+    std::optional<CapturedFrame> readDesktop() {
+        const auto deadline = av_gettime_relative() + static_cast<std::int64_t>(timeoutMs) * 1000;
+        bool recovering = false;
+        while (!stopped && av_gettime_relative() < deadline) {
+            try {
+                if (!desktopGraph) openDesktop();
+                // 在采集线程可唤醒地等到帧间隔，避免低帧率时在滤镜内部等整帧。
+                const auto waitUs = nextDesktopPullUs - av_gettime_relative();
+                if (waitUs > 0) waitForInput(deadline, std::chrono::microseconds(waitUs));
+                if (stopped || av_gettime_relative() >= deadline) break;
+                media::FramePtr texture{av_frame_alloc()};
+                if (!texture) throw std::bad_alloc{};
+                const auto pullUs = av_gettime_relative();
+                nextDesktopPullUs = std::max(nextDesktopPullUs + desktopFrameIntervalUs(), pullUs);
+                const int result = av_buffersink_get_frame(desktopSink, texture.get());
+                if (stopped) break;
+                if (result == AVERROR(EAGAIN)) {
+                    waitForInput(deadline, std::chrono::milliseconds(5));
+                    continue;
+                }
+                error::throwIfFFmpegFailed(result, "capture", "read ddagrab frame");
+                media::FramePtr frame{av_frame_alloc()};
+                if (!frame) throw std::bad_alloc{};
+                frame->format = AV_PIX_FMT_BGRA;
+                error::throwIfFFmpegFailed(av_hwframe_transfer_data(frame.get(), texture.get(), 0), "capture",
+                    "download ddagrab frame to system memory");
+                error::throwIfFFmpegFailed(av_frame_copy_props(frame.get(), texture.get()), "capture",
+                    "copy ddagrab frame properties");
+                const auto capturedUs = av_gettime_relative();
+                if (stopped || capturedUs >= deadline) break;
+                const auto timeBase = av_buffersink_get_time_base(desktopSink);
+                frame->time_base = timeBase;
+                // 跨桌面重开延续与其他设备共用的单调采集时钟。
+                static_cast<void>(stats::stampCaptureTime(*frame));
+                if (recovering) av_log(nullptr, AV_LOG_INFO, "ddagrab desktop capture recovered.\n");
+                return CapturedFrame{std::move(frame), Kind::Video, timeBase, capturedUs, capturedUs};
+            } catch (const error::FFmpegError& problem) {
+                if (stopped) break;
+                if (!desktopCanRecover(problem.code)) throw;
+                if (!recovering) av_log(nullptr, AV_LOG_WARNING,
+                    "Desktop duplication temporarily unavailable; rebuilding ddagrab within the capture timeout.\n");
+                recovering = true;
+                releaseDesktop();
+                waitForInput(deadline, std::chrono::milliseconds(100));
+            }
+        }
+        if (stopped) return std::nullopt;
+        throw error::FFmpegError("capture", AVERROR(ETIMEDOUT), "read ddagrab desktop frame");
+    }
+#endif
 
     int readPacket() {
         armTimeout();
         const auto readDeadline = deadlineUs.load();
-        bool recovering = false;
         for (;;) {
             if (stopped) { deadlineUs = 0; return AVERROR_EXIT; }
             if (av_gettime_relative() >= readDeadline) { deadlineUs = 0; return AVERROR(ETIMEDOUT); }
-            // BitBlt 失败会使 gdigrab 返回 EIO。重建其 DC/位图和 BMP 解码器，
-            // 而非让一次桌面切换或临时拒绝访问终止整个音视频流水线。
-            if (recovering && !format) {
-                try {
-                    openDesktop(readDeadline);
-                } catch (const error::FFmpegError& e) {
-                    releaseDesktop();
-                    if (e.code != AVERROR(EIO)) throw;
-                }
-                // 重开不能为每次尝试重新获得完整超时预算，也不能清掉停止标志。
-                deadlineUs = readDeadline;
-            }
-            if (interrupt(this)) {
-                deadlineUs = 0;
-                return stopped ? AVERROR_EXIT : AVERROR(ETIMEDOUT);
-            }
-            int result = format ? av_read_frame(format.get(), packet.get()) : AVERROR(EIO);
-            if (desktopFps && result == AVERROR(EIO)) {
-                if (!recovering) av_log(nullptr, AV_LOG_WARNING,
-                    "Desktop capture temporarily unavailable; rebuilding gdigrab within the capture timeout.\n");
-                recovering = true;
-                releaseDesktop();
-                std::unique_lock<std::mutex> lock(waitMutex);
-                wake.wait_for(lock, std::chrono::microseconds(std::min<std::int64_t>(100000,
-                    std::max<std::int64_t>(0, readDeadline - av_gettime_relative()))),
-                    [&] { return stopped.load(); });
-                continue;
-            }
+            int result = av_read_frame(format.get(), packet.get());
             if (result != AVERROR(EAGAIN)) {
                 if (result == AVERROR_EXIT && !stopped && interrupt(this)) result = AVERROR(ETIMEDOUT);
-                if (recovering && result >= 0) av_log(nullptr, AV_LOG_INFO, "Desktop capture recovered.\n");
                 deadlineUs = 0;
                 return result;
             }
             av_packet_unref(packet.get());
-            if (interrupt(this)) {
-                deadlineUs = 0;
-                return stopped ? AVERROR_EXIT : AVERROR(ETIMEDOUT);
-            }
-            std::unique_lock<std::mutex> lock(waitMutex);
-            wake.wait_for(lock, std::chrono::milliseconds(5), [&] { return stopped.load(); });
+            waitForInput(readDeadline, std::chrono::milliseconds(5));
         }
     }
 
@@ -342,14 +401,10 @@ void MediaInput::openDevice(Kind kind, const config::PublisherConfig& config) {
     impl_->timeoutMs = config.capture.timeoutMs;
     if (kind == Kind::Video && config.capture.videoSource == "desktop") {
 #ifdef _WIN32
-        detail::registerDevices();
-        const auto* backend = av_find_input_format("gdigrab");
-        if (!backend) throw error::AppError("capture", error::NotImplemented,
-            "FFmpeg was built without gdigrab; desktop capture requires this input backend");
         try {
             impl_->desktopFps = config.video.fps;
             impl_->openDesktop();
-            impl_->sourceDescription = "desktop: full Windows virtual desktop (cursor included)";
+            impl_->sourceDescription = "desktop: ddagrab (DXGI output 0, cursor included)";
         } catch (...) { close(); throw; }
         return;
 #else
@@ -445,6 +500,9 @@ void MediaInput::openFile(const config::PublisherConfig& config) {
 
 std::optional<CapturedFrame> MediaInput::readFrame() {
     if (impl_->systemAudio) return impl_->systemAudio->readFrame(impl_->stopped);
+#ifdef _WIN32
+    if (impl_->desktopFps) return impl_->readDesktop();
+#endif
     return impl_->read();
 }
 
@@ -452,6 +510,7 @@ std::string MediaInput::sourceDescription() const { return impl_->sourceDescript
 
 bool MediaInput::hasTrack(Kind kind) const noexcept {
     if (impl_->systemAudio && kind == Kind::Audio) return true;
+    if (impl_->desktopFps && kind == Kind::Video) return true;
     return std::any_of(impl_->decoders.begin(), impl_->decoders.end(),
         [kind](const Impl::Decoder& decoder) { return decoder.kind == kind; });
 }
@@ -463,6 +522,9 @@ void MediaInput::requestStop() noexcept {
 
 void MediaInput::close() noexcept {
     impl_->systemAudio.reset();
+#ifdef _WIN32
+    impl_->releaseDesktop();
+#endif
     impl_->packet.reset();
     impl_->decoders.clear();
     impl_->format.reset();

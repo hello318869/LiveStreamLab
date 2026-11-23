@@ -52,7 +52,8 @@ Json document(const PublisherConfig& c) {
                         {"max_interleave_delta_ms", c.streaming.maxInterleaveDeltaMs}}},
             {"video", {{"width", c.video.width}, {"height", c.video.height},
                        {"fps", c.video.fps}, {"bitrate", c.video.bitrate}}},
-            {"video_encoder", {{"gop_size", c.videoEncoder.gopSize},
+            {"video_encoder", {{"backend", c.videoEncoder.backend},
+                               {"gop_size", c.videoEncoder.gopSize},
                                {"preset", c.videoEncoder.preset},
                                {"low_latency", c.videoEncoder.lowLatency}}},
             {"audio", {{"sample_rate", c.audio.sampleRate}, {"channels", c.audio.channels},
@@ -98,6 +99,7 @@ Json document(const PlayerConfig& c) {
                        {"muted", c.audioPlayback.muted}, {"paused", c.audioPlayback.paused}}},
             {"video", {{"width", c.video.width}, {"height", c.video.height},
                        {"vsync", c.video.vsync}, {"fullscreen", c.video.fullscreen}}},
+            {"video_decoder", {{"backend", c.videoDecoderBackend}}},
             {"sync", {{"tolerance_ms", c.sync.toleranceMs},
                       {"drop_threshold_ms", c.sync.dropThresholdMs},
                       {"audio_wait_ms", c.sync.audioWaitMs},
@@ -302,6 +304,10 @@ void validate(const PublisherConfig& c) {
     }
     range(c.video.fps, 1, 120, "video.fps");
     range(c.video.bitrate, 64000, 100000000, "video.bitrate");
+    const auto& backend = c.videoEncoder.backend;
+    if (backend != "software" && backend != "nvenc" && backend != "auto") {
+        fail("video_encoder.backend", "expected software, nvenc or auto");
+    }
     range(c.videoEncoder.gopSize, 1, 1200, "video_encoder.gop_size");
     constexpr std::array<std::string_view, 10> presets = {
         "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"};
@@ -375,6 +381,10 @@ void validate(const PlayerConfig& c) {
     }
     range(c.video.width, 160, 7680, "video.width");
     range(c.video.height, 90, 4320, "video.height");
+    const auto& backend = c.videoDecoderBackend;
+    if (backend != "software" && backend != "nvdec" && backend != "auto") {
+        fail("video_decoder.backend", "expected software, nvdec or auto");
+    }
     range(c.demux.connectTimeoutMs, 100, 60000, "input.connect_timeout_ms");
     range(c.demux.readTimeoutMs, 100, 60000, "input.read_timeout_ms");
     range(c.demux.reconnectAttempts, -1, 100, "input.reconnect_attempts");
@@ -416,6 +426,7 @@ PublisherConfig parsePublisherConfig(std::string_view text, const Overrides& ove
     c.video.height = integer(data["video"]["height"], "video.height");
     c.video.fps = integer(data["video"]["fps"], "video.fps");
     c.video.bitrate = integer(data["video"]["bitrate"], "video.bitrate");
+    c.videoEncoder.backend = data["video_encoder"]["backend"].get<std::string>();
     c.videoEncoder.gopSize = integer(data["video_encoder"]["gop_size"], "video_encoder.gop_size");
     c.videoEncoder.preset = data["video_encoder"]["preset"].get<std::string>();
     c.videoEncoder.lowLatency = data["video_encoder"]["low_latency"].get<bool>();
@@ -485,6 +496,7 @@ PlayerConfig parsePlayerConfig(std::string_view text, const Overrides& overrides
     c.video.height = integer(data["video"]["height"], "video.height");
     c.video.vsync = data["video"]["vsync"].get<bool>();
     c.video.fullscreen = data["video"]["fullscreen"].get<bool>();
+    c.videoDecoderBackend = data["video_decoder"]["backend"].get<std::string>();
     const auto& sync = data["sync"];
     c.sync.toleranceMs = integer(sync["tolerance_ms"], "sync.tolerance_ms");
     c.sync.dropThresholdMs = integer(sync["drop_threshold_ms"], "sync.drop_threshold_ms");

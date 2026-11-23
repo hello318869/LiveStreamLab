@@ -6,15 +6,17 @@
 
 | 来源 | 行为与边界 |
 |---|---|
-| Windows 桌面 | `capture.source=devices`、`video_source=desktop`；gdigrab 读取完整虚拟桌面和鼠标，按 `video.fps` 采集，再缩放到目标尺寸，不按目标宽高裁剪桌面 |
+| Windows 桌面 | `capture.source=devices`、`video_source=desktop`。FFmpeg `ddagrab` 通过 DXGI Desktop Duplication 采集首个显示输出（`output_idx=0`）和鼠标，按 `video.fps` 请求帧率。`video.width/height` 决定后续预处理的输出尺寸。 |
 | 摄像头 | `video_source=camera`；Windows 使用 DirectShow，Linux 使用 V4L2；`devices.video` 可填设备 ID，Windows 也接受友好名称 |
 | 麦克风 | `audio_source=microphone`；Windows `default` 按默认录音端点 GUID 匹配 DirectShow 设备，Linux 使用 ALSA |
 | Windows 系统声音 | `audio_source=system`；WASAPI 回采默认播放端点，统一输出 48 kHz 双声道 float；与麦克风二选一，不混音、不修改系统音量，无声时允许正常等待 |
 | 本地文件 | `source=file`、`capture.file` 指定路径；自动识别容器，为允许且存在的音视频轨解码，文件模式忽略设备来源字段 |
 
 无配置时音源默认 `microphone`；仓库 `publisher.json` 和 `publisher-stream.json` 均选择 `system`。
-桌面与系统回采仅支持 Windows；Linux 设备视频须选择 `camera`。
+桌面与系统回采仅支持 Windows。Linux 设备视频须选择 `camera`。
 `--video-device` / `--video-format` 仅影响摄像头。
+
+桌面源按单个显示输出采集。`ddagrab` 产生 D3D11 帧，采集端将帧下载为 CPU 内存中的 BGRA，交给现有缩放和像素转换。静止时仍按采集帧率交付画面。Windows SDK 需要包含 `libavfilter`，运行时需支持 `ddagrab` 和 DXGI 桌面复制。
 
 ```powershell
 # 按仓库配置录制桌面与系统声音；输出文件已存在时需换名
@@ -47,7 +49,7 @@ input.close();
 帧不会被下一次读取覆盖，关闭输入后仍有效；引用副本共享底层缓冲，修改像素/样本前需 make_writable。
 `CapturedFrame` 包含帧、媒体种类、原始时间基、`timestampUs` 和 `capturedAtUs`：
 
-- 设备使用共同单调时钟；系统回采时间先校准到该时钟域。`capturedAtUs` 是应用收到解码帧的时刻，不是传感器曝光时刻。
+- 设备使用共同单调时钟。系统回采时间先校准到该时钟域。`capturedAtUs` 表示应用取得采集帧的时刻。
 - 文件以容器/轨道起点为共同原点，保留音视频偏移；优先 `best_effort_timestamp`，缺失时按样本数/帧率补齐。
 - 文件默认按时间戳节奏交付；`--realtime false` 可离线处理，但推流要求实时模式。
 - EOF 先排空解码器；`--loop true` seek 回起点并刷新解码器，时间轴接续上一轮。不支持 seek 或没有解码帧时不能循环。
@@ -63,8 +65,4 @@ input.close();
 异常会中止队列并停采集/网络。线程、队列与完整收尾顺序见 [多线程流水线](threading.md)。
 非阻塞读包与中断回调支持停止/超时，但故障驱动的内部初始化调用可能不响应中断。
 
-桌面读包遇到 `EIO` 时，在原采集线程释放并重建 gdigrab 和 BMP 解码器，间隔最多 100 ms，
-共用本次 `capture.timeout_ms`（默认 5000 ms）预算。恢复不重置公共媒体时钟，音频继续运行；
-停止请求可唤醒等待。持续失败超时退出；首次打开失败、其他来源/错误直接报告。
-恢复日志为 `Desktop capture temporarily unavailable` / `Desktop capture recovered`；
-已覆盖与未覆盖场景见 [采集恢复记录](m14-m15-fixes.md)。
+桌面读取遇到可恢复的 DXGI 错误时，在原采集线程尝试重建 `ddagrab` 采集图，共用本次 `capture.timeout_ms`（默认 5000 ms）预算。恢复期间沿用公共媒体时钟，音频继续运行，停止请求可唤醒重试等待。持续失败或首次打开失败会报告错误。FFmpeg 内部调用返回后才可检查停止和超时。

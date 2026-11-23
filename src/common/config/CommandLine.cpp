@@ -47,6 +47,7 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
                        {"--audio-queue-capacity", "pipeline.audio_queue_capacity"},
                        {"--output-queue-capacity", "pipeline.packet_queue_capacity"},
                        {"--video-bitrate", "video.bitrate"}, {"--audio-bitrate", "audio.bitrate"},
+                       {"--video-encoder", "video_encoder.backend"},
                        {"--gop-size", "video_encoder.gop_size"}, {"--preset", "video_encoder.preset"},
                        {"--low-latency", "video_encoder.low_latency"},
                        {"--source", "capture.source"}, {"--input-file", "capture.file"},
@@ -66,6 +67,7 @@ CommandLineOptions parseCommandLine(AppKind app, const std::vector<std::string>&
     } else {
         fields.insert({{"--width", "video.width"}, {"--height", "video.height"},
                        {"--vsync", "video.vsync"}, {"--fullscreen", "video.fullscreen"},
+                       {"--video-decoder", "video_decoder.backend"},
                        {"--play-audio", "audio.enabled"}, {"--audio-buffer-ms", "audio.buffer_ms"},
                        {"--volume", "audio.volume"}, {"--mute", "audio.muted"},
                        {"--audio-paused", "audio.paused"},
@@ -164,6 +166,7 @@ std::string commandLineHelp(AppKind app) {
                 "  --width N --height N     Even output dimensions; also requested from cameras\n"
                 "  --fps N                  Video frame rate\n"
                 "  --video-bitrate BPS      Video bitrate in bit/s\n"
+                "  --video-encoder NAME     software (default), nvenc or auto\n"
                 "  --video-file PATH        M05 video-only MP4 (default: output/video.mp4)\n"
                 "  --gop-size N             Keyframe interval in frames (1..1200)\n"
                 "  --preset NAME            x264 preset (default: veryfast)\n"
@@ -184,7 +187,7 @@ std::string commandLineHelp(AppKind app) {
                 "  --list-options KIND      Print camera (video) / microphone (audio) capabilities\n"
                 "  --source devices|file    Select live devices or a local file\n"
                 "  --video-source MODE      devices only: desktop (default, Windows) or camera\n"
-                "                           desktop captures the full virtual desktop with cursor\n"
+                "                           desktop captures the first DXGI output with cursor\n"
                 "                           camera: select input with --video-device NAME\n"
                 "  --audio-source MODE      devices only: microphone (default) or system\n"
                 "                           microphone: select input with --audio-device NAME\n"
@@ -209,6 +212,7 @@ std::string commandLineHelp(AppKind app) {
         help += "  --width N --height N     Initial window size (default: 1280x720)\n"
                 "  --vsync BOOL            Request vertical sync (default: true)\n"
                 "  --fullscreen BOOL       Start fullscreen (default: false)\n"
+                "  --video-decoder NAME    software (default), nvdec or auto\n"
                 "  --play-audio BOOL       Decode and play audio (default: true)\n"
                 "  --audio-buffer-ms MS    PCM ring capacity (100..2000; default: 100)\n"
                 "  --volume N              Player audio volume (0..100; default: 100)\n"

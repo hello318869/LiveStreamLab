@@ -6,21 +6,32 @@
 
 ```powershell
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --config config\player.json
+.\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --video-decoder nvdec
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --width 960 --height 540 --vsync true
 .\build\cmake\bin\Release\livestreamlab.exe --mode player --cli --fullscreen true
 ```
 
 CLI 的 F/Alt+Enter/双击切全屏，Space 暂停，M/↑/↓ 调声音，Esc/关窗/Ctrl+C 停止。GUI 见[观众控制](player-control.md)。`video.width/height` 仅设置 CLI 初始窗口，不改解码分辨率；默认 1280×720、`vsync=true`、`fullscreen=false`。输入地址与重连见[拉流说明](network-demuxing.md)，全部配置见[配置说明](configuration.md)。
 
+观众界面的「视频解码方式」在连接前选择，平台直播间可以停止播放后切换，再重新连接。配置项 `video_decoder.backend` 与 CLI 的 `--video-decoder` 都支持以下值。
+
+| 模式 | 行为 |
+|---|---|
+| `software` | 默认使用软件解码。 |
+| `nvdec` | 要求兼容的 NVIDIA GPU、驱动、FFmpeg 和视频码流。无法使用 NVDEC 时报告错误。 |
+| `auto` | 优先 NVDEC。设备初始化、解码器打开或格式协商失败时使用软件解码。 |
+
+首帧成功解码后，日志中的 `decoding backend=` 显示实际使用的后端。NVDEC 通过 FFmpeg 的 CUDA 硬件上下文解码，帧取回 CPU 内存时保留时间戳、色彩和 SEI，再交给现有帧队列和渲染器。 [FFmpeg 硬件解码示例](https://ffmpeg.org/doxygen/9.0/hw_decode_8c-example.html)
+
 ## 解码与帧交接
 
 `src/player/decoder/VideoDecoder.*` 的主要接口：
 
-- `reset(track, serial)`：按快照的 codec 参数和包时间基重建软件解码器，丢弃旧连接延迟帧，等待关键帧。
+- `reset(track, serial)`：按快照的 codec 参数、包时间基和所选后端重建解码器，丢弃旧连接延迟帧，等待关键帧。
 - `decode(packet, serial)`：send/receive；EAGAIN 先取输出再重送原包，支持一包多帧及延迟输出。
 - `flush()`：仅正常 EOF 发送空包排出尾帧。损坏包/帧则刷新解码器并等下一关键帧，严重资源/API 错误向上报告。
 
-解码使用 `FF_THREAD_SLICE` 帧内并行，B 帧正常重排。显示时间优先 `best_effort_timestamp`，其次帧 PTS，不用包 DTS 覆盖；时长依次取帧时长、解码器帧率、上帧时长，初值 40 ms。`DecodedVideoFrame` 独占帧结构，带 serial、微秒 PTS 和时长，底层缓冲由引用计数保活。
+软件解码请求 `FF_THREAD_SLICE` 帧内并行，B 帧按码流正常重排。显示时间优先 `best_effort_timestamp`，其次帧 PTS，不用包 DTS 覆盖；时长依次取帧时长、解码器帧率、上帧时长，初值 40 ms。`DecodedVideoFrame` 独占帧结构，带 serial、微秒 PTS 和时长，底层缓冲由引用计数保活。
 
 裁剪后 YUV420P/NV12 可直通，其余支持的软件格式经 libswscale 转 YUV420P，保留时间、色彩范围和像素宽高比，跟随实际尺寸/格式变化。
 

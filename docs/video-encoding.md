@@ -11,13 +11,16 @@ GUI 禁用本地文件；推流配置见 [RTMP 推流](rtmp-streaming.md)。构�
 | `output.video_file` | `output/video.mp4` | 空字符串禁用本地写出 |
 | `video.width` / `height` | 1280 / 720 | 与预处理输出一致的偶数尺寸 |
 | `video.fps` / `bitrate` | 25 / 2000000 | 时间基 `1/fps`；目标码率 bit/s，不保证每秒恒定 |
+| `video_encoder.backend` | `software` | `software`、`nvenc` 或 `auto` |
 | `video_encoder.gop_size` | 50 | 最大关键帧间隔，单位帧 |
 | `video_encoder.preset` | `veryfast` | x264 预设，ultrafast 至 placebo |
-| `video_encoder.low_latency` | true | 禁用 B 帧，x264 使用 zerolatency |
+| `video_encoder.low_latency` | true | 禁用 B 帧并启用所选编码器的低延迟设置 |
 
-优先 `libx264`，其次 `libopenh264`，均无则报错；不自动选硬件编码器。
-OpenH264 不应用 x264 preset、不启用 B 帧；x264 关闭低延迟时允许两帧重排。
-参数在新会话初始化，不支持运行中热切换。
+- `software` 优先 `libx264`，其次 `libopenh264`。x264 关闭低延迟时允许两帧重排，OpenH264 始终禁用 B 帧。
+- `nvenc` 使用 FFmpeg 的 `h264_nvenc`。需要支持 NVENC 的 NVIDIA GPU、驱动以及包含该编码器的 FFmpeg。初始化失败时报告错误。
+- `auto` 优先尝试 NVENC。初始化失败时记录原因并打开软件编码器，启动日志中的 `encoder=` 显示实际后端。
+
+主播界面从「推流设置 → 输出设置 → 视频编码方式」选择。每次开播按所选方式初始化，单独预览走软件编码。NVENC 接收预处理输出的 CPU 内存 YUV420P 帧，采用 `p4` 预设，低延迟模式使用 `ll` 并减少输出缓冲。两种 NVENC 模式均禁用 B 帧。
 
 ## 接口与输出约定
 
@@ -47,6 +50,7 @@ OpenH264 不应用 x264 preset、不启用 B 帧；x264 关闭低延迟时允许
 .\build\cmake\bin\Release\livestreamlab.exe --mode publisher --cli --source file --input-file "D:/media/sample.mp4" --capture-audio false --video-file output/file-video.mp4
 ```
 
-用 `--video-bitrate/--fps/--gop-size/--preset/--low-latency` 调整编码参数；
-`--set output.video_file=` 禁用本地写出，只编码/统计或按配置推流。
+用 `--video-encoder nvenc` 选择硬件编码，或用 `--video-encoder auto` 启用自动回退。
+用 `--video-bitrate`、`--fps`、`--gop-size`、`--preset` 和 `--low-latency` 调整编码参数。
+用 `--set output.video_file=` 禁用本地写出，只编码和统计，或按配置推流。
 音频独立文件见 [AAC 编码](audio-encoding.md)。

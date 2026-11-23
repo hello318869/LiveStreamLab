@@ -51,7 +51,7 @@ void printHelp() {
     std::cout << "LiveStreamLab - publish and watch live streams in one application\n"
                  "Usage: livestreamlab [--mode publisher|player] [--cli] [options]\n\n"
 #ifdef LSL_WITH_GUI
-                 "Launch without arguments to choose publishing or viewing.\n"
+                 "Launch without arguments to open the live room list.\n"
                  "--mode publisher / player opens that control window directly.\n"
                  "--cli runs the selected media pipeline in the console.\n"
 #else

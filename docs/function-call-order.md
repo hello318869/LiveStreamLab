@@ -1,6 +1,6 @@
 # 当前项目函数调用顺序
 
-本文依据 2026-10-28 的当前源码，以及 `D:/直播/方案.md` 中统一客户端的结构整理。没有构建、启动程序或运行测试。
+本文以 2026-10-28 的源码和 `D:/直播/方案.md` 为基础，GUI 入口与退出部分已按统一直播大厅更新。
 
 覆盖自有代码中的入口、配置、界面事件、会话、采集、编解码、封装、网络、同步与退出路径。FFmpeg、SDL、Qt 内部实现不继续展开；纯样式、图标和文字格式化函数作为界面叶子函数说明。
 
@@ -16,9 +16,12 @@
 flowchart TD
     A[main] --> B{启动方式}
     B -->|GUI| C[runApplicationControl / Qt 事件循环]
-    C --> D[ApplicationHome::openMode]
+    C -->|无参数| D[直播大厅]
+    C -->|显式模式| P[直连工具]
     D --> E[PublisherWindow]
     D --> F[PlayerWindow]
+    P --> E
+    P --> F
     E -->|开始直播或预览| G[PublisherSession]
     F -->|连接直播| H[PlayerSession]
     B -->|CLI| I[runConfigApp]
@@ -57,39 +60,28 @@ main(argc, argv)
 
 ### 2.1 GUI 的创建顺序
 
-位置：`src/apps/ui/ApplicationControl.cpp:155`。
+位置见 [ApplicationControl.cpp](../src/apps/ui/ApplicationControl.cpp) 和 [LobbyControl.cpp](../src/apps/ui/LobbyControl.cpp)。
 
 ```text
 runApplicationControl(initialMode, arguments)
   → 创建唯一 QApplication
   → 设置应用名和退出策略
   → applyTheme()
-  → ApplicationHome 构造
-      → makeCard(开播)
-      → makeCard(观看)
-      → 为按钮连接 clicked 回调
-  → 有初始模式：home.openMode(mode)
-    否则：home.show()
+  → 创建 ApplicationWindows
+  → 无初始模式：openLobby() → 加载平台和观众配置 → 创建大厅
+  → 有初始模式：openDirect() → 合并对应配置和参数 → 创建直连工具
   → app.exec()：进入 Qt 事件循环
 ```
 
-首页按钮在点击后调用 `ApplicationHome::openMode()`，不是构造首页时启动媒体。
-
 ```text
-ApplicationHome::openMode(mode)                  ApplicationControl.cpp:78
-  → parseCommandLine(mode, arguments)
-  → 未显式指定配置文件时，选择程序目录旁的：
-      开播 config/publisher-stream.json
-      观看 config/player.json
-  → loadPublisherConfig() 或 loadPlayerConfig()
-  → 创建该功能窗口使用的 Logger
-  → Logger::log("Configuration OK")
-  → createPublisherControl() 或 createPlayerControl()
-      → new PublisherWindow() 或 new PlayerWindow()
-  → 保存窗口和 logger 的所有权
-  → 连接 destroyed 回调：销毁功能窗口后释放 logger、重新显示首页
-  → 隐藏首页、显示功能窗口
+大厅显示 → 匿名查询公开直播列表
+  → 选择房间：查询播放地址 → 创建平台播放器 → 自动连接
+  → 我要开播：创建平台主播窗口 → 登录或复用当前登录态 → 打开个人房间
+      → 用户开始直播后申请直播场次、启动推流
+  → 子窗口打开时隐藏大厅并取消大厅查询，关闭后恢复列表刷新
 ```
+
+默认 GUI 配置是程序目录旁的 `config/player.json` 和 `config/publisher-stream.json`。直连 GUI 支持用 `--config` 和其他命令行参数覆盖。
 
 ### 2.2 CLI 与配置加载顺序
 
@@ -114,7 +106,7 @@ runConfigApp()
   → 根据 mode 调用 action：runPublisher() 或 runPlayer()
 ```
 
-配置优先级为：**结构体默认值 → 配置文件 → 命令行覆盖**。GUI 的 `openMode()` 也复用同一加载逻辑。
+直连 GUI 与 CLI 共用配置加载逻辑，优先级为 **结构体默认值 → 配置文件 → 命令行覆盖**。
 
 当前 CLI 在 `main()` 和 `runConfigApp()` 中分别解析一次选项；这两次解析都不创建媒体线程。设备查询由 `runPublisher()` 处理并返回，不进入完整媒体流水线。
 
@@ -266,17 +258,18 @@ runPublisherPipeline()
 
 | 接口/分支 | 内部调用顺序 |
 |---|---|
-| `openDevice()`，`:339`，桌面 | `registerDevices()` → `openDesktop()` → 配置 gdigrab → `Impl::open()` → `addDecoder(Video)` |
+| `openDevice()`，桌面 | `openDesktop()` → 配置 `ddagrab`（首个显示输出、鼠标、帧率）→ 连接并配置 FFmpeg 采集图 |
 | `openDevice()`，系统音频 | `SystemAudioInput::open()` → 打开 WASAPI 默认播放端点回采并启动客户端 |
 | `openDevice()`，摄像头/麦克风 | `deviceFormat()` → `deviceUrl()` → 输入参数 → `Impl::open()` → `addDecoder(kind)` |
-| `openFile()`，`:417` | `Impl::open()` → 探测流信息 → 为实际存在且允许的轨道 `addDecoder()` → 计算媒体起点 |
-| `Impl::open()`，`:82` | 分配输入上下文 → 安装可取消中断回调 → `avformat_open_input()`；文件还会探测流信息 |
-| `addDecoder()`，`:115` | 查找流/解码器 → 拷贝 codec 参数 → 设置时间基 → `avcodec_open2()` |
+| `openFile()` | `Impl::open()` → 探测流信息 → 为实际存在且允许的轨道 `addDecoder()` → 计算媒体起点 |
+| `Impl::open()` | 分配输入上下文 → 安装可取消中断回调 → `avformat_open_input()`；文件还会探测流信息 |
+| `addDecoder()` | 查找流/解码器 → 拷贝 codec 参数 → 设置时间基 → `avcodec_open2()` |
 
 ```text
-MediaInput::readFrame()                         MediaInput.cpp:446
+MediaInput::readFrame()
   ├─ 系统音频：SystemAudioInput::readFrame(stop)
-  └─ 其他输入：Impl::read()                     :276
+  ├─ 桌面：从 ddagrab 采集图取得 D3D11 帧 → 下载到 CPU BGRA → 返回 CapturedFrame
+  └─ 其他输入：Impl::read()
        → 先尝试 avcodec_receive_frame()
            成功：stamp() → 返回 CapturedFrame
        → 有待发送包：avcodec_send_packet()
@@ -286,9 +279,9 @@ MediaInput::readFrame()                         MediaInput.cpp:446
            非 loop：返回 nullopt
 ```
 
-`stamp()`（`:211`）统一采集/文件时间轴，文件实时模式会按媒体时间控制读取节奏。设备视频还调用 `stampCaptureTime()` 写入采集系统时间。
+`stamp()` 统一采集和文件时间轴，文件实时模式会按媒体时间控制读取节奏。设备视频还调用 `stampCaptureTime()` 写入采集系统时间。
 
-桌面读取遇到 `EIO` 时，`readPacket()` 在采集超时预算内调用 `releaseDesktop()` → `openDesktop()` 重建桌面输入，不重启整条流水线。
+桌面读取遇到可恢复错误时，采集线程在超时预算内尝试重建 `ddagrab` 采集图，音频和后续流水线继续使用原来的会话。
 
 系统音频（`src/publisher/capture/SystemAudioInput.cpp:264`）的读取链为：`GetNextPacketSize()` → `GetBuffer()` → 复制 PCM/处理静音 → 释放 WASAPI buffer → 时钟换算 → `swr_convert()` → 返回音频 `CapturedFrame`；停止时可排出 `drainTail()`。
 
@@ -834,10 +827,10 @@ readUntilEof() 返回 EOF
 
 上述网络线程、解码线程和协调循环会并行观察 serial；不应假定两消费者处理 Reset 与协调循环清画面之间存在固定的全局执行顺序。`VideoDecoder::reset()` 直接释放旧连接解码器，不排出旧连接尾帧。
 
-### 7.4 功能窗口返回首页与退出
+### 7.4 返回直播大厅与退出
 
 ```text
-功能窗口“返回首页” / 关闭
+功能窗口“返回直播大厅” / 关闭
   → PublisherWindow::closeEvent() 或 PlayerWindow::closeEvent()
       → session_.requestStop()
       → 仍在运行：忽略当前关闭事件，由 QTimer 继续轮询
@@ -845,11 +838,13 @@ readUntilEof() 返回 EOF
   → poll() 再调用 close()
   → 接受关闭、销毁窗口
       → Session 析构兜底 requestStop() + join()
-  → ApplicationHome 的 destroyed 回调
-      → 释放该功能 logger → 重新显示首页
+  → destroyed 回调
+      → 平台窗口：重新显示原大厅
+      → 直连窗口：打开直播大厅
 
-关闭首页且没有活动功能窗口
-  → ApplicationHome::closeEvent() → QCoreApplication::quit()
+关闭大厅 / 应用退出
+  → 停止大厅刷新，等待活动子窗口完成关闭
+  → 大厅销毁 → QCoreApplication::quit()
   → app.exec() 返回 → main() 返回
 ```
 
@@ -884,7 +879,7 @@ Logger 的生命周期覆盖 Session 和媒体工作线程，避免后台日志�
 | 顺序 | 文件 | 先看什么 |
 |---|---|---|
 | 1 | `src/apps/livestreamlab_main.cpp` | `main()`：GUI/CLI 分流 |
-| 2 | `src/apps/ui/ApplicationControl.cpp` | `runApplicationControl()`、`openMode()` |
+| 2 | `src/apps/ui/ApplicationControl.cpp` | `runApplicationControl()`、`openLobby()`、`openDirect()` |
 | 3 | `src/publisher/ui/PublisherControl.cpp` | `startLive()`、`togglePreview()`、`poll()` |
 | 4 | `src/publisher/pipeline/PublisherSession.cpp` | `start()`、`run()`、`requestStop()`、`observe()` |
 | 5 | `src/publisher/pipeline/PublisherPipeline.cpp` | `runPublisherPipeline()` 中的输出/视频/音频/采集线程 |

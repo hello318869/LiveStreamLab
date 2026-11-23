@@ -4,7 +4,7 @@
 
 ## 入口与示例配置
 
-统一程序为 `livestreamlab`；无参数打开首页，`--mode publisher|player` 直达界面，增加 `--cli` 运行控制台流水线。无 GUI 构建必须指定模式，自动使用 CLI。构建见 [项目 README](../README.md)。
+统一程序为 `livestreamlab`。无参数打开直播大厅，`--mode publisher|player` 直达手填地址的工具，增加 `--cli` 运行控制台流水线。无 GUI 构建必须指定模式，自动使用 CLI。构建见 [项目 README](../README.md)。
 
 | 配置来源 | 行为 |
 |---|---|
@@ -35,9 +35,10 @@
 | `video.width` / `video.height` | `1280` / `720` | 偶数；2–7680 / 2–4320 |
 | `video.fps` | `25` | 1–120 |
 | `video.bitrate` | `2000000` | 64000–100000000 bit/s |
+| `video_encoder.backend` | `software` | `software` 软件编码，`nvenc` 指定硬件编码，`auto` 优先 NVENC、初始化失败则回退软件编码 |
 | `video_encoder.gop_size` | `50` | 1–1200 帧 |
 | `video_encoder.preset` | `veryfast` | x264 预设，从 `ultrafast` 到 `placebo` |
-| `video_encoder.low_latency` | `true` | 禁用 B 帧；x264 使用 zerolatency |
+| `video_encoder.low_latency` | `true` | 禁用 B 帧并启用所选编码器的低延迟设置 |
 | `audio.sample_rate` / `audio.channels` | `48000` / `2` | AAC 标准采样率 / 1 或 2 声道 |
 | `audio.bitrate` | `128000` | 16000–512000 bit/s |
 | `output.url` | `rtmp://127.0.0.1/live/livestream` | RTMP/RTMPS 地址 |
@@ -50,7 +51,7 @@
 | `pipeline.packet_queue_capacity` | `256` | 8–4096 个编码输出事件 |
 | `pipeline.max_video_age_ms` | `200` | 20–5000 ms，实时原始视频排队年龄 |
 
-桌面采集完整虚拟桌面与鼠标，`video.width/height` 用于后续缩放而非桌面裁剪。`camera` 才使用摄像头设备名及格式。系统声音回采 Windows 默认播放端点，不含麦克风，当前不混音。文件模式使用文件音视频轨，不受两个 `*_source` 字段影响；文件推流必须保留 `capture.realtime=true`。详见 [采集](capture.md)、[推流](rtmp-streaming.md)。
+桌面采集 Windows 首个显示输出与鼠标，`video.width/height` 用于后续缩放。`camera` 使用摄像头设备名及格式。系统声音回采 Windows 默认播放端点。文件模式使用文件音视频轨，文件推流必须保留 `capture.realtime=true`。详见 [采集](capture.md)、[推流](rtmp-streaming.md)。
 
 ### 预处理
 
@@ -79,6 +80,7 @@
 | `input.discontinuity_threshold_ms` | `1000` | 100–60000 ms，输入时间戳跳变阈值 |
 | `video.width` / `video.height` | `1280` / `720` | 160–7680 / 90–4320，CLI 初始窗口尺寸，非解码尺寸 |
 | `video.vsync` / `video.fullscreen` | `true` / `false` | CLI 请求垂直同步 / 全屏启动 |
+| `video_decoder.backend` | `software` | `software` 软件解码，`nvdec` 指定 NVIDIA 硬解，`auto` 优先 NVDEC、初始化或格式协商失败则回退 |
 | `audio.device` | `default` | 默认或精确设备名，存在且启用音轨时打开 |
 | `audio.sample_rate` / `audio.channels` | `48000` / `2` | 输出 PCM 参数，AAC 标准采样率 / 1 或 2 声道 |
 | `audio.enabled` | `true` | 禁用后仍消费并释放音频包 |
@@ -127,7 +129,7 @@
 | 设备/文件 | `--source`、`--input-file`、`--video-source`、`--video-device`、`--audio-source`、`--capture-video`、`--capture-audio`、`--loop`、`--realtime` |
 | 编码/输出 | `--width`、`--height`、`--fps`、`--video-bitrate`、`--audio-bitrate`、`--gop-size`、`--preset`、`--low-latency`、`--stream`、`--video-file`、`--audio-file` |
 | 网络 | `--connect-timeout`、`--write-timeout`（主播）、`--read-timeout`（观众）、`--reconnect-attempts`、`--reconnect-delay`、`--reconnect-max-delay`、`--inactivity-timeout` |
-| 观看控制 | `--play-audio`、`--audio-buffer-ms`、`--volume`、`--mute`、`--audio-paused`、`--vsync`、`--fullscreen` |
+| 观看控制 | `--video-decoder`、`--play-audio`、`--audio-buffer-ms`、`--volume`、`--mute`、`--audio-paused`、`--vsync`、`--fullscreen` |
 
 ```powershell
 # 查询配置，不启动媒体；显式选择要查看的文件

@@ -1,18 +1,18 @@
 # LiveStreamLab
 
 C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理、编码、推流与本地录制，
-观众端负责拉流、解码、音画同步播放。统一软件 `livestreamlab.exe` 在首页选择“我要开播”或“我要观看”，
-通过同一进程中的 Qt Widgets 界面使用两种功能。
+观众端负责拉流、解码、音画同步播放。双击 `livestreamlab.exe` 直接打开直播大厅，
+可以匿名选房观看，也可以点击右上角“我要开播”进入主播流程。
 模块划分与验收标准见上级目录 `方案.md`，实现细节见 [docs/](docs/architecture.md)。
 
 ## 功能
 
 ### 开播模式 `publisher`
 
-- **视频源**：Windows 桌面（gdigrab，含鼠标）、摄像头、本地媒体文件（可循环、按时间戳节奏读取）
+- **视频源**：Windows 桌面（DXGI Desktop Duplication，采集首个显示输出和鼠标）、摄像头、本地媒体文件（可循环、按时间戳节奏读取）
 - **音频源**：麦克风、Windows 系统声音（WASAPI 回采）、文件音轨
 - **预处理**：缩放/裁剪/留黑、旋转、镜像、水印、直播时长叠加；重采样、声道转换、软件增益
-- **编码**：H.264（libx264，回退 libopenh264）+ AAC-LC，GOP、preset、低延迟可配
+- **编码**：H.264 + AAC-LC。H.264 默认软件编码，可在主播输出设置中选择 NVIDIA NVENC 或自动模式，支持配置 GOP、x264 预设和低延迟
 - **输出**：本地 MP4（纯视频）、M4A（纯音频）、FLV 经 RTMP/RTMPS 推送到 SRS
 - **并发**：采集、音视频处理编码、本地封装、推流各自线程，用有界队列交接；
   实时视频队列满时丢旧帧，音频和文件转换走背压
@@ -20,7 +20,7 @@ C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理�
 ### 观看模式 `player`
 
 - **输入**：RTMP/RTMPS、HTTP/HTTPS-FLV
-- **视频**：FFmpeg 软解 → SDL3 窗口或 Qt 控件显示，等比缩放、可全屏
+- **视频**：默认 FFmpeg 软件解码，可选择 NVIDIA NVDEC 或自动模式。通过 SDL3 窗口或 Qt 控件显示，等比缩放、可全屏
 - **音频**：解码重采样 → SDL3 输出，支持暂停、静音、音量
 - **音画同步**：以音频播放位置为主时钟，无音轨或欠载时降级为外部时钟，支持等待、丢帧和重连恢复
 - **网络**：连接/读取超时、无数据检测、指数退避重连
@@ -33,7 +33,7 @@ C++17 + FFmpeg + SDL3 音视频直播工程：主播端负责采集、预处理�
 
 ## 构建
 
-需要 CMake ≥ 3.24、支持 C++17 的编译器，以及含 **libavdevice** 的 FFmpeg ≥ 6 开发 SDK。
+需要 CMake ≥ 3.24、支持 C++17 的编译器，以及含 **libavdevice** 的 FFmpeg ≥ 6 开发 SDK。Windows 桌面采集还需要 **libavfilter** 和其中的 `ddagrab` 滤镜。
 SDL3 与 nlohmann/json 已放在 `external/`；Qt 界面另需 Qt 6.5+ Widgets、Network（本机 `external/qt/6.8.3/msvc2022_64` 会被自动找到）。
 
 ```powershell
@@ -67,9 +67,9 @@ Linux/WSL 后端可使用 `src/control_server/CMakeLists.txt` 或项目顶层 CM
 .\build\cmake\bin\Release\livestreamlab.exe
 ```
 
-首页选择“我要观看”进入公开直播大厅，选择主播后自动播放，返回时先停止媒体再回到大厅。
-选择“我要开播”先登录或注册，再设置房间标题、分类和采集参数；点击开始后向后端申请独立直播会话。
-本地预览不申请开播，推流地址由后端提供。返回首页或关闭功能窗口先停止当前媒体并释放资源；关闭首页退出软件。
+启动后直接显示公开直播大厅。观众可匿名选择房间并自动播放。
+大厅右上角“我要开播”进入主播流程，登录或注册后设置房间标题、分类和采集参数，再点击开始申请直播会话。
+本地预览不申请开播，推流地址由后端提供。从平台主播或播放器窗口返回时，程序先停止媒体并释放资源，再显示大厅。关闭大厅退出软件。
 
 平台入口优先读取程序旁 `config/platform.local.json`，否则读取 `platform.json`，默认 `http://127.0.0.1:8090`。
 本机覆盖文件不会被重新构建覆盖；修改地址后重启客户端。
@@ -135,7 +135,7 @@ CLI 播放窗口中 `F` / `Alt+Enter` / 双击切换全屏，`Esc` 停止；`Spa
 录制产物写入 `output/`，目录不存在会自动创建；文件名已存在时拒绝覆盖。
 字段含义与全部命令行参数见 [配置说明](docs/configuration.md)。
 旧文档中的 `publisher`、`player`、`publisher_gui`、`player_gui` 程序名对应早期独立入口；
-当前统一使用 `livestreamlab --mode publisher|player`，控制台场景再加 `--cli`。
+现在用 `livestreamlab --mode publisher|player` 打开直连工具，控制台场景再加 `--cli`。
 
 2026-10-27：统一 GUI 程序已通过 CMake 的 Windows Release 编译和链接，运行依赖与默认配置已部署。
 本次按要求未启动程序、未运行测试或真实推拉流；显示与切换效果仍待后续运行验收。

@@ -21,6 +21,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace lsl::player {
 namespace {
@@ -49,8 +50,8 @@ private:
 // 解码上下文只属于此工作线程。析构覆盖正常停止、网络错误和 SDL 异常路径。
 class VideoWorker {
 public:
-    VideoWorker(demuxer::Demuxer& input, VideoFrameQueue& frames, logging::Logger& logger)
-        : input_(input), frames_(frames), logger_(logger), thread_([this] { run(); }) {}
+    VideoWorker(demuxer::Demuxer& input, VideoFrameQueue& frames, logging::Logger& logger, std::string backend)
+        : input_(input), frames_(frames), logger_(logger), backend_(std::move(backend)), thread_([this] { run(); }) {}
     ~VideoWorker() { stop(); }
     void requestStop() noexcept {
         stopping_.store(true, std::memory_order_relaxed);
@@ -78,7 +79,7 @@ private:
     }
     void run() noexcept {
         try {
-            decoder::VideoDecoder decoder(logger_);
+            decoder::VideoDecoder decoder(logger_, backend_);
             bool initialized = false;
             std::uint64_t serial = 0;
             while (!stopping_.load(std::memory_order_relaxed)) {
@@ -128,6 +129,7 @@ private:
     demuxer::Demuxer& input_;
     VideoFrameQueue& frames_;
     logging::Logger& logger_;
+    std::string backend_;
     std::atomic<bool> stopping_{false};
     mutable std::mutex trackMutex_;
     std::uint64_t trackSerial_ = 0;
@@ -263,7 +265,7 @@ int runPlayerPipeline(const config::PlayerConfig& config, logging::Logger& logge
         ~Shutdown() { stopAndJoin(); }
     } shutdown{input, worker, audioWorker, audioOutput, display};
     input.start();
-    worker = std::make_unique<VideoWorker>(input, frames, logger);
+    worker = std::make_unique<VideoWorker>(input, frames, logger, config.videoDecoderBackend);
     audioWorker = std::make_unique<AudioPlayback>(config, input, audioOutput, logger);
     logger.log(logging::Level::Info, "player",
         "Playback started; bounded handoff, network recovery and audio master with estimated device latency.");

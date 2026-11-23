@@ -5,8 +5,9 @@
 
 ## 启动与配置
 
-双击 `livestreamlab.exe` 从首页选择开播，或 `livestreamlab --mode publisher` 直接进入主播界面。
-**进入窗口仅枚举设备，不自动采集或连接服务器；点击预览/开始直播后才启动媒体。**
+双击 `livestreamlab.exe` 后，在直播大厅右上角点击“我要开播”，进入平台登录和开播流程。 [平台客户端](platform-client.md)
+也可以用 `livestreamlab --mode publisher` 打开手填推流地址的直连主播工具。
+**进入主播窗口时会枚举设备，点击预览或开始直播后才启动媒体。**
 GUI 默认读取程序旁 `config/publisher-stream.json`，显式 `--config` 的相对路径按工作目录解释。
 配置优先级是默认值 < JSON < 命令行；`--help/--check-config/--print-config/--list-devices/--list-options`
 保留查询行为。
@@ -23,10 +24,10 @@ Windows 由 CMake 调用 windeployqt 部署 DLL 与 platforms/qwindows.dll，不
 2. 在一个“音频源”列表选择默认/具体麦克风或默认播放设备的系统声音。
    刷新保留源及设备，配置指定但未枚举到的麦克风仍单独保留，悬停查看 ID。
 3. 可先开启预览：仅开视频，关闭音频、网络和文件输出；仍走视频预处理/编码链，有编码 CPU 开销。
-4. 填 RTMP/RTMPS 地址，确认规格后开始直播，启动后锁定设置。
+4. 直连时填写 RTMP/RTMPS 地址，平台开播时使用服务端分配的地址。确认规格后开始直播，启动后锁定设置。
    正在预览时会先异步停止并释放设备，再开始直播。
 5. 停止后等待后台清理，再调整设置/重新启动；地址卡片可复制推流地址。
-   返回首页或关闭功能窗口也会先停止会话，关闭首页退出软件。
+   返回或关闭功能窗口时也会先停止会话。平台主播窗口返回直播大厅，关闭大厅退出软件。
 
 桌面/系统声音仅支持 Windows；其他平台沿用摄像头/麦克风路径。
 系统声音与麦克风二选一，不混音；不依赖摄像头/麦克风的桌面/系统源不因枚举失败而禁止启动。
@@ -53,6 +54,6 @@ Logger 内存最多 512 条，界面最多 1000 个文本块；FFmpeg 原始 std
 
 `PublisherControl` 负责主线程控件与 QImage 显示，`PublisherSession` 保存配置副本、后台工作线程、
 停止标志和加锁快照，`PublisherPipeline` 拥有媒体线程/队列。
-按钮只提交停止请求，不阻塞等待；关窗期间继续处理事件，结束后回首页。
+按钮只提交停止请求，关窗期间继续处理事件，媒体清理后关闭主播窗口。
 Session 析构兜底停止并 join，Logger 必须晚于 Session 释放。GUI 不安装进程信号处理器，CLI 保留 Ctrl+C。
 详见 [函数调用顺序](function-call-order.md)和[多线程流水线](threading.md)。

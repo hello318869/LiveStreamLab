@@ -47,6 +47,9 @@ void configuration() {
     require(c.video.width == 640 && c.video.height == 720 && c.video.fps == 60 &&
             c.audio.channels == 1 && c.videoDevice == u8"摄像头", "partial JSON and ordered overrides");
     require(toJson(parsePublisherConfig(toJson(c))) == toJson(c), "publisher round trip");
+    const auto nvenc = parsePublisherConfig(R"({"video_encoder":{"backend":"nvenc"}})");
+    require(nvenc.videoEncoder.backend == "nvenc" &&
+            parsePublisherConfig(toJson(nvenc)).videoEncoder.backend == "nvenc", "video encoder JSON round trip");
     const auto p = parsePlayerConfig(R"({"audio":{"device":"扬声器","sample_rate":44100},
         "logging":{"level":"WARN","console":false}})");
     require(p.audioDevice == u8"扬声器" && p.sampleRate == 44100 &&

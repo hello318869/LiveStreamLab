@@ -14,11 +14,11 @@ set_tests_properties(unit/player_playback PROPERTIES TIMEOUT 15)
 
 if(WIN32)
     add_executable(desktop_capture_tests integration/desktop_capture_tests.cpp)
-    target_link_libraries(desktop_capture_tests PRIVATE lsl_capture lsl_publisher_pipeline)
+    target_link_libraries(desktop_capture_tests PRIVATE lsl_capture lsl_publisher_pipeline FFmpeg::avfilter)
     lsl_set_warnings(desktop_capture_tests)
     lsl_copy_runtime(desktop_capture_tests)
     add_test(NAME integration/desktop_capture COMMAND desktop_capture_tests)
-    set_tests_properties(integration/desktop_capture PROPERTIES TIMEOUT 20)
+    set_tests_properties(integration/desktop_capture PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 endif()
 
 if(TARGET livestreamlab)
